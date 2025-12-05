@@ -135,8 +135,21 @@ class TakeoutDownloaderGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Google Takeout Bulk Downloader")
-        self.root.geometry("950x800")
-        self.root.minsize(900, 750)
+        
+        # Get screen dimensions and set appropriate window size
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        
+        # Use 80% of screen or minimum 950x850
+        width = max(950, int(screen_width * 0.6))
+        height = max(850, int(screen_height * 0.8))
+        
+        # Center the window
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(950, 850)
         
         # Set dark theme
         self.root.configure(bg=ModernStyle.BG_DARK)

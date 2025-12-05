@@ -376,8 +376,8 @@ def prompt_for_new_cookie(is_warning: bool = False) -> str:
     except KeyboardInterrupt:
         return None
 
-# Chunk size for downloads (8MB for better throughput)
-CHUNK_SIZE = 8 * 1024 * 1024
+# Chunk size for downloads (1MB for accurate speed tracking)
+CHUNK_SIZE = 1024 * 1024
 
 def create_fast_session(cookie: str) -> requests.Session:
     """Create an optimized session for fast downloads."""
@@ -432,31 +432,39 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
             safe_print(f"[{filename}] Starting ({size_gb:.2f} GB)")
             
             # Track per-file download speed
-            file_start_time = time.time()
-            last_speed_update = time.time()
+            last_update_time = time.time()
+            last_update_bytes = 0
+            last_percent_shown = 0
             
-            # Use larger buffer for writing
-            with open(output_path, 'wb', buffering=CHUNK_SIZE) as f:
+            with open(output_path, 'wb') as f:
                 downloaded = 0
-                last_percent = 0
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        update_stats(bytes_downloaded=len(chunk))
+                        chunk_len = len(chunk)
+                        downloaded += chunk_len
+                        update_stats(bytes_downloaded=chunk_len)
                         
                         now = time.time()
+                        elapsed = now - last_update_time
+                        
                         if total_size > 0:
                             percent = int((downloaded / total_size) * 100)
-                            # Update every 10% or every 5 seconds
-                            if percent >= last_percent + 10 or (now - last_speed_update >= 5):
-                                last_percent = (percent // 10) * 10  # Round to nearest 10%
-                                elapsed = now - file_start_time
+                            # Update every 10% or every 2 seconds
+                            if percent >= last_percent_shown + 10 or elapsed >= 2:
+                                # Calculate instant speed from bytes since last update
+                                bytes_since_last = downloaded - last_update_bytes
                                 if elapsed > 0:
-                                    speed_mbps = (downloaded / elapsed) / (1024 * 1024)
-                                    eta = get_eta()
-                                    safe_print(f"[{filename}] {percent}% @ {speed_mbps:.1f} MB/s (ETA: {eta})")
-                                last_speed_update = now
+                                    speed_mbps = (bytes_since_last / elapsed) / (1024 * 1024)
+                                else:
+                                    speed_mbps = 0
+                                
+                                eta = get_eta()
+                                safe_print(f"[{filename}] {percent}% @ {speed_mbps:.1f} MB/s (ETA: {eta})")
+                                
+                                last_percent_shown = (percent // 10) * 10
+                                last_update_time = now
+                                last_update_bytes = downloaded
             
             update_stats(file_completed=True)
             return (file_num, True, f"[{filename}] Done!", False)

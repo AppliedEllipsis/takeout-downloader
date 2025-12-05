@@ -50,7 +50,7 @@ class ModernStyle:
 # DOWNLOAD ENGINE (adapted from CLI version)
 # ============================================================================
 
-CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for more accurate speed tracking
 
 def extract_url_parts(url: str) -> tuple:
     """Extract URL parts for Google Takeout pattern."""
@@ -878,13 +878,13 @@ class TakeoutDownloaderGUI:
                 # Create download widget in UI
                 self.msg_queue.put(('download_start', filename, total_size))
                 
-                # Track per-file download speed with rolling window
-                file_start_time = time.time()
+                # Track per-file download speed using a simple approach:
+                # Measure bytes downloaded and time elapsed since last UI update
                 file_downloaded = 0
                 last_update_time = time.time()
                 last_update_bytes = 0
                 
-                with open(output_path, 'wb', buffering=CHUNK_SIZE) as f:
+                with open(output_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if self.should_stop:
                             self.msg_queue.put(('download_complete', filename, False))
@@ -895,20 +895,24 @@ class TakeoutDownloaderGUI:
                             file_downloaded += chunk_len
                             self.stats['bytes_downloaded'] += chunk_len
                             
-                            # Update speed every 500ms for responsive UI
+                            # Update UI every 500ms
                             now = time.time()
-                            time_delta = now - last_update_time
-                            if time_delta >= 0.5:
-                                # Calculate instant speed from recent data
-                                bytes_delta = file_downloaded - last_update_bytes
-                                if time_delta > 0:
-                                    instant_speed = bytes_delta / time_delta / (1024 * 1024)
+                            elapsed = now - last_update_time
+                            
+                            if elapsed >= 0.5:
+                                # Bytes downloaded since last update
+                                bytes_since_last = file_downloaded - last_update_bytes
+                                
+                                # Speed = bytes / seconds, then convert to MB/s
+                                if elapsed > 0:
+                                    speed_mbps = (bytes_since_last / elapsed) / (1024 * 1024)
                                 else:
-                                    instant_speed = 0
+                                    speed_mbps = 0
                                 
                                 percent = (file_downloaded / total_size * 100) if total_size > 0 else 0
-                                self.msg_queue.put(('download_progress', filename, percent, instant_speed))
+                                self.msg_queue.put(('download_progress', filename, percent, speed_mbps))
                                 
+                                # Save current state for next calculation
                                 last_update_time = now
                                 last_update_bytes = file_downloaded
                 

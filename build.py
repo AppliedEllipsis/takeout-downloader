@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Build script to create standalone executables for Linux, macOS, and Windows.
-Uses PyInstaller to package the GUI and Web applications.
+Uses PyInstaller to package the CLI, GUI, and Web applications.
 
 Usage:
     python build.py              # Build GUI for current platform
+    python build.py --cli        # Build CLI (terminal) for current platform
     python build.py --web        # Build Web server for current platform
-    python build.py --both       # Build both GUI and Web
-    python build.py --all        # Instructions for all platforms
+    python build.py --all-apps   # Build CLI, GUI, and Web
+    python build.py --help       # Instructions for all platforms
 """
 
 import subprocess
@@ -22,6 +23,15 @@ ICON_NAME = "icon"  # Will look for icon.ico (Windows), icon.icns (macOS), icon.
 
 # Build configurations
 BUILD_CONFIGS = {
+    'cli': {
+        'name': 'Google_Takeout_CLI',
+        'script': 'google_takeout_downloader.py',
+        'windowed': False,  # Console app
+        'hidden_imports': [
+            'requests', 'urllib3',
+        ],
+        'collect_submodules': [],
+    },
     'gui': {
         'name': 'Google_Takeout_Downloader',
         'script': 'google_takeout_gui.py',
@@ -169,30 +179,34 @@ To build for all platforms, you need to run the build on each OS.
 
 BUILD OPTIONS:
   python build.py              # Build GUI (desktop app)
+  python build.py --cli        # Build CLI (terminal app)
   python build.py --web        # Build Web server
-  python build.py --both       # Build both GUI and Web
+  python build.py --all-apps   # Build CLI, GUI, and Web
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ LINUX                                                           │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py --both                                          │
-│ Output: dist/Google_Takeout_Downloader                          │
+│ python build.py --all-apps                                      │
+│ Output: dist/Google_Takeout_CLI                                 │
+│         dist/Google_Takeout_Downloader                          │
 │         dist/Google_Takeout_Web                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ WINDOWS                                                         │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py --both                                          │
-│ Output: dist/Google_Takeout_Downloader.exe                      │
+│ python build.py --all-apps                                      │
+│ Output: dist/Google_Takeout_CLI.exe                             │
+│         dist/Google_Takeout_Downloader.exe                      │
 │         dist/Google_Takeout_Web.exe                             │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ macOS                                                           │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py --both                                          │
-│ Output: dist/Google_Takeout_Downloader.app                      │
+│ python build.py --all-apps                                      │
+│ Output: dist/Google_Takeout_CLI                                 │
+│         dist/Google_Takeout_Downloader.app                      │
 │         dist/Google_Takeout_Web                                 │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -230,17 +244,24 @@ def main():
     install_pyinstaller()
     
     # Determine what to build
+    build_cli = "--cli" in sys.argv
     build_web = "--web" in sys.argv
-    build_both = "--both" in sys.argv
-    build_gui = not build_web or build_both
+    build_all = "--all-apps" in sys.argv
+    
+    # Default to GUI if no specific flag
+    build_gui = (not build_cli and not build_web) or build_all
     
     success = True
     
-    if build_gui or build_both:
+    if build_cli or build_all:
+        if not build_executable('cli'):
+            success = False
+    
+    if build_gui or build_all:
         if not build_executable('gui'):
             success = False
     
-    if build_web or build_both:
+    if build_web or build_all:
         if not build_executable('web'):
             success = False
     

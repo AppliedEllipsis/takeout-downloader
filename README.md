@@ -2,18 +2,25 @@
 
 A Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as **GUI**, **CLI**, **Web interface**, and **Docker** deployment.
 
-![GUI Screenshot](https://img.shields.io/badge/GUI-Available-brightgreen) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![CLI](https://img.shields.io/badge/CLI-Available-green) ![GUI](https://img.shields.io/badge/GUI-Available-brightgreen) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
 ## Quick Start - Download Pre-built Binaries
 
 Download the latest release for your platform (no Python required):
+
+### CLI (Terminal)
+| Platform | Download |
+|----------|----------|
+| **Linux** | [Google_Takeout_CLI-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **Windows** | [Google_Takeout_CLI-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **macOS** | [Google_Takeout_CLI-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 
 ### GUI Application (Desktop)
 | Platform | Download |
 |----------|----------|
 | **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 | **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **macOS** | [Google_Takeout_Downloader-macos-x64.app](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **macOS** | [Google_Takeout_Downloader-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 
 ### Web Server (Headless/NAS)
 | Platform | Download |
@@ -323,14 +330,17 @@ To create standalone executables:
 # Install build dependencies
 pip install pyinstaller
 
-# Build GUI app (desktop)
+# Build GUI app (desktop) - default
 python build.py
+
+# Build CLI (terminal)
+python build.py --cli
 
 # Build Web server (headless/NAS)
 python build.py --web
 
-# Build both GUI and Web
-python build.py --both
+# Build all three (CLI, GUI, Web)
+python build.py --all-apps
 
 # Output will be in dist/ folder
 ```
@@ -346,10 +356,15 @@ git push origin v1.0.0
 
 This will create a GitHub Release with binaries for:
 
+**CLI (Terminal)**
+- `Google_Takeout_CLI-linux-x64`
+- `Google_Takeout_CLI-windows-x64.exe`
+- `Google_Takeout_CLI-macos-x64`
+
 **GUI Application (Desktop)**
 - `Google_Takeout_Downloader-linux-x64`
 - `Google_Takeout_Downloader-windows-x64.exe`
-- `Google_Takeout_Downloader-macos-x64.app`
+- `Google_Takeout_Downloader-macos-x64.zip`
 
 **Web Server (Headless/NAS)**
 - `Google_Takeout_Web-linux-x64`

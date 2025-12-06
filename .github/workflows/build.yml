@@ -10,6 +10,64 @@ permissions:
   contents: write
 
 jobs:
+  build-cli:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: Google_Takeout_CLI
+            asset_name: Google_Takeout_CLI-linux-x64
+          - os: windows-latest
+            artifact_name: Google_Takeout_CLI.exe
+            asset_name: Google_Takeout_CLI-windows-x64.exe
+          - os: macos-latest
+            artifact_name: Google_Takeout_CLI
+            asset_name: Google_Takeout_CLI-macos-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyinstaller
+
+      - name: Build CLI executable (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller --name "Google_Takeout_CLI" \
+            --onefile \
+            --clean \
+            --noconfirm \
+            --hidden-import requests \
+            --hidden-import urllib3 \
+            google_takeout_downloader.py
+
+      - name: Build CLI executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --name "Google_Takeout_CLI" `
+            --onefile `
+            --clean `
+            --noconfirm `
+            --hidden-import requests `
+            --hidden-import urllib3 `
+            google_takeout_downloader.py
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.artifact_name }}
+
   build-gui:
     strategy:
       matrix:
@@ -178,7 +236,7 @@ jobs:
           path: dist/${{ matrix.artifact_name }}
 
   release:
-    needs: [build-gui, build-web]
+    needs: [build-cli, build-gui, build-web]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     
@@ -191,16 +249,32 @@ jobs:
       - name: Display structure
         run: ls -R artifacts
 
+      - name: Rename artifacts for release
+        run: |
+          # Rename files to include platform in filename (avoid duplicates)
+          # CLI
+          mv artifacts/Google_Takeout_CLI-linux-x64/Google_Takeout_CLI artifacts/Google_Takeout_CLI-linux-x64/Google_Takeout_CLI-linux-x64
+          mv artifacts/Google_Takeout_CLI-macos-x64/Google_Takeout_CLI artifacts/Google_Takeout_CLI-macos-x64/Google_Takeout_CLI-macos-x64
+          # GUI
+          mv artifacts/Google_Takeout_Downloader-linux-x64/Google_Takeout_Downloader artifacts/Google_Takeout_Downloader-linux-x64/Google_Takeout_Downloader-linux-x64
+          # Web
+          mv artifacts/Google_Takeout_Web-linux-x64/Google_Takeout_Web artifacts/Google_Takeout_Web-linux-x64/Google_Takeout_Web-linux-x64
+          mv artifacts/Google_Takeout_Web-macos-x64/Google_Takeout_Web artifacts/Google_Takeout_Web-macos-x64/Google_Takeout_Web-macos-x64
+          ls -R artifacts
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/Google_Takeout_Downloader-linux-x64/*
-            artifacts/Google_Takeout_Downloader-windows-x64.exe/*
-            artifacts/Google_Takeout_Downloader-macos-x64.app/*
-            artifacts/Google_Takeout_Web-linux-x64/*
-            artifacts/Google_Takeout_Web-windows-x64.exe/*
-            artifacts/Google_Takeout_Web-macos-x64/*
+            artifacts/Google_Takeout_CLI-linux-x64/Google_Takeout_CLI-linux-x64
+            artifacts/Google_Takeout_CLI-windows-x64.exe/Google_Takeout_CLI.exe
+            artifacts/Google_Takeout_CLI-macos-x64/Google_Takeout_CLI-macos-x64
+            artifacts/Google_Takeout_Downloader-linux-x64/Google_Takeout_Downloader-linux-x64
+            artifacts/Google_Takeout_Downloader-windows-x64.exe/Google_Takeout_Downloader.exe
+            artifacts/Google_Takeout_Downloader-macos-x64.app/Google_Takeout_Downloader-macos-x64.zip
+            artifacts/Google_Takeout_Web-linux-x64/Google_Takeout_Web-linux-x64
+            artifacts/Google_Takeout_Web-windows-x64.exe/Google_Takeout_Web.exe
+            artifacts/Google_Takeout_Web-macos-x64/Google_Takeout_Web-macos-x64
           draft: false
           prerelease: false
           generate_release_notes: true

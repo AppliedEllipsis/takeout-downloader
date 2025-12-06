@@ -51,9 +51,11 @@ download_state = {
         'skipped_files': 0,
         'bytes_downloaded': 0,
         'start_time': None,
-    }
+    },
+    'log': [],  # Preserve log messages for reconnecting clients
 }
 state_lock = threading.Lock()
+MAX_LOG_ENTRIES = 500  # Limit log buffer size
 
 # ============================================================================
 # DOWNLOAD ENGINE
@@ -129,6 +131,21 @@ def create_fast_session(cookie: str) -> requests.Session:
 def emit_status(event: str, data: dict):
     """Emit status update to all connected clients."""
     socketio.emit(event, data)
+
+def add_log(message: str, log_type: str = 'info'):
+    """Add a log entry to the buffer and emit to clients."""
+    from datetime import datetime
+    entry = {
+        'time': datetime.now().strftime('%H:%M:%S'),
+        'message': message,
+        'type': log_type,
+    }
+    with state_lock:
+        download_state['log'].append(entry)
+        # Keep log buffer bounded
+        if len(download_state['log']) > MAX_LOG_ENTRIES:
+            download_state['log'] = download_state['log'][-MAX_LOG_ENTRIES:]
+    socketio.emit('log_entry', entry)
 
 def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> dict:
     """Download a single file with progress tracking."""
@@ -224,13 +241,16 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
             'start_time': datetime.now().isoformat(),
         }
         download_state['files'] = []
+        download_state['log'] = []  # Clear log for new session
     
+    add_log('Starting downloads...', 'info')
     emit_status('download_started', {'message': 'Starting downloads...'})
     
     # Parse URL
     base_url, batch_num, start_file, extension, query_string = extract_url_parts(url)
     
     if base_url is None:
+        add_log('Invalid URL format. Expected: takeout-TIMESTAMP-N-NNN.zip', 'error')
         emit_status('error', {'message': 'Invalid URL format. Expected: takeout-TIMESTAMP-N-NNN.zip'})
         with state_lock:
             download_state['is_running'] = False
@@ -268,6 +288,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
         download_state['stats']['skipped_files'] = skipped
         download_state['files'] = [{'filename': d['filename'], 'status': 'pending'} for d in downloads]
     
+    add_log(f'Found {len(downloads)} files to download ({skipped} skipped)', 'info')
     emit_status('download_info', {
         'total': len(downloads),
         'skipped': skipped,
@@ -276,6 +297,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     })
     
     if not downloads:
+        add_log(f'All {skipped} files already exist!', 'success')
         emit_status('download_complete', {
             'message': f'All {skipped} files already exist!',
             'stats': download_state['stats'],
@@ -310,6 +332,13 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                     if result['auth_failed']:
                         auth_failed = True
             
+            # Log file completion
+            if result['success']:
+                size_str = f"{result['size'] / (1024*1024*1024):.2f} GB" if result['size'] > 0 else ''
+                add_log(f"✓ {result['filename']} complete ({size_str})", 'success')
+            else:
+                add_log(f"✗ {result['filename']}: {result['message']}", 'error')
+            
             emit_status('file_complete', {
                 'index': result['index'],
                 'filename': result['filename'],
@@ -323,14 +352,17 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                 emit_status('stats_update', download_state['stats'])
     
     if auth_failed:
+        add_log('⚠️ Authentication expired. Please provide a new cookie.', 'warning')
         emit_status('auth_required', {
             'message': 'Authentication expired. Please provide a new cookie.',
         })
     else:
         with state_lock:
+            stats = download_state['stats']
+            add_log(f"🎉 All downloads finished! {stats['completed_files']} completed, {stats['failed_files']} failed", 'success')
             emit_status('download_complete', {
                 'message': 'All downloads finished!',
-                'stats': download_state['stats'],
+                'stats': stats,
             })
     
     with state_lock:
@@ -794,6 +826,65 @@ HTML_TEMPLATE = '''
         }
         
         // Socket event handlers
+        
+        // Handle state restoration on reconnect/refresh
+        socket.on('restore_state', (state) => {
+            console.log('Restoring state:', state);
+            
+            // Show progress cards if there's an active or completed session
+            if (state.is_running || state.stats.total_files > 0) {
+                document.getElementById('progress-card').classList.remove('hidden');
+                document.getElementById('files-card').classList.remove('hidden');
+                document.getElementById('start-btn').disabled = state.is_running;
+            }
+            
+            // Restore stats
+            document.getElementById('stat-total').textContent = state.stats.total_files;
+            document.getElementById('stat-complete').textContent = state.stats.completed_files;
+            document.getElementById('stat-failed').textContent = state.stats.failed_files;
+            document.getElementById('stat-skipped').textContent = state.stats.skipped_files;
+            document.getElementById('stat-size').textContent = formatBytes(state.stats.bytes_downloaded);
+            lastBytesDownloaded = state.stats.bytes_downloaded;
+            
+            // Update progress bar
+            const total = state.stats.total_files || 1;
+            const completed = state.stats.completed_files + state.stats.failed_files;
+            const percent = (completed / total) * 100;
+            document.getElementById('overall-progress').style.width = percent + '%';
+            
+            // Restore file list
+            const fileList = document.getElementById('file-list');
+            fileList.innerHTML = '';
+            state.files.forEach((file, index) => {
+                updateFileStatus(index, file.filename, file.status);
+            });
+            
+            // Restore log
+            const logContainer = document.getElementById('log-container');
+            logContainer.innerHTML = '';
+            state.log.forEach(entry => {
+                const div = document.createElement('div');
+                div.className = `log-entry ${entry.type}`;
+                div.textContent = `[${entry.time}] ${entry.message}`;
+                logContainer.appendChild(div);
+            });
+            logContainer.scrollTop = logContainer.scrollHeight;
+            
+            if (state.is_running) {
+                log('Reconnected to active download session', 'info');
+            }
+        });
+        
+        // Handle individual log entries
+        socket.on('log_entry', (entry) => {
+            const container = document.getElementById('log-container');
+            const div = document.createElement('div');
+            div.className = `log-entry ${entry.type}`;
+            div.textContent = `[${entry.time}] ${entry.message}`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        });
+        
         socket.on('download_started', (data) => {
             log(data.message, 'info');
         });
@@ -943,11 +1034,27 @@ def api_start():
 
 @app.route('/api/status')
 def api_status():
+    """Get full current state for page refresh/reconnection."""
     with state_lock:
         return jsonify({
             'is_running': download_state['is_running'],
             'stats': download_state['stats'],
+            'files': download_state['files'],
+            'log': download_state['log'],
         })
+
+@socketio.on('connect')
+def handle_connect():
+    """Send current state to newly connected/reconnected clients."""
+    with state_lock:
+        if download_state['is_running'] or download_state['stats']['total_files'] > 0:
+            # Send current state to the reconnecting client
+            emit('restore_state', {
+                'is_running': download_state['is_running'],
+                'stats': download_state['stats'],
+                'files': download_state['files'],
+                'log': download_state['log'],
+            })
 
 # ============================================================================
 # MAIN

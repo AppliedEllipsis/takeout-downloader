@@ -1,24 +1,34 @@
 # Google Takeout Bulk Downloader
 
-A Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as both a **GUI application** and **command-line script**.
+A Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as **GUI**, **CLI**, **Web interface**, and **Docker** deployment.
 
-![GUI Screenshot](https://img.shields.io/badge/GUI-Available-brightgreen) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![GUI Screenshot](https://img.shields.io/badge/GUI-Available-brightgreen) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
 ## Quick Start - Download Pre-built Binaries
 
 Download the latest release for your platform (no Python required):
 
+### GUI Application (Desktop)
 | Platform | Download |
 |----------|----------|
 | **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 | **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 | **macOS** | [Google_Takeout_Downloader-macos-x64.app](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 
-Just download, run, and paste your cookie!
+### Web Server (Headless/NAS)
+| Platform | Download |
+|----------|----------|
+| **Linux** | [Google_Takeout_Web-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **Windows** | [Google_Takeout_Web-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **macOS** | [Google_Takeout_Web-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+
+Just download, run, and paste your cookie! For the web version, open `http://localhost:5000` in your browser.
 
 ## Features
 
 - **🖥️ Modern GUI** - User-friendly graphical interface with dark theme
+- **🌐 Web Interface** - Browser-based UI for headless/NAS environments
+- **🐳 Docker Ready** - One-command deployment with docker-compose
 - **📦 Bulk Downloads** - Automatically downloads all numbered Takeout files
 - **⚡ Parallel Downloads** - Configurable concurrent downloads (default: 4-6)
 - **🔄 Resume Support** - Skips already downloaded files
@@ -145,7 +155,47 @@ If you prefer to put the cookie in `.env` instead of pasting cURL each time:
 
 ## Usage
 
-### GUI Application (Recommended)
+### 🐳 Docker (Recommended for NAS/Headless)
+
+The easiest way to run on a NAS or headless server:
+
+```bash
+# Quick start with docker-compose
+docker-compose up -d
+
+# Or build and run manually
+docker build -t takeout-downloader .
+docker run -d -p 5000:5000 -v $(pwd)/downloads:/downloads takeout-downloader
+```
+
+Then open your browser to `http://your-server:5000`
+
+**Docker environment variables:**
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OUTPUT_DIR` | Download directory inside container | `/downloads` |
+| `PARALLEL_DOWNLOADS` | Concurrent downloads | `6` |
+| `FILE_COUNT` | Max files to download | `100` |
+
+### 🌐 Web Interface (Headless Servers)
+
+Run the web interface directly (without Docker):
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start web server
+python google_takeout_web.py --host 0.0.0.0 --port 5000
+```
+
+Open `http://your-server:5000` in your browser. The web UI provides:
+- Paste area for cURL commands
+- Real-time progress via WebSocket
+- Download statistics and speed
+- Activity log
+
+### 🖥️ GUI Application (Desktop)
 
 Launch the graphical interface:
 
@@ -160,7 +210,7 @@ The GUI provides:
 - Download log with color-coded status
 - Start/Stop controls
 
-### Command-Line Interface
+### ⌨️ Command-Line Interface
 
 ```bash
 # Run with settings from .env

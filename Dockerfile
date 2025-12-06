@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+LABEL maintainer="Google Takeout Downloader"
+LABEL description="Web interface for downloading Google Takeout archives"
+
+# Set working directory
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY google_takeout_web.py .
+COPY google_takeout_downloader.py .
+
+# Create downloads directory
+RUN mkdir -p /downloads
+
+# Environment variables
+ENV OUTPUT_DIR=/downloads
+ENV PARALLEL_DOWNLOADS=6
+ENV FILE_COUNT=100
+ENV PYTHONUNBUFFERED=1
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/ || exit 1
+
+# Run the web server
+CMD ["python", "google_takeout_web.py", "--host", "0.0.0.0", "--port", "5000"]

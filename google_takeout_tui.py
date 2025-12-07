@@ -247,7 +247,7 @@ class TakeoutTUI(App):
             
             # Log section
             with Vertical(id="log-section"):
-                yield Log(highlight=True, markup=True)
+                yield Log(highlight=True)
         
         yield Footer()
     

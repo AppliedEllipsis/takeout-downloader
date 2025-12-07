@@ -2,6 +2,8 @@
 """
 Google Takeout Bulk Downloader - GUI Version
 A modern, user-friendly interface for downloading Google Takeout archives.
+
+This module can be run standalone or launched via: python takeout.py --gui
 """
 
 import os
@@ -19,6 +21,18 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Import shared core (if available)
+try:
+    from takeout import (
+        DownloadConfig, DownloadStats, DownloadProgress, NotificationConfig,
+        DownloadEngine, extract_url_parts, extract_cookie_from_curl, 
+        extract_url_from_curl, verify_zip_file, VERSION
+    )
+    USING_SHARED_CORE = True
+except ImportError:
+    USING_SHARED_CORE = False
+    VERSION = "1.5.0"
 
 # ============================================================================
 # STYLING & THEME
@@ -52,51 +66,53 @@ class ModernStyle:
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for more accurate speed tracking
 
-def extract_url_parts(url: str) -> tuple:
-    """Extract URL parts for Google Takeout pattern."""
-    if '?' in url:
-        url_path, query_string = url.split('?', 1)
-    else:
-        url_path, query_string = url, ''
-    
-    match = re.search(r'(.*takeout-[^-]+-)(\d+)-(\d+)(\.\w+)$', url_path)
-    if not match:
-        return None, None, None, None, None
-    
-    base = match.group(1)
-    batch_num = int(match.group(2))
-    file_num = int(match.group(3))
-    ext = match.group(4)
-    
-    return base, batch_num, file_num, ext, query_string
+# Fallback functions if shared core not available
+if not USING_SHARED_CORE:
+    def extract_url_parts(url: str) -> tuple:
+        """Extract URL parts for Google Takeout pattern."""
+        if '?' in url:
+            url_path, query_string = url.split('?', 1)
+        else:
+            url_path, query_string = url, ''
+        
+        match = re.search(r'(.*takeout-[^-]+-)(\d+)-(\d+)(\.\w+)$', url_path)
+        if not match:
+            return None, None, None, None, None
+        
+        base = match.group(1)
+        batch_num = int(match.group(2))
+        file_num = int(match.group(3))
+        ext = match.group(4)
+        
+        return base, batch_num, file_num, ext, query_string
 
-def extract_cookie_from_curl(curl_text: str) -> str:
-    """Extract cookie value from a cURL command or raw cookie string."""
-    if 'curl' in curl_text.lower() or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
-        match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+    def extract_cookie_from_curl(curl_text: str) -> str:
+        """Extract cookie value from a cURL command or raw cookie string."""
+        if 'curl' in curl_text.lower() or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
+            match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        if curl_text.lower().startswith('cookie:'):
+            return curl_text[7:].strip()
+        
+        cookie = curl_text.strip()
+        if (cookie.startswith("'") and cookie.endswith("'")) or \
+           (cookie.startswith('"') and cookie.endswith('"')):
+            cookie = cookie[1:-1]
+        
+        return cookie
+
+    def extract_url_from_curl(curl_text: str) -> str:
+        """Extract the download URL from a cURL command."""
+        # Match URL in curl command: curl 'URL' or curl "URL"
+        match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
-    
-    if curl_text.lower().startswith('cookie:'):
-        return curl_text[7:].strip()
-    
-    cookie = curl_text.strip()
-    if (cookie.startswith("'") and cookie.endswith("'")) or \
-       (cookie.startswith('"') and cookie.endswith('"')):
-        cookie = cookie[1:-1]
-    
-    return cookie
-
-def extract_url_from_curl(curl_text: str) -> str:
-    """Extract the download URL from a cURL command."""
-    # Match URL in curl command: curl 'URL' or curl "URL"
-    match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
-    if match:
-        url = match.group(1)
-        # Verify it's a takeout URL
-        if 'takeout' in url.lower():
-            return url
-    return None
+            url = match.group(1)
+            # Verify it's a takeout URL
+            if 'takeout' in url.lower():
+                return url
+        return None
 
 def extract_from_curl(curl_text: str) -> tuple[str, str]:
     """Extract both cookie and URL from a cURL command.
@@ -880,12 +896,12 @@ class TakeoutDownloaderGUI:
                     preview = r.content[:500].decode('utf-8', errors='ignore')
                     if 'signin' in preview.lower() or 'login' in preview.lower():
                         return (False, "Auth failed", True)
-                    return (False, "Got HTML instead of ZIP", False)
+                    return (False, "Got HTML instead of ZIP", True)
                 
                 total_size = int(r.headers.get('content-length', 0))
                 
                 if total_size < 1000000:
-                    return (False, f"File too small ({total_size} bytes)", False)
+                    return (False, f"File too small ({total_size} bytes) - likely auth failure", True)
                 
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 
@@ -897,12 +913,24 @@ class TakeoutDownloaderGUI:
                 file_downloaded = 0
                 last_update_time = time.time()
                 last_update_bytes = 0
+                first_chunk = True
                 
                 with open(output_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if self.should_stop:
                             self.msg_queue.put(('download_complete', filename, False))
                             return (False, "Stopped by user", False)
+                        # Validate first chunk is a ZIP file (starts with PK magic bytes)
+                        if first_chunk and chunk:
+                            first_chunk = False
+                            if not chunk[:2] == b'PK':
+                                # Not a ZIP file - likely auth redirect or error page
+                                preview = chunk[:500].decode('utf-8', errors='ignore').lower()
+                                if 'signin' in preview or 'login' in preview or 'accounts.google' in preview:
+                                    self.msg_queue.put(('download_complete', filename, False))
+                                    return (False, "Auth failed - redirected to login", True)
+                                self.msg_queue.put(('download_complete', filename, False))
+                                return (False, "Not a valid ZIP file (wrong magic bytes)", True)
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)

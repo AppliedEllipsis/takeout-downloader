@@ -417,13 +417,13 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
                 preview = r.content[:500].decode('utf-8', errors='ignore')
                 if 'signin' in preview.lower() or 'login' in preview.lower():
                     return (file_num, False, f"[{filename}] Auth failed - cookies invalid/expired", True)
-                return (file_num, False, f"[{filename}] Got HTML instead of ZIP", False)
+                return (file_num, False, f"[{filename}] Got HTML instead of ZIP", True)
             
             total_size = int(r.headers.get('content-length', 0))
             
             # Validate file size - Google Takeout files are typically large
             if total_size < 1000000:  # Less than 1MB is suspicious
-                return (file_num, False, f"[{filename}] File too small ({total_size} bytes) - likely not valid")
+                return (file_num, False, f"[{filename}] File too small ({total_size} bytes) - likely not valid", True)
             
             # Create parent directory if it doesn't exist
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -435,10 +435,20 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
             last_update_time = time.time()
             last_update_bytes = 0
             last_percent_shown = 0
+            first_chunk = True
             
             with open(output_path, 'wb') as f:
                 downloaded = 0
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    # Validate first chunk is a ZIP file (starts with PK magic bytes)
+                    if first_chunk and chunk:
+                        first_chunk = False
+                        if not chunk[:2] == b'PK':
+                            # Not a ZIP file - likely auth redirect or error page
+                            preview = chunk[:500].decode('utf-8', errors='ignore').lower()
+                            if 'signin' in preview or 'login' in preview or 'accounts.google' in preview:
+                                return (file_num, False, f"[{filename}] Auth failed - redirected to login", True)
+                            return (file_num, False, f"[{filename}] Not a valid ZIP file (wrong magic bytes)", True)
                     if chunk:
                         f.write(chunk)
                         chunk_len = len(chunk)

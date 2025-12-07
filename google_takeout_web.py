@@ -2,6 +2,8 @@
 """
 Google Takeout Bulk Downloader - Web Version
 A web interface for downloading Google Takeout archives in headless environments.
+
+This module can be run standalone or launched via: python takeout.py --web
 """
 
 import os
@@ -22,6 +24,18 @@ from urllib3.util.retry import Retry
 from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 
+# Import shared core (if available)
+try:
+    from takeout import (
+        DownloadConfig, DownloadStats, DownloadProgress, NotificationConfig,
+        DownloadEngine, extract_url_parts, extract_cookie_from_curl, 
+        extract_url_from_curl, verify_zip_file, VERSION
+    )
+    USING_SHARED_CORE = True
+except ImportError:
+    USING_SHARED_CORE = False
+    VERSION = "1.5.0"
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -38,6 +52,7 @@ DEFAULT_FILE_COUNT = int(os.environ.get('FILE_COUNT', '100'))
 # Download state
 download_state = {
     'is_running': False,
+    'should_stop': False,  # Flag to stop downloads on auth failure
     'cookie': '',
     'url': '',
     'output_dir': DEFAULT_OUTPUT_DIR,
@@ -63,49 +78,51 @@ MAX_LOG_ENTRIES = 500  # Limit log buffer size
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
-def extract_url_parts(url: str) -> tuple:
-    """Extract URL parts for Google Takeout pattern."""
-    if '?' in url:
-        url_path, query_string = url.split('?', 1)
-    else:
-        url_path, query_string = url, ''
-    
-    match = re.search(r'(.*takeout-[^-]+-)(\d+)-(\d+)(\.\w+)$', url_path)
-    if not match:
-        return None, None, None, None, None
-    
-    base = match.group(1)
-    batch_num = int(match.group(2))
-    file_num = int(match.group(3))
-    ext = match.group(4)
-    
-    return base, batch_num, file_num, ext, query_string
+# Fallback functions if shared core not available
+if not USING_SHARED_CORE:
+    def extract_url_parts(url: str) -> tuple:
+        """Extract URL parts for Google Takeout pattern."""
+        if '?' in url:
+            url_path, query_string = url.split('?', 1)
+        else:
+            url_path, query_string = url, ''
+        
+        match = re.search(r'(.*takeout-[^-]+-)(\d+)-(\d+)(\.\w+)$', url_path)
+        if not match:
+            return None, None, None, None, None
+        
+        base = match.group(1)
+        batch_num = int(match.group(2))
+        file_num = int(match.group(3))
+        ext = match.group(4)
+        
+        return base, batch_num, file_num, ext, query_string
 
-def extract_cookie_from_curl(curl_text: str) -> str:
-    """Extract cookie value from a cURL command or raw cookie string."""
-    if 'curl' in curl_text.lower() or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
-        match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+    def extract_cookie_from_curl(curl_text: str) -> str:
+        """Extract cookie value from a cURL command or raw cookie string."""
+        if 'curl' in curl_text.lower() or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
+            match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        if curl_text.lower().startswith('cookie:'):
+            return curl_text[7:].strip()
+        
+        cookie = curl_text.strip()
+        if (cookie.startswith("'") and cookie.endswith("'")) or \
+           (cookie.startswith('"') and cookie.endswith('"')):
+            cookie = cookie[1:-1]
+        
+        return cookie
+
+    def extract_url_from_curl(curl_text: str) -> str:
+        """Extract the download URL from a cURL command."""
+        match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
-    
-    if curl_text.lower().startswith('cookie:'):
-        return curl_text[7:].strip()
-    
-    cookie = curl_text.strip()
-    if (cookie.startswith("'") and cookie.endswith("'")) or \
-       (cookie.startswith('"') and cookie.endswith('"')):
-        cookie = cookie[1:-1]
-    
-    return cookie
-
-def extract_url_from_curl(curl_text: str) -> str:
-    """Extract the download URL from a cURL command."""
-    match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
-    if match:
-        url = match.group(1)
-        if 'takeout' in url.lower():
-            return url
-    return None
+            url = match.group(1)
+            if 'takeout' in url.lower():
+                return url
+        return None
 
 def create_fast_session(cookie: str) -> requests.Session:
     """Create an optimized session for fast downloads."""
@@ -172,12 +189,14 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> 
                     result['auth_failed'] = True
                     return result
                 result['message'] = 'Got HTML instead of ZIP'
+                result['auth_failed'] = True
                 return result
             
             total_size = int(r.headers.get('content-length', 0))
             
             if total_size < 1000000:
-                result['message'] = f'File too small ({total_size} bytes)'
+                result['message'] = f'File too small ({total_size} bytes) - likely auth failure'
+                result['auth_failed'] = True
                 return result
             
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,9 +209,22 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> 
             
             downloaded = 0
             last_emit_time = time.time()
+            first_chunk = True
             
             with open(output_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    # Validate first chunk is a ZIP file (starts with PK magic bytes)
+                    if first_chunk and chunk:
+                        first_chunk = False
+                        if not chunk[:2] == b'PK':
+                            # Not a ZIP file - likely auth redirect or error page
+                            preview = chunk[:500].decode('utf-8', errors='ignore').lower()
+                            if 'signin' in preview or 'login' in preview or 'accounts.google' in preview:
+                                result['message'] = 'Auth failed - redirected to login'
+                            else:
+                                result['message'] = 'Not a valid ZIP file (wrong magic bytes)'
+                            result['auth_failed'] = True
+                            return result
                     if chunk:
                         f.write(chunk)
                         chunk_len = len(chunk)
@@ -310,6 +342,10 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     # Run downloads in parallel
     auth_failed = False
     
+    # Reset stop flag
+    with state_lock:
+        download_state['should_stop'] = False
+    
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         futures = {
             executor.submit(download_file, d['url'], d['path'], d['index'], cookie): d
@@ -317,8 +353,13 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
         }
         
         for future in as_completed(futures):
-            if auth_failed:
-                continue
+            # Check if we should stop (auth failed or user cancelled)
+            with state_lock:
+                if download_state['should_stop'] or auth_failed:
+                    # Cancel remaining futures
+                    for f in futures:
+                        f.cancel()
+                    break
                 
             result = future.result()
             
@@ -332,6 +373,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                     
                     if result['auth_failed']:
                         auth_failed = True
+                        download_state['should_stop'] = True  # Signal other downloads to stop
             
             # Log file completion
             if result['success']:

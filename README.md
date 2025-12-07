@@ -1,50 +1,75 @@
 # Google Takeout Bulk Downloader
 
-A Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as **GUI**, **CLI**, **Web interface**, and **Docker** deployment.
+A comprehensive Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as **unified CLI**, **GUI**, **Web interface**, and **Docker** deployment.
 
-![CLI](https://img.shields.io/badge/CLI-Available-green) ![GUI](https://img.shields.io/badge/GUI-Available-brightgreen) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![Version](https://img.shields.io/badge/Version-2.0.0-blue) ![CLI](https://img.shields.io/badge/CLI-Available-green) ![GUI](https://img.shields.io/badge/GUI-Available-brightgreen) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
-## Quick Start - Download Pre-built Binaries
+## What's New in v2.0
+
+- **🔗 Unified Script** - Single `takeout.py` with `--web` and `--gui` flags
+- **📥 Resume Partial Downloads** - Interrupted downloads resume from where they left off
+- **✅ ZIP Verification** - Validates downloaded files are not corrupted
+- **⏱️ Auth Expiry Countdown** - Shows time remaining before session expires
+- **🚦 Speed Limiting** - Control bandwidth usage with `--speed-limit`
+- **📧 Email/Webhook Notifications** - Get notified via email or webhook
+- **📂 Auto-Extract & Organize** - Extract ZIPs and organize by Google service type
+
+## Quick Start
+
+### Unified Script (Recommended)
+
+```bash
+# CLI mode (default)
+python takeout.py --cookie "YOUR_COOKIE" --url "https://..."
+
+# Web interface
+python takeout.py --web --port 5000
+
+# Desktop GUI
+python takeout.py --gui
+```
+
+### Pre-built Binaries
 
 Download the latest release for your platform (no Python required):
 
-### CLI (Terminal)
-| Platform | Download |
-|----------|----------|
-| **Linux** | [Google_Takeout_CLI-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **Windows** | [Google_Takeout_CLI-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **macOS** | [Google_Takeout_CLI-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-
-### GUI Application (Desktop)
-| Platform | Download |
-|----------|----------|
-| **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **macOS** | [Google_Takeout_Downloader-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-
-### Web Server (Headless/NAS)
-| Platform | Download |
-|----------|----------|
-| **Linux** | [Google_Takeout_Web-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **Windows** | [Google_Takeout_Web-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-| **macOS** | [Google_Takeout_Web-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
-
-Just download, run, and paste your cookie! For the web version, open `http://localhost:5000` in your browser.
+| Mode | Linux | Windows | macOS |
+|------|-------|---------|-------|
+| **CLI** | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **GUI** | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **Web** | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) | [Download](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
 
 ## Features
 
-- **🖥️ Modern GUI** - User-friendly graphical interface with dark theme
-- **🌐 Web Interface** - Browser-based UI for headless/NAS environments
-- **🐳 Docker Ready** - One-command deployment with docker-compose
+### Core Features
 - **📦 Bulk Downloads** - Automatically downloads all numbered Takeout files
-- **⚡ Parallel Downloads** - Configurable concurrent downloads (default: 4-6)
-- **🔄 Resume Support** - Skips already downloaded files
-- **🔐 Interactive Re-authentication** - Prompts for new cookies when session expires
+- **⚡ Parallel Downloads** - Configurable concurrent downloads (default: 6)
+- **🔄 Resume Support** - Resumes partial downloads and skips completed files
 - **📋 cURL Paste Support** - Just paste the entire cURL command, cookie is extracted automatically
 - **📊 Progress Tracking** - Real-time progress with ETA and download speed
-- **🔔 Desktop Notifications** - Get notified when auth expires or downloads complete
-- **🔊 Sound Alerts** - Audio alerts for auth expiry and completion (CLI)
-- **⚠️ Auth Expiry Warning** - Warns before session expires (~45 min)
+
+### Reliability
+- **✅ ZIP Verification** - Validates downloaded files using CRC checks
+- **🔐 Auth Failure Detection** - Detects expired sessions via ZIP magic bytes
+- **⏱️ Auth Expiry Warning** - Warns ~15 minutes before session expires
+- **🔁 Auto-Retry** - Prompts for new cookie and resumes on auth failure
+
+### Notifications
+- **🔔 Desktop Notifications** - Native notifications on all platforms
+- **🔊 Sound Alerts** - Audio alerts for auth expiry and completion
+- **📧 Email Notifications** - SMTP email alerts for long-running downloads
+- **🌐 Webhook Support** - POST notifications to any URL (Slack, Discord, etc.)
+
+### Post-Processing
+- **📂 Auto-Extract** - Automatically extract downloaded ZIPs
+- **🗂️ Organize by Type** - Sort extracted files by Google service (Photos, Drive, Mail, etc.)
+- **🗑️ Auto-Cleanup** - Optionally delete ZIPs after extraction
+
+### Interfaces
+- **🖥️ Modern GUI** - User-friendly graphical interface with dark theme
+- **🌐 Web Interface** - Browser-based UI for headless/NAS environments
+- **⌨️ CLI** - Full-featured command-line interface
+- **🐳 Docker Ready** - One-command deployment with docker-compose
 
 ## Installation
 
@@ -189,10 +214,10 @@ Then open your browser to `http://your-server:5000`
 Run the web interface directly (without Docker):
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Using unified script (recommended)
+python takeout.py --web --port 5000
 
-# Start web server
+# Or standalone
 python google_takeout_web.py --host 0.0.0.0 --port 5000
 ```
 
@@ -207,7 +232,11 @@ Open `http://your-server:5000` in your browser. The web UI provides:
 Launch the graphical interface:
 
 ```bash
-./venv/bin/python google_takeout_gui.py
+# Using unified script (recommended)
+python takeout.py --gui
+
+# Or standalone
+python google_takeout_gui.py
 ```
 
 The GUI provides:
@@ -220,27 +249,68 @@ The GUI provides:
 ### ⌨️ Command-Line Interface
 
 ```bash
-# Run with settings from .env
-./venv/bin/python google_takeout_downloader.py
+# Using unified script (recommended)
+python takeout.py --cookie "YOUR_COOKIE" --url "https://..."
 
-# Or with command-line arguments
-./venv/bin/python google_takeout_downloader.py \
+# With all features
+python takeout.py \
   --cookie "your_cookie" \
   --url "https://takeout-download..." \
   --output "/path/to/downloads" \
   --count 100 \
-  --parallel 6
+  --parallel 6 \
+  --speed-limit 50 \
+  --auto-extract \
+  --organize \
+  --webhook "https://hooks.slack.com/..."
+
+# Or use legacy script
+python google_takeout_downloader.py
 ```
 
 ### Command-Line Options
 
+#### Basic Options
 | Option | Description | Default |
 |--------|-------------|---------|
+| `--web` | Start web interface | - |
+| `--gui` | Start desktop GUI | - |
 | `--cookie` | Full cookie header string | From `.env` |
 | `--url` | First download URL | From `.env` |
-| `--output` | Output directory | `./downloads` |
-| `--count` | Max files to download | `100` |
-| `--parallel` | Concurrent downloads | `6` |
+| `--output`, `-o` | Output directory | `./downloads` |
+| `--count`, `-n` | Max files to download | `100` |
+| `--parallel`, `-p` | Concurrent downloads | `6` |
+
+#### Advanced Options
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--speed-limit` | Speed limit in MB/s (0 = unlimited) | `0` |
+| `--no-resume` | Disable resume support | Enabled |
+| `--no-verify` | Disable ZIP verification | Enabled |
+
+#### Auto-Extract Options
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--auto-extract` | Auto-extract downloaded ZIPs | Disabled |
+| `--extract-dir` | Directory for extracted files | Same as output |
+| `--organize` | Organize by Google service type | Disabled |
+| `--delete-after-extract` | Delete ZIP after extraction | Disabled |
+
+#### Notification Options
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--webhook` | Webhook URL for notifications | - |
+| `--email` | Email address for notifications | - |
+| `--smtp-host` | SMTP server host | - |
+| `--smtp-port` | SMTP server port | `587` |
+| `--smtp-user` | SMTP username | - |
+| `--smtp-password` | SMTP password | - |
+
+#### Web Server Options
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--host` | Web server host | `0.0.0.0` |
+| `--port` | Web server port | `5000` |
 
 ## Re-authentication
 

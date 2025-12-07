@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY takeout.py .
 COPY google_takeout_web.py .
 
-# Create downloads directory
-RUN mkdir -p /downloads
+# Create downloads directory with open permissions
+RUN mkdir -p /downloads && chmod 777 /downloads
 
 # Environment variables
 ENV OUTPUT_DIR=/downloads

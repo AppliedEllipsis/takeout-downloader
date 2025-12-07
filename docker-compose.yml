@@ -5,28 +5,21 @@ services:
     build: .
     container_name: takeout-downloader
     restart: unless-stopped
+    # Run as current user to avoid permission issues with mounted volumes
+    # Set UID/GID in .env or export before running: export UID=$(id -u) GID=$(id -g)
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "5000:5000"
     volumes:
-      # Mount your downloads directory
+      # Mount your downloads directory (change path as needed)
       - ./downloads:/downloads
-      # Optional: mount .env file for configuration
-      # - ./.env:/app/.env:ro
     environment:
       - OUTPUT_DIR=/downloads
       - PARALLEL_DOWNLOADS=6
       - FILE_COUNT=100
-      # Optional: Set a secret key for Flask sessions
-      # - SECRET_KEY=your-secret-key-here
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-
-# Optional: Add Traefik labels for reverse proxy
-# labels:
-#   - "traefik.enable=true"
-#   - "traefik.http.routers.takeout.rule=Host(`takeout.yourdomain.com`)"
-#   - "traefik.http.services.takeout.loadbalancer.server.port=5000"

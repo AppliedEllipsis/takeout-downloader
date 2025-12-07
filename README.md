@@ -1,5 +1,11 @@
 # Google Takeout Bulk Downloader
 
+> **⚠️ ACTIVE DEVELOPMENT WARNING**
+> 
+> This project is in **highly active development** and will change rapidly over the next week or two. Features may be added, removed, or modified without notice.
+> 
+> **Please [open an issue](https://github.com/clivewatts/takeout_downloader_script/issues) for any problems you experience!**
+
 A simple, robust tool to bulk download Google Takeout archives. Available as **TUI** (Terminal UI) and **Web interface**.
 
 ![Version](https://img.shields.io/badge/Version-4.0.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)

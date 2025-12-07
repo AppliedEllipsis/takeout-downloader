@@ -806,10 +806,10 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-size').textContent = formatBytes(state.stats.bytes_downloaded);
             lastBytesDownloaded = state.stats.bytes_downloaded;
             
-            // Update progress bar
+            // Update progress bar (include skipped in progress)
             const total = state.stats.total_files || 1;
-            const completed = state.stats.completed_files + state.stats.failed_files;
-            const percent = (completed / total) * 100;
+            const completed = state.stats.completed_files + state.stats.failed_files + state.stats.skipped_files;
+            const percent = Math.min((completed / total) * 100, 100);
             document.getElementById('overall-progress').style.width = percent + '%';
             
             // Restore file list
@@ -944,6 +944,19 @@ HTML_TEMPLATE = '''
                 statusEl.textContent = `${percent}%`;
             }
         }
+        
+        // Fetch state on page load (backup in case socket is slow)
+        window.addEventListener('load', () => {
+            fetch('/api/status')
+                .then(res => res.json())
+                .then(state => {
+                    if (state.is_running || state.stats.total_files > 0) {
+                        // Trigger restore via the same handler
+                        socket.emit('request_state');
+                    }
+                })
+                .catch(err => console.log('Could not fetch initial state:', err));
+        });
     </script>
 </body>
 </html>
@@ -1018,6 +1031,17 @@ def handle_connect():
                 'files': download_state['files'],
                 'log': download_state['log'],
             })
+
+@socketio.on('request_state')
+def handle_request_state():
+    """Handle explicit state request from client."""
+    with state_lock:
+        emit('restore_state', {
+            'is_running': download_state['is_running'],
+            'stats': download_state['stats'],
+            'files': download_state['files'],
+            'log': download_state['log'],
+        })
 
 # ============================================================================
 # APP FACTORY

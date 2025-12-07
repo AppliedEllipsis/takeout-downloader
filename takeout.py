@@ -99,17 +99,26 @@ class SizeHistory:
 def extract_url_parts(url: str) -> Tuple[Optional[str], Optional[int], Optional[str], str]:
     """Extract URL parts for Google Takeout pattern.
     
-    Returns: (base_url, batch_num, extension, query_string)
+    Pattern: takeout-TIMESTAMP-BATCH-FILENUM.zip
+    Example: takeout-20251207T071725Z-3-003.zip
+    
+    Returns: (base_url_with_batch, file_num, extension, query_string)
     """
     if '?' in url:
         url_path, query_string = url.split('?', 1)
     else:
         url_path, query_string = url, ''
     
-    # Match pattern like: takeout-20241207T123456Z-001.zip
-    match = re.search(r'(.*takeout-[^-]+-\d+-)(\d+)(\.\w+)$', url_path)
+    # Match pattern: takeout-TIMESTAMP-BATCH-FILENUM.zip
+    # Example: takeout-20251207T071725Z-3-003.zip
+    #          base = everything up to and including "3-"
+    #          file_num = 003
+    match = re.search(r'(.*takeout-\d{8}T\d{6}Z-\d+-)(\d{3})(\.\w+)$', url_path)
     if not match:
-        return None, None, None, ''
+        # Try alternate pattern without timestamp
+        match = re.search(r'(.*takeout-[^-]+-\d+-)(\d{3})(\.\w+)$', url_path)
+        if not match:
+            return None, None, None, ''
     
     base = match.group(1)
     file_num = int(match.group(2))
@@ -221,13 +230,13 @@ class TakeoutDownloader:
         Clean up zero-sized and incomplete files.
         Returns the first file number that needs downloading.
         """
-        first_missing = 1
+        first_missing = None
         
         for num in range(1, self.file_count + 1):
             filepath = self.get_filepath(num)
             
             if not filepath.exists():
-                if first_missing == 1:
+                if first_missing is None:
                     first_missing = num
                 continue
             
@@ -237,7 +246,7 @@ class TakeoutDownloader:
             if size == 0:
                 print(f"  Deleting zero-sized: {filepath.name}")
                 filepath.unlink()
-                if num < first_missing or first_missing == 1:
+                if first_missing is None:
                     first_missing = num
                 continue
             
@@ -246,7 +255,7 @@ class TakeoutDownloader:
             if expected and size < expected:
                 print(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
                 filepath.unlink()
-                if num < first_missing or first_missing == 1:
+                if first_missing is None:
                     first_missing = num
                 continue
             
@@ -254,7 +263,7 @@ class TakeoutDownloader:
             if not expected:
                 self.size_history.record_size(filepath.name, size)
         
-        return first_missing
+        return first_missing if first_missing is not None else 1
     
     def download_file(self, num: int) -> Tuple[bool, str]:
         """

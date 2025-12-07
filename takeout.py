@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Callable
 from datetime import datetime
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -33,9 +34,10 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-DEFAULT_PARALLEL = 3
+DEFAULT_PARALLEL = 1
+MAX_PARALLEL = 20
 DEFAULT_FILE_COUNT = 100
 DEFAULT_OUTPUT_DIR = "./downloads"
 SIZE_HISTORY_FILE = ".takeout_sizes.json"
@@ -170,7 +172,7 @@ class TakeoutDownloader:
     4. Cleans up bad zips and resumes from last good
     """
     
-    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR):
+    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR, parallel: int = DEFAULT_PARALLEL):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.size_history = SizeHistory(output_dir)
@@ -179,8 +181,11 @@ class TakeoutDownloader:
         self.query_string = ""
         self.extension = ".zip"
         self.file_count = DEFAULT_FILE_COUNT
+        self.parallel = min(max(1, parallel), MAX_PARALLEL)  # Clamp to 1-20
         self.should_stop = False
+        self.auth_failed = False  # Flag for parallel downloads
         self.stats = DownloadStats()
+        self._lock = threading.Lock()  # For thread-safe stats updates
     
     def set_curl(self, curl_text: str) -> bool:
         """Set cookie and URL from cURL command."""
@@ -388,14 +393,17 @@ class TakeoutDownloader:
         """
         Main download loop.
         Keeps trying until all files downloaded or user quits.
+        Supports parallel downloads with simple auth retry.
         """
         self.file_count = file_count
         self.stats = DownloadStats(start_time=datetime.now())
         self.should_stop = False
+        self.auth_failed = False
         
         print(f"\nGoogle Takeout Downloader v{VERSION}")
         print(f"Output: {self.output_dir}")
         print(f"Max files: {file_count}")
+        print(f"Parallel: {self.parallel}")
         print("-" * 60)
         
         # Initial cURL if not set
@@ -404,67 +412,114 @@ class TakeoutDownloader:
                 print("No cURL provided, exiting.")
                 return self.stats
         
-        consecutive_404 = 0
-        current_file = 1
-        
-        while current_file <= file_count and not self.should_stop:
+        while not self.should_stop:
             # Clean up any bad files first
             print(f"\nChecking for incomplete downloads...")
             first_needed = self.cleanup_bad_files()
-            if first_needed > current_file:
-                current_file = first_needed
             
-            print(f"\nStarting from file {current_file}...")
-            
-            while current_file <= file_count and not self.should_stop:
-                filepath = self.get_filepath(current_file)
-                
-                # Skip existing good files
+            # Build list of files to download
+            to_download = []
+            for num in range(first_needed, file_count + 1):
+                filepath = self.get_filepath(num)
                 if filepath.exists() and filepath.stat().st_size > 0:
                     expected = self.size_history.get_expected_size(filepath.name)
                     if not expected or filepath.stat().st_size >= expected:
-                        print(f"✓ {filepath.name} (exists)")
-                        self.stats.skipped_files += 1
-                        current_file += 1
+                        continue  # Skip existing good files
+                to_download.append(num)
+            
+            if not to_download:
+                print("\nAll files downloaded!")
+                break
+            
+            print(f"\nDownloading {len(to_download)} files starting from {to_download[0]}...")
+            
+            # Reset auth flag
+            self.auth_failed = False
+            consecutive_404 = 0
+            
+            if self.parallel == 1:
+                # Sequential mode (simpler)
+                for num in to_download:
+                    if self.should_stop or self.auth_failed:
+                        break
+                    
+                    filepath = self.get_filepath(num)
+                    success, error = self.download_file(num)
+                    
+                    if success:
+                        print(f"✓ {filepath.name}")
+                        with self._lock:
+                            self.stats.completed_files += 1
                         consecutive_404 = 0
-                        continue
-                
-                # Try to download
-                success, error = self.download_file(current_file)
-                
-                if success:
-                    print(f"✓ {filepath.name}")
-                    self.stats.completed_files += 1
-                    current_file += 1
-                    consecutive_404 = 0
-                    
-                elif error == "AUTH_FAILED":
-                    print(f"\n✗ Auth failed on file {current_file}")
-                    # Prompt for new cURL
-                    if not self.prompt_new_curl():
-                        print("No new cURL provided, stopping.")
-                        self.should_stop = True
+                        
+                    elif error == "AUTH_FAILED":
+                        print(f"\n✗ Auth failed on file {num}")
+                        self.auth_failed = True
                         break
-                    # Don't increment - retry same file
-                    consecutive_404 = 0
+                        
+                    elif error == "NOT_FOUND":
+                        consecutive_404 += 1
+                        print(f"✗ {filepath.name} not found (404)")
+                        if consecutive_404 >= 3:
+                            print(f"\n3 consecutive 404s - assuming done")
+                            self.should_stop = True
+                            break
+                            
+                    else:
+                        print(f"✗ {filepath.name}: {error}")
+                        with self._lock:
+                            self.stats.failed_files += 1
+                        consecutive_404 = 0
+            else:
+                # Parallel mode
+                with ThreadPoolExecutor(max_workers=self.parallel) as executor:
+                    futures = {executor.submit(self.download_file, num): num for num in to_download}
                     
-                elif error == "NOT_FOUND":
-                    consecutive_404 += 1
-                    print(f"✗ {filepath.name} not found (404)")
-                    
-                    # After 3 consecutive 404s, assume we've reached the end
-                    if consecutive_404 >= 3:
-                        print(f"\n3 consecutive 404s - assuming all files downloaded")
-                        break
-                    
-                    current_file += 1
-                    
-                else:
-                    # Other error - log and continue
-                    print(f"\n✗ {filepath.name}: {error}")
-                    self.stats.failed_files += 1
-                    current_file += 1
-                    consecutive_404 = 0
+                    for future in as_completed(futures):
+                        if self.should_stop or self.auth_failed:
+                            # Cancel remaining futures
+                            for f in futures:
+                                f.cancel()
+                            break
+                        
+                        num = futures[future]
+                        filepath = self.get_filepath(num)
+                        
+                        try:
+                            success, error = future.result()
+                            
+                            if success:
+                                print(f"✓ {filepath.name}")
+                                with self._lock:
+                                    self.stats.completed_files += 1
+                                    
+                            elif error == "AUTH_FAILED":
+                                print(f"\n✗ Auth failed on file {num}")
+                                self.auth_failed = True
+                                
+                            elif error == "NOT_FOUND":
+                                print(f"✗ {filepath.name} not found (404)")
+                                # Don't track consecutive 404s in parallel mode
+                                
+                            else:
+                                print(f"✗ {filepath.name}: {error}")
+                                with self._lock:
+                                    self.stats.failed_files += 1
+                                    
+                        except Exception as e:
+                            print(f"✗ {filepath.name}: {e}")
+                            with self._lock:
+                                self.stats.failed_files += 1
+            
+            # Handle auth failure - prompt for new cURL and retry
+            if self.auth_failed:
+                if not self.prompt_new_curl():
+                    print("No new cURL provided, stopping.")
+                    break
+                # Loop will continue and retry remaining files
+            else:
+                # No auth failure - we're done
+                break
         
         # Summary
         print("\n" + "=" * 60)
@@ -494,7 +549,8 @@ def run_cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          # Interactive mode
+  %(prog)s                          # Interactive mode (sequential)
+  %(prog)s -p 5                     # 5 parallel downloads
   %(prog)s -n 50                    # Download up to 50 files
   %(prog)s -o /path/to/downloads    # Custom output directory
   %(prog)s --web                    # Start web interface
@@ -511,6 +567,8 @@ Examples:
                        help=f'Output directory (default: {DEFAULT_OUTPUT_DIR})')
     parser.add_argument('--count', '-n', type=int, default=DEFAULT_FILE_COUNT,
                        help=f'Max files to download (default: {DEFAULT_FILE_COUNT})')
+    parser.add_argument('--parallel', '-p', type=int, default=DEFAULT_PARALLEL,
+                       help=f'Parallel downloads 1-{MAX_PARALLEL} (default: {DEFAULT_PARALLEL})')
     
     # Web options
     parser.add_argument('--port', type=int, default=5000, help='Web server port')
@@ -530,7 +588,7 @@ Examples:
         return
     
     # CLI mode
-    downloader = TakeoutDownloader(args.output)
+    downloader = TakeoutDownloader(args.output, args.parallel)
     
     try:
         downloader.run(args.count)

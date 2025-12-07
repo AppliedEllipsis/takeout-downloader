@@ -130,7 +130,28 @@ docker run -d -p 5000:5000 -v $(pwd)/downloads:/downloads takeout-downloader
 | `PARALLEL_DOWNLOADS` | Concurrent downloads | `6` |
 | `FILE_COUNT` | Max files to download | `100` |
 
-## Building Standalone Binary
+## Pre-built Binaries
+
+Download the latest release for your platform (no Python required):
+
+| Platform | Download |
+|----------|----------|
+| **Linux** | [takeout-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-linux-x64) |
+| **Windows** | [takeout-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-windows-x64.exe) |
+| **macOS** | [takeout-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-macos-x64) |
+
+```bash
+# Linux/macOS
+chmod +x takeout-linux-x64
+./takeout-linux-x64              # TUI mode
+./takeout-linux-x64 --web        # Web mode
+
+# Windows
+takeout-windows-x64.exe          # TUI mode
+takeout-windows-x64.exe --web    # Web mode
+```
+
+## Building from Source
 
 Build a single executable that includes both TUI and Web modes:
 
@@ -140,11 +161,6 @@ python build.py
 ```
 
 Output: `dist/takeout` (Linux/macOS) or `dist/takeout.exe` (Windows)
-
-```bash
-./takeout              # TUI mode
-./takeout --web        # Web mode
-```
 
 ## How It Works
 

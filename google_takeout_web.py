@@ -650,7 +650,7 @@ HTML_TEMPLATE = '''
                     <input type="number" id="parallel" value="{{ parallel }}" min="1" max="10">
                 </div>
                 <div class="form-group">
-                    <label for="file-count">Max Files</label>
+                    <label for="file-count">Parts</label>
                     <input type="number" id="file-count" value="{{ file_count }}" min="1" max="500">
                 </div>
             </div>
@@ -877,22 +877,25 @@ HTML_TEMPLATE = '''
         socket.on('stats_update', (stats) => {
             document.getElementById('stat-complete').textContent = stats.completed_files;
             document.getElementById('stat-failed').textContent = stats.failed_files;
+            document.getElementById('stat-skipped').textContent = stats.skipped_files;
             document.getElementById('stat-size').textContent = formatBytes(stats.bytes_downloaded);
             
-            // Calculate speed
+            // Calculate speed - update every 0.5 seconds for faster feedback
             const now = Date.now();
             const elapsed = (now - lastSpeedUpdate) / 1000;
-            if (elapsed >= 1) {
+            if (elapsed >= 0.5) {
                 const bytesDelta = stats.bytes_downloaded - lastBytesDownloaded;
                 const speed = bytesDelta / elapsed;
-                document.getElementById('stat-speed').textContent = formatBytes(speed) + '/s';
+                if (speed > 0) {
+                    document.getElementById('stat-speed').textContent = formatBytes(speed) + '/s';
+                }
                 lastBytesDownloaded = stats.bytes_downloaded;
                 lastSpeedUpdate = now;
             }
             
             // Update progress bar
             const total = parseInt(document.getElementById('stat-total').textContent) || 1;
-            const completed = stats.completed_files + stats.failed_files;
+            const completed = stats.completed_files + stats.failed_files + stats.skipped_files;
             const percent = (completed / total) * 100;
             document.getElementById('overall-progress').style.width = percent + '%';
         });

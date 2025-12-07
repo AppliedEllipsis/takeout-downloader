@@ -931,6 +931,19 @@ class TakeoutDownloaderGUI:
                                     return (False, "Auth failed - redirected to login", True)
                                 self.msg_queue.put(('download_complete', filename, False))
                                 return (False, "Not a valid ZIP file (wrong magic bytes)", True)
+                            
+                            # Check if first chunk matches any existing file (duplicate detection)
+                            # Google returns file 001 for all requests when download limit is hit
+                            for existing_file in output_path.parent.glob("*.zip"):
+                                if existing_file != output_path:
+                                    try:
+                                        with open(existing_file, 'rb') as ef:
+                                            existing_first = ef.read(len(chunk))
+                                            if existing_first == chunk:
+                                                self.msg_queue.put(('download_complete', filename, False))
+                                                return (False, f"Duplicate of {existing_file.name} - download limit reached", True)
+                                    except:
+                                        pass
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)

@@ -449,6 +449,18 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
                             if 'signin' in preview or 'login' in preview or 'accounts.google' in preview:
                                 return (file_num, False, f"[{filename}] Auth failed - redirected to login", True)
                             return (file_num, False, f"[{filename}] Not a valid ZIP file (wrong magic bytes)", True)
+                        
+                        # Check if first chunk matches any existing file (duplicate detection)
+                        # Google returns file 001 for all requests when download limit is hit
+                        for existing_file in output_path.parent.glob("*.zip"):
+                            if existing_file != output_path:
+                                try:
+                                    with open(existing_file, 'rb') as ef:
+                                        existing_first = ef.read(len(chunk))
+                                        if existing_first == chunk:
+                                            return (file_num, False, f"[{filename}] Duplicate of {existing_file.name} - download limit reached", True)
+                                except:
+                                    pass
                     if chunk:
                         f.write(chunk)
                         chunk_len = len(chunk)

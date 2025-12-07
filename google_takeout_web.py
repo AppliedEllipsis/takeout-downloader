@@ -225,6 +225,21 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> 
                                 result['message'] = 'Not a valid ZIP file (wrong magic bytes)'
                             result['auth_failed'] = True
                             return result
+                        
+                        # Check if first chunk matches any existing file (duplicate detection)
+                        # Google returns file 001 for all requests when download limit is hit
+                        output_dir = output_path.parent
+                        for existing_file in output_dir.glob("*.zip"):
+                            if existing_file != output_path:
+                                try:
+                                    with open(existing_file, 'rb') as ef:
+                                        existing_first = ef.read(len(chunk))
+                                        if existing_first == chunk:
+                                            result['message'] = f'Duplicate of {existing_file.name} - download limit reached (5 per file)'
+                                            result['auth_failed'] = True
+                                            return result
+                                except:
+                                    pass
                     if chunk:
                         f.write(chunk)
                         chunk_len = len(chunk)

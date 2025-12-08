@@ -6,13 +6,13 @@ services:
     container_name: takeout-downloader
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5001:5000"
     volumes:
       # Mount your downloads directory (change path as needed)
       - /path/to/downloads:/downloads
     environment:
       - OUTPUT_DIR=/downloads
-      - PARALLEL_DOWNLOADS=6
+      - PARALLEL_DOWNLOADS=2
       - FILE_COUNT=100
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]

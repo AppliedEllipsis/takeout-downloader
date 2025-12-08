@@ -85,7 +85,7 @@ def add_log(message: str, log_type: str = 'info'):
     socketio.emit('log_entry', entry)
 
 def download_file(url: str, output_path: Path, file_index: int, cookie: str, size_history: SizeHistory) -> dict:
-    """Download a single file with progress tracking."""
+    """Download a single file with progress tracking and resume support."""
     filename = output_path.name
     result = {
         'index': file_index,
@@ -96,13 +96,27 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         'size': 0,
     }
     
+    temp_path = output_path.with_suffix('.downloading')
+    resume_from = 0
+    
+    # Check for existing partial download to resume
+    if temp_path.exists():
+        resume_from = temp_path.stat().st_size
+    
     try:
+        headers = {
+            'Cookie': cookie,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+        
+        # Add Range header for resume
+        if resume_from > 0:
+            headers['Range'] = f'bytes={resume_from}-'
+            add_log(f'Resuming {filename} from {resume_from/(1024*1024):.1f}MB', 'info')
+        
         response = requests.get(
             url,
-            headers={
-                'Cookie': cookie,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
+            headers=headers,
             stream=True,
             timeout=(10, 300),
         )
@@ -111,12 +125,31 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         if response.status_code in (401, 403):
             result['message'] = 'Auth failed'
             result['auth_failed'] = True
+            # Keep partial file for resume
             return result
         
         if 'accounts.google' in response.url:
             result['message'] = 'Auth failed - redirected to login'
             result['auth_failed'] = True
             return result
+        
+        # 416 = Range Not Satisfiable (file might be complete)
+        if response.status_code == 416:
+            if resume_from > 0:
+                # Verify with HEAD request
+                head_resp = requests.head(url, headers={'Cookie': cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
+                if head_resp.status_code == 200:
+                    expected_size = int(head_resp.headers.get('content-length', 0))
+                    if expected_size > 0 and resume_from >= expected_size:
+                        temp_path.rename(output_path)
+                        size_history.record_size(filename, resume_from)
+                        result['success'] = True
+                        result['message'] = 'Resumed complete'
+                        result['size'] = resume_from
+                        return result
+            temp_path.unlink(missing_ok=True)
+            # Retry without resume (recursive call with fresh state)
+            return download_file(url, output_path, file_index, cookie, size_history)
         
         response.raise_for_status()
         
@@ -126,8 +159,18 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             result['auth_failed'] = True
             return result
         
-        total_size = int(response.headers.get('content-length', 0))
-        if total_size < 1000:
+        # Get total size - for 206 Partial Content, content-length is remaining bytes
+        content_length = int(response.headers.get('content-length', 0))
+        
+        if response.status_code == 206:
+            total_size = resume_from + content_length
+        else:
+            total_size = content_length
+            if resume_from > 0:
+                # Server doesn't support resume, start fresh
+                resume_from = 0
+        
+        if total_size < 1000 and resume_from == 0:
             result['message'] = 'Auth failed - file too small'
             result['auth_failed'] = True
             return result
@@ -138,16 +181,18 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             'index': file_index,
             'filename': filename,
             'size': total_size,
+            'resumed_from': resume_from,
         })
         
-        temp_path = output_path.with_suffix('.downloading')
-        downloaded = 0
+        # Open file in append mode for resume, write mode for fresh
+        file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
+        downloaded = resume_from
         last_emit_time = time.time()
         
-        with open(temp_path, 'wb') as f:
+        with open(temp_path, file_mode) as f:
             for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                 if chunk:
-                    # Check first chunk for ZIP magic
+                    # Check first chunk for ZIP magic (only on fresh downloads)
                     if downloaded == 0 and chunk[:2] != b'PK':
                         temp_path.unlink()
                         result['message'] = 'Auth failed - not a ZIP'
@@ -186,9 +231,11 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         if e.response and e.response.status_code == 404:
             result['message'] = 'File not found (404)'
             return result
+        # Keep partial file for resume
         result['message'] = f'HTTP error: {e}'
         return result
     except requests.exceptions.RequestException as e:
+        # Keep partial file for resume
         result['message'] = f'Network error: {e}'
         return result
 

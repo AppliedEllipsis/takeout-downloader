@@ -234,11 +234,26 @@ class TakeoutDownloader:
         """
         Clean up zero-sized and incomplete files.
         Returns the first file number that needs downloading.
+        
+        Note: .downloading files are preserved for resume support.
         """
         first_missing = None
         
         for num in range(1, self.file_count + 1):
             filepath = self.get_filepath(num)
+            temp_path = filepath.with_suffix('.downloading')
+            
+            # Check if there's a partial download to resume
+            if temp_path.exists():
+                partial_size = temp_path.stat().st_size
+                if partial_size > 0:
+                    print(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
+                    if first_missing is None:
+                        first_missing = num
+                    continue
+                else:
+                    # Zero-sized partial, delete it
+                    temp_path.unlink()
             
             if not filepath.exists():
                 if first_missing is None:
@@ -272,8 +287,13 @@ class TakeoutDownloader:
     
     def download_file(self, num: int) -> Tuple[bool, str]:
         """
-        Download a single file.
+        Download a single file with resume support.
         Returns: (success, error_message)
+        
+        Resume logic:
+        - If .downloading file exists, resume from that byte offset
+        - Uses HTTP Range header for partial content
+        - Preserves partial file on auth failure for later resume
         """
         filepath = self.get_filepath(num)
         url = self.get_url(num)
@@ -285,24 +305,58 @@ class TakeoutDownloader:
             if size > 0 and (not expected or size >= expected):
                 return True, "already exists"
         
+        temp_path = filepath.with_suffix('.downloading')
+        resume_from = 0
+        
+        # Check for existing partial download to resume
+        if temp_path.exists():
+            resume_from = temp_path.stat().st_size
+            if resume_from > 0:
+                print(f"  [{filepath.name}] Resuming from {resume_from/(1024*1024):.1f}MB")
+        
         try:
+            headers = {
+                'Cookie': self.cookie,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            }
+            
+            # Add Range header for resume
+            if resume_from > 0:
+                headers['Range'] = f'bytes={resume_from}-'
+            
             response = requests.get(
                 url,
-                headers={
-                    'Cookie': self.cookie,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                },
+                headers=headers,
                 stream=True,
                 timeout=(10, 300),
             )
             
             # Check for auth failure via status
             if response.status_code in (401, 403):
+                # Keep partial file for resume
                 return False, "AUTH_FAILED"
             
             # Check for redirect to login
             if response.status_code == 302 or 'accounts.google' in response.url:
                 return False, "AUTH_FAILED"
+            
+            # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
+            if response.status_code == 416:
+                # Try without range header - file might be complete
+                if resume_from > 0:
+                    print(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
+                    # Verify with a fresh request to get content-length
+                    head_resp = requests.head(url, headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
+                    if head_resp.status_code == 200:
+                        expected_size = int(head_resp.headers.get('content-length', 0))
+                        if expected_size > 0 and resume_from >= expected_size:
+                            # File is complete, rename it
+                            temp_path.rename(filepath)
+                            self.size_history.record_size(filepath.name, resume_from)
+                            return True, "resumed-complete"
+                # Otherwise restart from scratch
+                temp_path.unlink(missing_ok=True)
+                return self.download_file(num)  # Retry without resume
             
             response.raise_for_status()
             
@@ -311,23 +365,37 @@ class TakeoutDownloader:
             if 'text/html' in content_type:
                 return False, "AUTH_FAILED"
             
-            # Get expected size
-            total_size = int(response.headers.get('content-length', 0))
-            if total_size < 1000:
+            # Get total size - for 206 Partial Content, content-length is remaining bytes
+            content_length = int(response.headers.get('content-length', 0))
+            
+            # For resumed downloads (206), total = resume_from + content_length
+            # For fresh downloads (200), total = content_length
+            if response.status_code == 206:
+                total_size = resume_from + content_length
+            else:
+                total_size = content_length
+                # Fresh download - reset resume_from
+                if resume_from > 0:
+                    print(f"  [{filepath.name}] Server doesn't support resume, starting fresh")
+                    resume_from = 0
+            
+            if total_size < 1000 and resume_from == 0:
                 return False, "AUTH_FAILED"  # Too small, probably auth page
             
-            # Download to temp file first
-            temp_path = filepath.with_suffix('.downloading')
-            downloaded = 0
+            # Open file in append mode for resume, write mode for fresh
+            file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
+            downloaded = resume_from
             
-            with open(temp_path, 'wb') as f:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(temp_path, file_mode) as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if self.should_stop:
-                        temp_path.unlink()
+                        # Keep partial file for resume on stop
                         return False, "stopped"
                     
                     if chunk:
-                        # Check first chunk for ZIP magic
+                        # Check first chunk for ZIP magic (only on fresh downloads)
                         if downloaded == 0 and chunk[:2] != b'PK':
                             temp_path.unlink()
                             return False, "AUTH_FAILED"
@@ -352,8 +420,10 @@ class TakeoutDownloader:
         except requests.exceptions.HTTPError as e:
             if e.response and e.response.status_code == 404:
                 return False, "NOT_FOUND"
+            # Keep partial file for resume on network errors
             return False, f"HTTP error: {e}"
         except requests.exceptions.RequestException as e:
+            # Keep partial file for resume on network errors
             return False, f"Network error: {e}"
     
     def prompt_new_curl(self) -> bool:

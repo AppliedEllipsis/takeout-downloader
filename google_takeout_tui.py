@@ -375,7 +375,7 @@ class TakeoutTUI(App):
         self.call_from_thread(self.download_complete)
     
     def download_file(self, num: int) -> tuple:
-        """Download a single file with progress updates."""
+        """Download a single file with progress updates and resume support."""
         if not self.downloader:
             return False, "No downloader"
         
@@ -383,23 +383,38 @@ class TakeoutTUI(App):
         url = self.downloader.get_url(num)
         filename = filepath.name
         
+        temp_path = filepath.with_suffix('.downloading')
+        resume_from = 0
+        
+        # Check for existing partial download to resume
+        if temp_path.exists():
+            resume_from = temp_path.stat().st_size
+        
         # Add to active downloads
         with self._lock:
-            self.active_downloads[filename] = ActiveDownload(filename=filename, status="Connecting")
+            status = f"Resuming from {resume_from/(1024*1024):.1f}MB" if resume_from > 0 else "Connecting"
+            self.active_downloads[filename] = ActiveDownload(filename=filename, status=status, downloaded=resume_from)
         self.call_from_thread(self.update_downloads_table)
         
         try:
+            headers = {
+                'Cookie': self.downloader.cookie,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            }
+            
+            # Add Range header for resume
+            if resume_from > 0:
+                headers['Range'] = f'bytes={resume_from}-'
+            
             response = requests.get(
                 url,
-                headers={
-                    'Cookie': self.downloader.cookie,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                },
+                headers=headers,
                 stream=True,
                 timeout=(10, 300),
             )
             
             if response.status_code in (401, 403):
+                # Keep partial file for resume
                 return False, "AUTH_FAILED"
             
             if response.status_code == 404:
@@ -408,14 +423,41 @@ class TakeoutTUI(App):
             if 'accounts.google' in response.url:
                 return False, "AUTH_FAILED"
             
+            # 416 = Range Not Satisfiable (file might be complete)
+            if response.status_code == 416:
+                if resume_from > 0:
+                    # Verify with HEAD request
+                    head_resp = requests.head(url, headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
+                    if head_resp.status_code == 200:
+                        expected_size = int(head_resp.headers.get('content-length', 0))
+                        if expected_size > 0 and resume_from >= expected_size:
+                            temp_path.rename(filepath)
+                            self.downloader.size_history.record_size(filename, resume_from)
+                            return True, "resumed-complete"
+                temp_path.unlink(missing_ok=True)
+                # Retry without resume
+                with self._lock:
+                    self.active_downloads[filename] = ActiveDownload(filename=filename, status="Restarting")
+                return self.download_file(num)
+            
             response.raise_for_status()
             
             content_type = response.headers.get('content-type', '')
             if 'text/html' in content_type:
                 return False, "AUTH_FAILED"
             
-            total_size = int(response.headers.get('content-length', 0))
-            if total_size < 1000:
+            # Get total size - for 206 Partial Content, content-length is remaining bytes
+            content_length = int(response.headers.get('content-length', 0))
+            
+            if response.status_code == 206:
+                total_size = resume_from + content_length
+            else:
+                total_size = content_length
+                if resume_from > 0:
+                    # Server doesn't support resume, start fresh
+                    resume_from = 0
+            
+            if total_size < 1000 and resume_from == 0:
                 return False, "AUTH_FAILED"
             
             # Update active download info
@@ -425,18 +467,20 @@ class TakeoutTUI(App):
                     self.active_downloads[filename].status = "Downloading"
             
             filepath.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = filepath.with_suffix('.downloading')
             
-            downloaded = 0
+            # Open file in append mode for resume, write mode for fresh
+            file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
+            downloaded = resume_from
             last_update = datetime.now()
             
-            with open(temp_path, 'wb') as f:
+            with open(temp_path, file_mode) as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if self.downloader.should_stop:
-                        temp_path.unlink()
+                        # Keep partial file for resume on stop
                         return False, "Stopped"
                     
                     if chunk:
+                        # Check first chunk for ZIP magic (only on fresh downloads)
                         if downloaded == 0 and chunk[:2] != b'PK':
                             temp_path.unlink()
                             return False, "AUTH_FAILED"
@@ -463,8 +507,10 @@ class TakeoutTUI(App):
         except requests.exceptions.HTTPError as e:
             if e.response and e.response.status_code == 404:
                 return False, "NOT_FOUND"
+            # Keep partial file for resume
             return False, str(e)
         except requests.exceptions.RequestException as e:
+            # Keep partial file for resume
             return False, str(e)
     
     def handle_auth_failure(self):

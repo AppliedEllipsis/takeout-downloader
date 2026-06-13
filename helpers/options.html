@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 24px; }
+        h2 { color: #a855f7; margin-bottom: 16px; }
+        .section { margin-bottom: 16px; }
+        label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
+        input, select { width: 100%; padding: 10px; background: #2d2d3f; border: 1px solid #4b5563; border-radius: 6px; color: #f8fafc; font-size: 14px; }
+        button { padding: 10px 20px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #6d28d9; }
+        .status { padding: 12px; background: #2d2d3f; border-radius: 6px; font-size: 14px; margin-top: 12px; }
+        .status.ok { color: #22c55e; }
+        .status.err { color: #ef4444; }
+    </style>
+</head>
+<body>
+    <h2>⚙️ Takeout Helper Settings</h2>
+
+    <div class="section">
+        <label>Downloader Server URL</label>
+        <input type="text" id="serverUrl" value="http://localhost:5000">
+    </div>
+
+    <div class="section">
+        <label>Authentication User</label>
+        <input type="text" id="authUser" placeholder="admin">
+    </div>
+
+    <div class="section">
+        <label>Authentication Password</label>
+        <input type="password" id="authPass">
+    </div>
+
+    <div class="section">
+        <label>Default Output Directory</label>
+        <input type="text" id="outputDir" value="/downloads">
+    </div>
+
+    <div class="section">
+        <label>Default Parallel Downloads</label>
+        <input type="number" id="parallel" value="6" min="1" max="20">
+    </div>
+
+    <div class="section">
+        <label>Default File Count</label>
+        <input type="number" id="fileCount" value="100" min="1" max="1000">
+    </div>
+
+    <button onclick="save()">Save Settings</button>
+
+    <div id="status" class="status"></div>
+
+    <script src="options.js"></script>
+</body>
+</html>

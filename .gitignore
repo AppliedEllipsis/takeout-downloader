@@ -29,3 +29,8 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+# Helper extension build artifacts
+helpers/*.crx
+helpers/*.pem
+helpers/icons/

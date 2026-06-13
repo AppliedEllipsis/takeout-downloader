@@ -30,8 +30,16 @@ import requests
 from takeout import (
     TakeoutDownloader, SizeHistory, DownloadStats,
     extract_url_parts, extract_cookie_from_curl, extract_url_from_curl,
-    VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL, MAX_PARALLEL
+    validate_output_dir, generate_secret_key,
+    VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL,
+    MAX_PARALLEL, MAX_FILE_COUNT, MAX_RETRIES
 )
+
+try:
+    from aria2c_integration import detect_aria2c, Aria2cManager
+    ARIA2C_AVAILABLE = detect_aria2c()
+except ImportError:
+    ARIA2C_AVAILABLE = False
 
 
 @dataclass
@@ -165,8 +173,9 @@ class TakeoutTUI(App):
     
     def on_mount(self) -> None:
         """Called when app is mounted."""
+        aria2c_status = " (aria2c: available)" if ARIA2C_AVAILABLE else " (aria2c: not found)"
         self.title = f"Google Takeout Downloader v{VERSION}"
-        self.sub_title = "TUI Mode - Parallel Downloads"
+        self.sub_title = f"TUI Mode - Parallel Downloads{aria2c_status}"
         
         # Setup downloads table
         table = self.query_one("#downloads-table", DataTable)
@@ -175,6 +184,11 @@ class TakeoutTUI(App):
         self.log_message(f"Google Takeout Downloader v{VERSION}")
         self.log_message("Paste a cURL command and click Start")
         self.log_message("Keys: Q=quit, S=start, X=stop, C=clear")
+        if ARIA2C_AVAILABLE:
+            self.log_message("aria2c detected — available for high-speed downloads")
+        else:
+            self.log_message("Tip: Install aria2c for multi-connection downloads (apt install aria2)")
+        self.log_message("Helper: Use bookmarklet or userscript from helpers/ to auto-capture cURL")
         
         self.update_stats_display()
     
@@ -260,6 +274,7 @@ class TakeoutTUI(App):
         
         try:
             file_count = int(self.query_one("#count-input", Input).value.strip() or DEFAULT_FILE_COUNT)
+            file_count = min(max(1, file_count), MAX_FILE_COUNT)
         except ValueError:
             file_count = DEFAULT_FILE_COUNT
         
@@ -272,6 +287,14 @@ class TakeoutTUI(App):
             self.log_message("ERROR: Paste a cURL command first!", "error")
             return
         
+        # Validate output directory
+        try:
+            validated_dir = validate_output_dir(output_dir)
+            output_dir = str(validated_dir)
+        except ValueError as e:
+            self.log_message(f"ERROR: Invalid output directory: {e}", "error")
+            return
+
         # Create downloader
         self.downloader = TakeoutDownloader(output_dir, parallel)
         
@@ -375,7 +398,7 @@ class TakeoutTUI(App):
         self.call_from_thread(self.download_complete)
     
     def download_file(self, num: int) -> tuple:
-        """Download a single file with progress updates and resume support."""
+        """Download a single file with progress updates, resume support, and retry loop."""
         if not self.downloader:
             return False, "No downloader"
         
@@ -396,122 +419,145 @@ class TakeoutTUI(App):
             self.active_downloads[filename] = ActiveDownload(filename=filename, status=status, downloaded=resume_from)
         self.call_from_thread(self.update_downloads_table)
         
-        try:
-            headers = {
-                'Cookie': self.downloader.cookie,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
-            
-            # Add Range header for resume
-            if resume_from > 0:
-                headers['Range'] = f'bytes={resume_from}-'
-            
-            response = requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=(10, 300),
-            )
-            
-            if response.status_code in (401, 403):
-                # Keep partial file for resume
-                return False, "AUTH_FAILED"
-            
-            if response.status_code == 404:
-                return False, "NOT_FOUND"
-            
-            if 'accounts.google' in response.url:
-                return False, "AUTH_FAILED"
-            
-            # 416 = Range Not Satisfiable (file might be complete)
-            if response.status_code == 416:
+        # Retry loop — replaces the old recursive call on 416
+        for attempt in range(MAX_RETRIES):
+            try:
+                headers = {
+                    'Cookie': self.downloader.cookie,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                }
+                
+                # Add Range header for resume
                 if resume_from > 0:
-                    # Verify with HEAD request
-                    head_resp = requests.head(url, headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
-                    if head_resp.status_code == 200:
-                        expected_size = int(head_resp.headers.get('content-length', 0))
-                        if expected_size > 0 and resume_from >= expected_size:
-                            temp_path.rename(filepath)
-                            self.downloader.size_history.record_size(filename, resume_from)
-                            return True, "resumed-complete"
-                temp_path.unlink(missing_ok=True)
-                # Retry without resume
-                with self._lock:
-                    self.active_downloads[filename] = ActiveDownload(filename=filename, status="Restarting")
-                return self.download_file(num)
-            
-            response.raise_for_status()
-            
-            content_type = response.headers.get('content-type', '')
-            if 'text/html' in content_type:
-                return False, "AUTH_FAILED"
-            
-            # Get total size - for 206 Partial Content, content-length is remaining bytes
-            content_length = int(response.headers.get('content-length', 0))
-            
-            if response.status_code == 206:
-                total_size = resume_from + content_length
-            else:
-                total_size = content_length
-                if resume_from > 0:
-                    # Server doesn't support resume, start fresh
+                    headers['Range'] = f'bytes={resume_from}-'
+                
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=(10, 300),
+                )
+                
+                # Check for auth failure via status
+                if response.status_code in (401, 403):
+                    return False, "AUTH_FAILED"
+                
+                if response.status_code == 404:
+                    return False, "NOT_FOUND"
+                
+                # requests follows redirects by default, so 302 won't be seen here.
+                # Check if the final URL redirected to a login page.
+                if 'accounts.google' in response.url:
+                    return False, "AUTH_FAILED"
+                
+                # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
+                if response.status_code == 416:
+                    if resume_from > 0:
+                        # Verify with HEAD request
+                        head_resp = requests.head(url, headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
+                        if head_resp.status_code == 200:
+                            expected_size = int(head_resp.headers.get('content-length', 0))
+                            if expected_size > 0 and resume_from >= expected_size:
+                                temp_path.rename(filepath)
+                                self.downloader.size_history.record_size(filename, resume_from)
+                                return True, "resumed-complete"
+                    # File is not complete — restart from scratch
+                    temp_path.unlink(missing_ok=True)
                     resume_from = 0
-            
-            if total_size < 1000 and resume_from == 0:
-                return False, "AUTH_FAILED"
-            
-            # Update active download info
-            with self._lock:
-                if filename in self.active_downloads:
-                    self.active_downloads[filename].total = total_size
-                    self.active_downloads[filename].status = "Downloading"
-            
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Open file in append mode for resume, write mode for fresh
-            file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
-            downloaded = resume_from
-            last_update = datetime.now()
-            
-            with open(temp_path, file_mode) as f:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if self.downloader.should_stop:
-                        # Keep partial file for resume on stop
-                        return False, "Stopped"
-                    
-                    if chunk:
-                        # Check first chunk for ZIP magic (only on fresh downloads)
-                        if downloaded == 0 and chunk[:2] != b'PK':
-                            temp_path.unlink()
-                            return False, "AUTH_FAILED"
+                    with self._lock:
+                        self.active_downloads[filename] = ActiveDownload(filename=filename, status="Restarting")
+                    self.call_from_thread(self.update_downloads_table)
+                    continue  # Loop back with resume_from=0
+                
+                response.raise_for_status()
+                
+                content_type = response.headers.get('content-type', '')
+                if 'text/html' in content_type:
+                    return False, "AUTH_FAILED"
+                
+                # Get total size — for 206, content-length is remaining bytes
+                content_length = int(response.headers.get('content-length', 0))
+                
+                if response.status_code == 206:
+                    total_size = resume_from + content_length
+                else:
+                    total_size = content_length
+                    if resume_from > 0:
+                        # Server doesn't support resume, start fresh
+                        resume_from = 0
+                
+                if total_size < 1000 and resume_from == 0:
+                    return False, "AUTH_FAILED"
+                
+                # Update active download info
+                with self._lock:
+                    if filename in self.active_downloads:
+                        self.active_downloads[filename].total = total_size
+                        self.active_downloads[filename].status = "Downloading"
+                
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Open file in append mode for resume, write mode for fresh
+                file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
+                downloaded = resume_from
+                last_update = datetime.now()
+                
+                with open(temp_path, file_mode) as f:
+                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        if self.downloader.should_stop:
+                            return False, "Stopped"
                         
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        self.stats.bytes_downloaded += len(chunk)
-                        
-                        # Update progress every 300ms
-                        now = datetime.now()
-                        if (now - last_update).total_seconds() >= 0.3:
-                            with self._lock:
-                                if filename in self.active_downloads:
-                                    self.active_downloads[filename].downloaded = downloaded
-                            self.call_from_thread(self.update_downloads_table)
-                            self.call_from_thread(self.update_stats_display)
-                            last_update = now
-            
-            temp_path.rename(filepath)
-            self.downloader.size_history.record_size(filename, downloaded)
-            
-            return True, ""
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 404:
-                return False, "NOT_FOUND"
-            # Keep partial file for resume
-            return False, str(e)
-        except requests.exceptions.RequestException as e:
-            # Keep partial file for resume
-            return False, str(e)
+                        if chunk:
+                            # Check first chunk for ZIP magic (only on fresh downloads)
+                            if downloaded == 0 and chunk[:2] != b'PK':
+                                temp_path.unlink()
+                                return False, "AUTH_FAILED"
+                            
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            self.stats.bytes_downloaded += len(chunk)
+                            
+                            # Update progress every 300ms
+                            now = datetime.now()
+                            if (now - last_update).total_seconds() >= 0.3:
+                                with self._lock:
+                                    if filename in self.active_downloads:
+                                        self.active_downloads[filename].downloaded = downloaded
+                                self.call_from_thread(self.update_downloads_table)
+                                self.call_from_thread(self.update_stats_display)
+                                last_update = now
+                
+                # Verify ZIP integrity before finalizing
+                with open(temp_path, 'rb') as f:
+                    f.seek(max(0, downloaded - 1024))
+                    tail = f.read()
+                    if b'PK\x05\x06' not in tail:
+                        temp_path.unlink()
+                        return False, "INTEGRITY_FAILED"
+                
+                temp_path.rename(filepath)
+                self.downloader.size_history.record_size(filename, downloaded)
+                
+                return True, ""
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 404:
+                    return False, "NOT_FOUND"
+                # Retry on transient errors
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(2 ** attempt)
+                    continue
+                return False, str(e)
+            except requests.exceptions.RequestException as e:
+                # Retry on transient network errors
+                if attempt < MAX_RETRIES - 1:
+                    import time
+                    time.sleep(2 ** attempt)
+                    continue
+                return False, str(e)
+        
+        return False, "Max retries exceeded"
     
     def handle_auth_failure(self):
         """Handle authentication failure."""

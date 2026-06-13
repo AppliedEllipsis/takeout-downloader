@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 16px; min-width: 320px; }
+        h2 { color: #a855f7; margin-bottom: 12px; font-size: 16px; }
+        .section { margin-bottom: 16px; }
+        label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
+        input { width: 100%; padding: 8px; background: #2d2d3f; border: 1px solid #4b5563; border-radius: 6px; color: #f8fafc; font-size: 13px; }
+        button { width: 100%; padding: 10px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; margin-top: 8px; }
+        button:hover { background: #6d28d9; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status { padding: 8px; background: #2d2d3f; border-radius: 6px; font-size: 12px; margin-top: 8px; }
+        .status.ok { color: #22c55e; }
+        .status.err { color: #ef4444; }
+        .status.warn { color: #f59e0b; }
+        .toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #94a3b8; }
+        .toggle input { width: auto; }
+    </style>
+</head>
+<body>
+    <h2>📦 Takeout Downloader</h2>
+
+    <div class="section">
+        <label>Server URL</label>
+        <input type="text" id="serverUrl" value="http://localhost:5000">
+    </div>
+
+    <div class="section">
+        <label>Auth User (blank = no auth)</label>
+        <input type="text" id="authUser" placeholder="admin">
+    </div>
+
+    <div class="section">
+        <label>Auth Password</label>
+        <input type="password" id="authPass" placeholder="changeme">
+    </div>
+
+    <div class="section">
+        <label>Output Directory</label>
+        <input type="text" id="outputDir" value="/downloads">
+    </div>
+
+    <div class="section">
+        <label>Parallel Downloads</label>
+        <input type="number" id="parallel" value="6" min="1" max="20">
+    </div>
+
+    <div class="section">
+        <label>File Count</label>
+        <input type="number" id="fileCount" value="100" min="1" max="1000">
+    </div>
+
+    <div class="section">
+        <div class="toggle">
+            <input type="checkbox" id="autoSend">
+            <span>Auto-send on capture</span>
+        </div>
+    </div>
+
+    <button id="sendBtn" onclick="sendCapture()">📤 Send Last Capture</button>
+    <button id="updateBtn" onclick="updateCookie()" style="background:#f59e0b;margin-top:4px;">🔄 Update Cookie</button>
+
+    <div id="status" class="status">No capture yet</div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

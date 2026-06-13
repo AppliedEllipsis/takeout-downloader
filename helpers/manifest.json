@@ -1,0 +1,35 @@
+{
+    "manifest_version": 3,
+    "name": "Takeout Downloader Helper",
+    "version": "1.0.0",
+    "description": "Captures Google Takeout download URLs and sends them to your Takeout Downloader server",
+    "permissions": [
+        "webRequest",
+        "storage",
+        "activeTab"
+    ],
+    "host_permissions": [
+        "https://takeout.google.com/*",
+        "https://storage.cloud.google.com/takeout*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "options_ui": {
+        "page": "options.html",
+        "open_in_tab": true
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": {
+            "16": "icon16.png",
+            "48": "icon48.png",
+            "128": "icon128.png"
+        }
+    },
+    "icons": {
+        "16": "icon16.png",
+        "48": "icon48.png",
+        "128": "icon128.png"
+    }
+}

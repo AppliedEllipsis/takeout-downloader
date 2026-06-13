@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Takeout Downloader Bookmarklet</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; color: #333; line-height: 1.6; }
+        h1 { color: #7c3aed; }
+        h2 { margin-top: 30px; }
+        code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+        pre { background: #1e1e2e; color: #f8fafc; padding: 16px; border-radius: 8px; overflow-x: auto; }
+        .bookmarklet-link { display: inline-block; padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; margin: 10px 0; }
+        .bookmarklet-link:hover { background: #6d28d9; }
+        .warning { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px; margin: 16px 0; border-radius: 4px; }
+        .step { background: #f8fafc; padding: 12px; margin: 8px 0; border-radius: 6px; border: 1px solid #e2e8f0; }
+    </style>
+</head>
+<body>
+    <h1>📦 Takeout Downloader Bookmarklet</h1>
+    <p>Drag the link below to your bookmarks bar. When you're on a Google Takeout page and click a download, the bookmarklet will capture the URL and cookie and send them to your downloader server.</p>
+
+    <a class="bookmarklet-link" href="javascript:void(function()%7Bvar%20s%3Dprompt('Takeout%20Downloader%20Server%20URL%3A'%2C'http%3A%2F%2Flocalhost%3A5000')%3Bif(!s)return%3Bvar%20c%3Ddocument.cookie%3Bvar%20l%3Ddocument.querySelectorAll('a%5Bhref*%3D%22takeout%22%5D%2Ca%5Bhref*%3D%22storage.cloud.google.com%22%5D')%3Bvar%20u%3Dl.length%3Fl%5B0%5D.href%3Aprompt('Paste%20takeout%20download%20URL%3A')%3Bif(!u)return%3Bvar%20au%3Dprompt('Auth%20user%20(blank%20to%20skip)%3A')%3Bvar%20ap%3Dau%3Fprompt('Auth%20password%3A')%3A''%3Bvar%20h%3D%7B'Content-Type'%3A'application%2Fjson'%7D%3Bif(au)h%5B'Authorization'%5D%3D'Basic%20'%2Bbtoa(au%2B'%3A'%2Bap)%3Bfetch(s%2B'%2Fapi%2Fstart'%2C%7Bmethod%3A'POST'%2Cheaders%3Ah%2Cbody%3AJSON.stringify(%7Bcurl_input%3A'Cookie%3A%20'%2Bc%2Curl%3Au%2Coutput_dir%3A'%2Fdownloads'%2Cparallel%3A6%2Cfile_count%3A100%7D)%7D).then(r%3Dr.json()).then(d%3D%7Balert(d.error%7C%7C'Download%20started!')%7D).catch(e%3D%7Balert('Error%3A%20'%2Be)%7D)%7D())">📥 Send to Takeout Downloader</a>
+
+    <h2>Setup Instructions</h2>
+
+    <div class="step">
+        <strong>1. Start your downloader server</strong><br>
+        <code>python google_takeout_web.py</code> or via Docker
+    </div>
+
+    <div class="step">
+        <strong>2. Drag the bookmarklet above</strong> to your browser's bookmarks bar
+    </div>
+
+    <div class="step">
+        <strong>3. Go to takeout.google.com</strong>, click your download link
+    </div>
+
+    <div class="step">
+        <strong>4. Click the bookmarklet</strong> — it will prompt for server URL, detect the download link, and send the request
+    </div>
+
+    <h2>Bookmarklet Source (for review)</h2>
+    <pre id="source-code"></pre>
+
+    <div class="warning">
+        <strong>Note:</strong> The bookmarklet uses <code>document.cookie</code> which may not include all authentication cookies (especially httpOnly ones). For full cookie capture, use the <strong>Tampermonkey userscript</strong> instead, which intercepts the actual network requests including all headers.
+    </div>
+
+    <h2>Alternative: Tampermonkey Userscript</h2>
+    <p>For more reliable cookie capture, install the <a href="takeout-extractor.user.js">takeout-extractor.user.js</a> userscript in Tampermonkey or Greasemonkey. It automatically intercepts network requests and captures the full cookie header.</p>
+
+    <script>
+        // Decode and display the bookmarklet source for transparency
+        const bookmarklet = document.querySelector('.bookmarklet-link').href;
+        const decoded = decodeURIComponent(bookmarklet.replace('javascript:void(', '').slice(0, -1));
+        document.getElementById('source-code').textContent = decoded;
+    </script>
+</body>
+</html>

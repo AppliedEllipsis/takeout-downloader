@@ -156,6 +156,14 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
     └── icon16/48/128.png
 ```
 
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — how the extension, payload schema, and TUI fit together; the capture/refresh flow.
+- [`docs/EXTENSION.md`](./docs/EXTENSION.md) — installing and using the browser extension.
+- [`USAGE.md`](./USAGE.md) — step-by-step usage guide.
+- [`docs/BEST_PRACTICES.md`](./docs/BEST_PRACTICES.md) — research notes on Takeout downloading.
+- [`CHANGELOG.md`](./CHANGELOG.md) — version history.
+
 ## Security model
 
 - The extension makes **no network calls that leave the browser**. It

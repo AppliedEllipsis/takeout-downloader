@@ -15,8 +15,19 @@ All notable changes to this project are documented here.
   `extraInfoSpec`, which is required to observe `Cookie` / `Referer` /
   `Authorization`. Extension bumped to 2.0.1.
 
-### Added (Docker support for the TUI)
+### Added
 
+- **Directory browser in the TUI.** A `📁 Browse` button (and `b` key)
+  opens a modal filesystem picker — navigate with the tree, go `↑ Up`, or
+  type/paste a path directly. Symlinks are resolved, so a host link such
+  as `./downloads/opt -> /opt` lands on the real target. The output-dir
+  field also still accepts a typed/pasted path directly.
+- **Persistent settings.** The last-used output directory, file count, and
+  parallel count are saved to `~/.takeout_downloader.json` (override with
+  `TAKEOUT_SETTINGS`) and restored on the next launch.
+- **`ALLOWED_DIRS` env var.** Extend the output-dir allowlist with extra
+  roots (`os.pathsep`-separated), e.g. a JuiceFS path under `/opt`. Paths
+  are resolved (symlinks followed) before the prefix check.
 - **`Dockerfile` + `docker-compose.yml`** — the TUI is now self-contained
   in a container, with `aria2c` and all Python deps baked in. Because the
   TUI is interactive, run it with `docker compose run --rm takeout` (not
@@ -26,6 +37,11 @@ All notable changes to this project are documented here.
   flow is unchanged.
   - Note: these files had been removed in v6.0 (they only served the old
     web UI); they are reintroduced here purpose-built for the TUI.
+  - **Mounts host `/opt`** with `bind.recursive` + `rslave` propagation so
+    the JuiceFS / gocryptfs FUSE submounts under `/opt` (e.g.
+    `/srv/storage`) are visible inside the container instead of
+    showing as empty dirs. Settings persist on the mounted volume via
+    `TAKEOUT_SETTINGS=/downloads/.takeout_settings.json`.
 
 ## [6.1.0] — Retry hardening from cross-project research
 

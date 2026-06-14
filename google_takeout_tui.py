@@ -16,6 +16,7 @@ Usage:
     python takeout.py
 """
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,9 +26,10 @@ from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Header, Footer, Static, Button, Input, Label,
-    Log, DataTable, TextArea
+    Log, DataTable, TextArea, DirectoryTree
 )
 from textual.binding import Binding
 from textual import work
@@ -37,6 +39,7 @@ import requests
 from takeout import (
     TakeoutDownloader, DownloadStats,
     validate_output_dir, compute_backoff, _retry_after_seconds,
+    load_settings, save_settings,
     VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL,
     MAX_PARALLEL, MAX_FILE_COUNT, MAX_RETRIES
 )
@@ -56,6 +59,97 @@ class ActiveDownload:
     downloaded: int = 0
     total: int = 0
     status: str = "Starting"
+
+
+class DirectoryPicker(ModalScreen):
+    """Modal directory browser. Navigate the filesystem, or type/paste a path.
+
+    Dismisses with the chosen absolute path (str) on "Use this folder", or
+    None on Cancel. Symlinks are followed (resolve), so a path like
+    ./downloads/opt -> /opt lands on the real target.
+    """
+
+    CSS = """
+    DirectoryPicker {
+        align: center middle;
+    }
+    #picker-card {
+        width: 90%;
+        height: 90%;
+        max-width: 120;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #picker-title { text-style: bold; color: $primary; height: 1; }
+    #picker-cwd { color: $text-muted; height: 1; margin-bottom: 1; }
+    #picker-path-input { margin-bottom: 1; }
+    #picker-tree { height: 1fr; border: round $secondary; }
+    #picker-buttons { height: 3; align: center middle; margin-top: 1; }
+    #picker-buttons Button { margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, start_dir: str = ".") -> None:
+        super().__init__()
+        try:
+            p = Path(start_dir).expanduser().resolve()
+            if not p.is_dir():
+                p = p.parent if p.parent.is_dir() else Path.cwd()
+        except (OSError, ValueError):
+            p = Path.cwd()
+        self._cwd = p
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-card"):
+            yield Label("Select output directory", id="picker-title")
+            yield Label(str(self._cwd), id="picker-cwd")
+            yield Input(value=str(self._cwd), placeholder="Type or paste a path, then Enter", id="picker-path-input")
+            tree = DirectoryTree(str(self._cwd), id="picker-tree")
+            yield tree
+            with Horizontal(id="picker-buttons"):
+                yield Button("\u2191 Up", id="picker-up", variant="default")
+                yield Button("\u2705 Use this folder", id="picker-use", variant="success")
+                yield Button("\u2716 Cancel", id="picker-cancel", variant="error")
+
+    def _set_cwd(self, path: Path) -> None:
+        try:
+            path = path.expanduser().resolve()
+        except (OSError, ValueError):
+            return
+        if not path.is_dir():
+            return
+        self._cwd = path
+        self.query_one("#picker-cwd", Label).update(str(path))
+        self.query_one("#picker-path-input", Input).value = str(path)
+        tree = self.query_one("#picker-tree", DirectoryTree)
+        tree.path = str(path)
+        tree.reload()
+
+    def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
+        # Single click highlights; selecting a directory navigates into it.
+        self._set_cwd(Path(event.path))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "picker-path-input":
+            self._set_cwd(Path(event.value))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "picker-up":
+            self._set_cwd(self._cwd.parent)
+        elif event.button.id == "picker-use":
+            # Honour a path typed in the box even if not yet navigated to.
+            typed = self.query_one("#picker-path-input", Input).value.strip()
+            chosen = typed or str(self._cwd)
+            self.dismiss(chosen)
+        elif event.button.id == "picker-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class TakeoutTUI(App):
@@ -84,6 +178,20 @@ class TakeoutTUI(App):
 
     #settings-labels {
         height: 1;
+    }
+
+    #outdir-row {
+        height: 3;
+        margin-bottom: 1;
+    }
+
+    #output-input {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #browse-btn {
+        width: auto;
     }
 
     .field-label {
@@ -161,6 +269,7 @@ class TakeoutTUI(App):
         Binding("s", "start", "Start"),
         Binding("x", "stop", "Stop"),
         Binding("c", "clear_log", "Clear Log"),
+        Binding("b", "browse", "Browse dir"),
     ]
 
     # How often to re-ring the bell / flash while waiting for a refresh.
@@ -198,15 +307,19 @@ class TakeoutTUI(App):
                 )
                 yield TextArea(id="curl-input")
 
+                # Output directory row: input + Browse button.
+                yield Label("Output directory", classes="field-label")
+                with Horizontal(id="outdir-row"):
+                    yield Input(value=DEFAULT_OUTPUT_DIR, placeholder="Type/paste a path, or click Browse", id="output-input")
+                    yield Button("\U0001F4C1 Browse", id="browse-btn", variant="primary")
+
                 # Per-field labels so the meaning stays visible after the
                 # placeholder text is replaced by a value.
                 with Horizontal(id="settings-labels"):
-                    yield Label("Output directory", classes="field-label")
                     yield Label("Max files (parts)", classes="field-label")
                     yield Label(f"Parallel (1-{MAX_PARALLEL})", classes="field-label")
 
                 with Horizontal(id="settings-row"):
-                    yield Input(value=DEFAULT_OUTPUT_DIR, placeholder="Output dir", id="output-input")
                     yield Input(value=str(DEFAULT_FILE_COUNT), placeholder="Max files", id="count-input")
                     yield Input(value=str(DEFAULT_PARALLEL), placeholder=f"Parallel 1-{MAX_PARALLEL}", id="parallel-input")
 
@@ -247,14 +360,41 @@ class TakeoutTUI(App):
 
         self.log_message(f"Google Takeout Downloader v{VERSION}")
         self.log_message("Paste a JSON payload (extension → Copy as JSON) or a cURL command, then Start")
-        self.log_message("Keys: Q=quit, S=start, X=stop, C=clear")
+        self.log_message("Keys: Q=quit, S=start, X=stop, C=clear, B=browse output dir")
         if ARIA2C_AVAILABLE:
             self.log_message("aria2c detected — available for high-speed downloads")
         else:
             self.log_message("Tip: Install aria2c for multi-connection downloads (apt install aria2)")
         self.log_message("Install the browser extension from helpers/ to capture payloads")
 
+        # Restore last-used settings (output dir, file count, parallel).
+        self._restore_settings()
+
         self.update_stats_display()
+
+    def _restore_settings(self) -> None:
+        """Pre-fill the input fields from the persisted settings file."""
+        s = load_settings()
+        if not s:
+            return
+        out = s.get("output_dir")
+        if isinstance(out, str) and out:
+            self.query_one("#output-input", Input).value = out
+        fc = s.get("file_count")
+        if isinstance(fc, int):
+            self.query_one("#count-input", Input).value = str(fc)
+        par = s.get("parallel")
+        if isinstance(par, int):
+            self.query_one("#parallel-input", Input).value = str(par)
+        self.log_message("Restored last-used settings")
+
+    def _persist_settings(self, output_dir: str, file_count: int, parallel: int) -> None:
+        """Save the current settings so the next launch restores them."""
+        save_settings({
+            "output_dir": output_dir,
+            "file_count": file_count,
+            "parallel": parallel,
+        })
 
     def log_message(self, message: str, level: str = "info"):
         """Add a message to the log."""
@@ -384,6 +524,19 @@ class TakeoutTUI(App):
             self.stop_download()
         elif event.button.id == "clear-btn":
             self.action_clear_log()
+        elif event.button.id == "browse-btn":
+            self.action_browse()
+
+    def action_browse(self) -> None:
+        """Open the directory picker, seeded with the current output dir."""
+        start = self.query_one("#output-input", Input).value.strip() or DEFAULT_OUTPUT_DIR
+
+        def _on_picked(chosen: Optional[str]) -> None:
+            if chosen:
+                self.query_one("#output-input", Input).value = chosen
+                self.log_message(f"Output directory set to: {chosen}")
+
+        self.push_screen(DirectoryPicker(start), _on_picked)
 
     def start_download(self) -> None:
         """Parse the pasted payload and start (or resume) downloading."""
@@ -456,6 +609,9 @@ class TakeoutTUI(App):
         self.active_downloads.clear()
         self._last_file_count = file_count
         self._last_parallel = parallel
+
+        # Remember these for next launch (best-effort).
+        self._persist_settings(output_dir, file_count, parallel)
 
         self.query_one("#start-btn", Button).disabled = True
         self.query_one("#stop-btn", Button).disabled = False

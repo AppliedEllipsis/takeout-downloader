@@ -6,11 +6,36 @@
 #     docker compose build
 #     docker compose run --rm takeout
 #
-# Downloads land in ./downloads on the host (change the volume below or set
-# OUTPUT_DIR in .env). Inside the container the output dir is /downloads.
+# WHERE FILES LAND
+# ----------------
+# Two volumes are mounted:
+#   1. ./downloads        -> /downloads   (default output + resume state)
+#   2. /opt (host)        -> /opt         (your JuiceFS / encfs storage)
 #
-# There is no web server, no exposed port, and no daemon — payloads come
-# from the browser extension via your clipboard (Copy as JSON → paste).
+# Inside the TUI you can set the output directory to anything under /downloads
+# or /opt. To save into e.g.
+#     /srv/storage/google-takeout/my-takeout
+# just type or Browse to that path in the TUI — it's visible because /opt is
+# mounted. A host symlink like ./downloads/opt -> /opt is also followed by the
+# TUI (paths are resolved before the allowed-dir check).
+#
+# JUICEFS / FUSE SUBMOUNTS
+# ------------------------
+# /opt on the host has FUSE submounts under it (JuiceFS: /srv/storage,
+# gocryptfs: /opt/docker, /opt/caches). A plain bind mount would show those as
+# EMPTY dirs in the container. `recursive: enabled` (rbind) captures the
+# submounts that exist at start; `propagation: rslave` additionally keeps them
+# in sync if the host (re)mounts them while the container runs.
+#
+# `rslave` requires the host /opt to be a shared or slave mount. On systemd
+# systems / is shared by default, so /opt inherits that and this works. If the
+# container ever FAILS TO START with a propagation error, either run once:
+#     sudo mount --make-rshared /
+# or drop the `propagation: rslave` line below (recursive bind alone still shows
+# the submounts present at start, which is the common case).
+#
+# There is no web server, no exposed port, and no daemon — payloads come from
+# the browser extension via your clipboard (Copy as JSON -> paste).
 
 services:
   takeout:
@@ -28,11 +53,27 @@ services:
         required: false
 
     environment:
-      # Keep the in-container output dir stable regardless of host .env.
-      OUTPUT_DIR: /downloads
+      # Keep the in-container default output dir stable regardless of host .env.
+      OUTPUT_DIR: ${OUTPUT_DIR:-/downloads}
       TERM: ${TERM:-xterm-256color}
+      # Persist last-used TUI settings on the mounted volume so they survive
+      # `--rm`. (Engine reads TAKEOUT_SETTINGS; default would be $HOME, which
+      # is ephemeral in a container.)
+      TAKEOUT_SETTINGS: /downloads/.takeout_settings.json
+      # /opt is an allowed output root by default, but list it explicitly in
+      # case you point OUTPUT_DIR at a deep JuiceFS path.
+      ALLOWED_DIRS: /opt:/downloads
 
     volumes:
       # Downloaded archives + resume state (.downloading, .takeout_sizes.json)
       # persist on the host so a removed container never loses progress.
       - ./downloads:/downloads
+
+      # Host /opt (with its JuiceFS + encfs FUSE submounts) visible in-container.
+      # bind-recursive + rslave is what makes the nested FUSE mounts show up.
+      - type: bind
+        source: /opt
+        target: /opt
+        bind:
+          propagation: rslave
+          recursive: enabled

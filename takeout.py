@@ -93,21 +93,79 @@ def _retry_after_seconds(response) -> Optional[float]:
     except (ValueError, AttributeError):
         return None
 
-# Allowed directories for output (resolved paths)
+# Allowed directories for output (resolved paths). Override / extend with the
+# ALLOWED_DIRS env var (os.pathsep-separated) — useful for custom mounts like
+# a JuiceFS path under /opt or a NAS share. Paths are resolved (symlinks
+# followed) before the prefix check, so a symlink such as ./downloads/opt -> /opt
+# validates against the /opt prefix.
 _ALLOWED_DIRS: Optional[Tuple[Path, ...]] = None
 
 def _get_allowed_dirs() -> Tuple[Path, ...]:
     """Lazily compute allowed directory prefixes (resolved, absolute)."""
     global _ALLOWED_DIRS
     if _ALLOWED_DIRS is None:
-        _ALLOWED_DIRS = (
+        dirs = [
             Path.cwd().resolve(),
             Path.home().resolve(),
             Path("/opt/").resolve(),
             Path("/downloads/").resolve(),
             Path("/tmp/").resolve(),
-        )
+        ]
+        extra = os.environ.get("ALLOWED_DIRS", "")
+        for raw in extra.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                try:
+                    dirs.append(Path(raw).resolve())
+                except (OSError, ValueError):
+                    pass
+        # De-dupe while preserving order
+        seen = set()
+        unique = []
+        for d in dirs:
+            if d not in seen:
+                seen.add(d)
+                unique.append(d)
+        _ALLOWED_DIRS = tuple(unique)
     return _ALLOWED_DIRS
+
+# =============================================================================
+# SETTINGS PERSISTENCE - Remember last-used output dir / counts across runs
+# =============================================================================
+
+def _settings_path() -> Path:
+    """Where the persisted TUI settings live.
+
+    Override with TAKEOUT_SETTINGS. Defaults to ~/.takeout_downloader.json.
+    In Docker we point this at /downloads/.takeout_settings.json (a mounted,
+    persistent volume) so settings survive container removal.
+    """
+    override = os.environ.get("TAKEOUT_SETTINGS", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".takeout_downloader.json"
+
+def load_settings() -> Dict[str, object]:
+    """Load persisted settings; returns {} if none / unreadable."""
+    p = _settings_path()
+    if p.exists():
+        try:
+            with open(p) as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def save_settings(settings: Dict[str, object]) -> None:
+    """Persist settings (best-effort; never raises)."""
+    p = _settings_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass
 
 
 # =============================================================================

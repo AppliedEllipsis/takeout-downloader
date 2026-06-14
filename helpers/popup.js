@@ -91,6 +91,33 @@ function renderCapture(data) {
     }, null, 2);
 }
 
+function buildSinglePayload(capture) {
+    return {
+        schema: capture.schema || 1,
+        captured_at: new Date().toISOString(),
+        source: 'extension',
+        url: capture.url,
+        method: capture.method || 'GET',
+        headers: capture.headers || {},
+        cookie: capture.cookie || ''
+    };
+}
+
+function buildMultiPayload(capture, urls) {
+    return {
+        schema: capture.schema || 1,
+        captured_at: new Date().toISOString(),
+        source: 'extension',
+        multi: true,
+        exports: (urls || []).map(url => ({
+            url: url,
+            filename: shortFilename(url)
+        })),
+        headers: capture.headers || {},
+        cookie: capture.cookie || ''
+    };
+}
+
 async function copyToClipboard(text, kind) {
     try {
         await navigator.clipboard.writeText(text);
@@ -148,6 +175,7 @@ document.addEventListener('DOMContentLoaded', () => {
     els.statusBox = $('statusBox');
     els.errorBox = $('errorBox');
     els.copyAllBtn = $('copyAllBtn');
+    els.copyCaptureBtn = $('copyCaptureBtn');
     els.clearBtn = $('clearBtn');
     els.preview = $('preview');
     els.autoCopy = $('autoCopy');
@@ -167,6 +195,34 @@ document.addEventListener('DOMContentLoaded', () => {
             els.autoCopy.checked = prefs.autoCopy;
         }
     });
+
+    // "Copy this capture" button — copies the single captured URL as a
+    // single-export payload. Useful when Copy ALL fails.
+    els.copyCaptureBtn.addEventListener('click', async () => {
+        setError(null);
+        const response = await chrome.runtime.sendMessage({ action: 'getCapture' });
+        if (!response || !response.capture) {
+            setStatus('No capture to copy.', 'warn');
+            return;
+        }
+        const payload = buildSinglePayload(response.capture);
+        await copyToClipboard(JSON.stringify(payload, null, 2), 'this capture');
+    });
+
+    // Clicking the [copy] link next to "Preview capture" does the same.
+    const copyPreview = document.getElementById('copyPreview');
+    if (copyPreview) {
+        copyPreview.addEventListener('click', async () => {
+            setError(null);
+            const response = await chrome.runtime.sendMessage({ action: 'getCapture' });
+            if (!response || !response.capture) {
+                setStatus('No capture to copy.', 'warn');
+                return;
+            }
+            const payload = buildSinglePayload(response.capture);
+            await copyToClipboard(JSON.stringify(payload, null, 2), 'this capture');
+        });
+    }
 
     // The one and only copy button: fetches all exports then builds
     // a multi-payload with them.
@@ -211,15 +267,7 @@ document.addEventListener('DOMContentLoaded', () => {
             filename: shortFilename(url)
         }));
 
-        const payload = {
-            schema: capture.schema || 1,
-            captured_at: new Date().toISOString(),
-            source: 'extension',
-            multi: true,
-            exports: exports,
-            headers: capture.headers || {},
-            cookie: capture.cookie || ''
-        };
+        const payload = buildMultiPayload(capture, urls);
         await copyToClipboard(
             JSON.stringify(payload, null, 2),
             `ALL exports (${exports.length})`

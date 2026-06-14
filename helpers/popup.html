@@ -47,11 +47,12 @@
 
     <div class="section">
         <button id="copyAllBtn" class="success" disabled>📋 Copy ALL exports</button>
+        <button id="copyCaptureBtn" class="warning" disabled style="margin-top:4px;">📋 Copy this capture</button>
         <button id="clearBtn" class="secondary" disabled style="margin-top:2px;">🗑 Clear capture</button>
     </div>
 
     <details>
-        <summary>Preview capture</summary>
+        <summary>Preview capture <span id="copyPreview" style="cursor:pointer; color:#a855f7; margin-left:6px;">[copy]</span></summary>
         <pre class="payload" id="preview">No capture yet.</pre>
     </details>
 

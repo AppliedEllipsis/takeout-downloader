@@ -84,6 +84,31 @@ docker compose build
 docker compose run --rm takeout-cli
 ```
 
+To pin a custom output directory, create a `.env` file (gitignored) in the
+project root:
+
+```bash
+cat > .env << 'EOF'
+OUTPUT_DIR=/srv/storage/google-takeout/my-takeout
+PARALLEL_DOWNLOADS=3
+MAX_PARTS=500
+ALLOWED_DIRS=/opt:/downloads
+EOF
+```
+
+Then run with no flags — the CLI picks up `OUTPUT_DIR` from `.env`:
+
+```bash
+docker compose run --rm takeout-cli   # no flags needed
+```
+
+NOTE: Docker Compose has a quirk where `docker compose run --rm takeout-cli
+--out /path` (with equals) and `--out /path` (with space) both fail because
+runc treats `--out` as an executable. To avoid this, always use `.env` or
+the `OUTPUT_DIR` env var. The CLI also persists the last-used folder to
+`~/.takeout-cli.json` after the first prompt, so subsequent runs default to
+the same folder automatically.
+
 **TUI** (opt-in via profile, use only on a local terminal):
 
 ```bash

@@ -37,7 +37,25 @@ chrome.storage.local.get([
             statusEl.className = 'status err';
         }
     }
+
+    // Check for pending remote confirmation
+    if (data.pendingRemoteConfirmation) {
+        showRemoteConfirmDialog(data.pendingRemoteConfirmation);
+    }
 });
+
+function showRemoteConfirmDialog(pending) {
+    const msg = 'This is the FIRST capture being sent to a remote server:\n\n' +
+                'Server: ' + pending.serverUrl + '\n\n' +
+                'A remote server can see your Google session cookie.\n\n' +
+                'Click OK to allow sends to this server for this session,\n' +
+                'or Cancel to deny.';
+    if (confirm(msg)) {
+        chrome.runtime.sendMessage({ action: 'confirmRemote' }, () => {});
+    } else {
+        chrome.runtime.sendMessage({ action: 'denyRemote' }, () => {});
+    }
+}
 
 // Save settings on change
 ['serverUrl', 'authUser', 'authPass', 'outputDir', 'parallel', 'fileCount'].forEach(id => {

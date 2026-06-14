@@ -94,21 +94,35 @@ function sendToServer(capture, settings) {
     }
 
     // SECURITY: require explicit confirmation for non-localhost serverUrls
-    // when sending for the first time per session
+    // when sending for the first time per session.
+    // MV3 service workers can't use window.confirm(), so we set a pending
+    // flag and surface the confirmation in the popup (which has DOM access).
     if (!isLocalhostUrl(serverUrl)) {
         chrome.storage.local.get(['confirmedRemoteHost'], (data) => {
             if (data.confirmedRemoteHost === serverUrl) {
                 doSendToServer(capture, settings);
             } else {
-                const ack = confirm(
-                    'Send captured Google session cookie to remote server?\n\n' +
-                    'Server: ' + serverUrl + '\n\n' +
-                    'Click OK to allow sends to THIS server for this session.'
-                );
-                if (ack) {
-                    chrome.storage.local.set({ confirmedRemoteHost: serverUrl });
-                    doSendToServer(capture, settings);
-                }
+                // Save the pending capture and notify the user to confirm in the popup
+                chrome.storage.local.set({
+                    pendingRemoteConfirmation: {
+                        capture: capture,
+                        serverUrl: serverUrl,
+                        timestamp: Date.now()
+                    },
+                    lastSendResult: {
+                        error: 'Remote server not yet confirmed. Open the extension popup to allow sends to ' + serverUrl
+                    },
+                    lastSendTime: Date.now()
+                });
+                chrome.notifications.create({
+                    type: 'basic',
+                    iconUrl: 'icon48.png',
+                    title: 'Takeout Downloader - confirm required',
+                    message: 'New remote server: ' + serverUrl + '. Click the extension icon to allow sends.'
+                });
+                // Set badge to draw attention
+                chrome.action.setBadgeText({ text: '!' });
+                chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
             }
         });
         return;
@@ -188,5 +202,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             .catch(err => sendResponse({ error: err.message }));
             return true; // async
         });
+    }
+    if (msg.action === 'confirmRemote') {
+        // User confirmed in the popup that it's OK to send to the remote server
+        chrome.storage.local.get([
+            'pendingRemoteConfirmation', 'serverUrl', 'authUser', 'authPass',
+            'outputDir', 'parallel', 'fileCount'
+        ], (data) => {
+            const pending = data.pendingRemoteConfirmation;
+            if (!pending) {
+                sendResponse({ error: 'No pending confirmation' });
+                return;
+            }
+            chrome.storage.local.set({
+                confirmedRemoteHost: pending.serverUrl,
+                pendingRemoteConfirmation: null
+            }, () => {
+                chrome.action.setBadgeText({ text: '' });
+                const settings = {
+                    serverUrl: pending.serverUrl,
+                    authUser: data.authUser,
+                    authPass: data.authPass,
+                    outputDir: data.outputDir,
+                    parallel: data.parallel,
+                    fileCount: data.fileCount
+                };
+                doSendToServer(pending.capture, settings);
+                sendResponse({ status: 'confirmed and sent' });
+            });
+        });
+        return true; // async
+    }
+    if (msg.action === 'denyRemote') {
+        // User denied — clear the pending flag, keep capture so they can retry manually
+        chrome.storage.local.set({
+            pendingRemoteConfirmation: null,
+            lastSendResult: { error: 'Remote server denied. Update serverUrl or manually click Send.' },
+            lastSendTime: Date.now()
+        }, () => {
+            chrome.action.setBadgeText({ text: '' });
+            sendResponse({ status: 'denied' });
+        });
+        return true; // async
     }
 });

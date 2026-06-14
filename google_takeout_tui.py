@@ -474,6 +474,11 @@ class TakeoutTUI(App):
         self.log_message(f"Payload search roots: output_dir, cwd, /downloads, /downloads/drop, /drop, /work, /work/drop, $HOME")
         self.log_message(f"Payload filenames: {', '.join(self.PAYLOAD_FILENAMES)}")
 
+        # Network connectivity check. Runs in a worker thread with a 5s
+        # timeout so a DNS/firewall issue surfaces immediately rather than
+        # silently failing every download attempt.
+        self._check_network()
+
         # Restore last-used settings (output dir, file count, parallel).
         self._restore_settings()
 
@@ -602,6 +607,55 @@ class TakeoutTUI(App):
             "file_count": file_count,
             "parallel": parallel,
         })
+
+    @work(thread=True, exclusive=True)
+    def _check_network(self) -> None:
+        """Verify the container can reach takeout-download.usercontent.google.com.
+
+        Runs once at startup in a worker thread with a 5s timeout. If DNS
+        fails or the host is unreachable, logs a clear error so the user
+        knows downloads will fail before they hit Start.
+        """
+        try:
+            import socket
+            host = "takeout-download.usercontent.google.com"
+            socket.setdefaulttimeout(5)
+            try:
+                ip = socket.gethostbyname(host)
+                self.call_from_thread(
+                    self.log_message, f"✓ DNS resolved {host} -> {ip}", "info"
+                )
+            except (socket.gaierror, socket.timeout) as e:
+                self.call_from_thread(
+                    self.log_message,
+                    f"✗ DNS FAILED for {host}: {e}\n"
+                    f"  → Downloads will fail. Check container DNS / network.",
+                    "error",
+                )
+                return
+            # Try a quick HEAD request to confirm TCP reachability
+            try:
+                r = requests.head(
+                    f"https://{host}/",
+                    timeout=5,
+                    allow_redirects=False,
+                )
+                self.call_from_thread(
+                    self.log_message,
+                    f"✓ Network OK: {host} reachable (HTTP {r.status_code})",
+                    "info",
+                )
+            except requests.exceptions.RequestException as e:
+                self.call_from_thread(
+                    self.log_message,
+                    f"✗ Cannot reach {host}: {type(e).__name__}: {e}\n"
+                    f"  → Downloads will fail. Container may lack network access.",
+                    "error",
+                )
+        except Exception as e:
+            self.call_from_thread(
+                self.log_message, f"⚠ Network check error: {e}", "warning"
+            )
 
     def log_message(self, message: str, level: str = "info"):
         """Add a message to the log widget AND mirror it to a file.
@@ -1422,11 +1476,24 @@ class TakeoutTUI(App):
                 if resume_from > 0:
                     headers['Range'] = f'bytes={resume_from}-'
 
+                # Log the actual HTTP request so we can tell whether the
+                # download is even reaching Google's servers, or whether it's
+                # stuck on DNS / connect / firewall.
+                self.call_from_thread(
+                    self.log_message,
+                    f"→ GET {filename} (attempt {attempt+1}/{MAX_RETRIES})"
+                    + (f", Range: bytes={resume_from}-" if resume_from > 0 else ""),
+                )
                 response = requests.get(
                     url,
                     headers=headers,
                     stream=True,
                     timeout=(10, 300),
+                )
+                self.call_from_thread(
+                    self.log_message,
+                    f"  ← {filename} HTTP {response.status_code} "
+                    f"({response.headers.get('content-length', '?')} bytes)",
                 )
 
                 # Check for auth failure via status
@@ -1625,6 +1692,9 @@ class TakeoutTUI(App):
 
             except requests.exceptions.HTTPError as e:
                 if e.response is not None and e.response.status_code == 404:
+                    self.call_from_thread(
+                        self.log_message, f"⊘ {filename}: 404 (past last file?)", "warning"
+                    )
                     return False, "NOT_FOUND"
                 # Retry transient errors with jittered backoff
                 if attempt < MAX_RETRIES - 1:
@@ -1632,11 +1702,15 @@ class TakeoutTUI(App):
                     wait = compute_backoff(attempt)
                     self.call_from_thread(
                         self.log_message,
-                        f"⚠ {filename} HTTP error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s",
+                        f"⚠ {filename} HTTP error (attempt {attempt+1}/{MAX_RETRIES}), "
+                        f"retrying in {wait:.1f}s: {type(e).__name__}: {e}",
                         "warning",
                     )
                     time.sleep(wait)
                     continue
+                self.call_from_thread(
+                    self.log_message, f"✗ {filename} HTTP failed: {type(e).__name__}: {e}", "error"
+                )
                 return False, str(e)
             except requests.exceptions.RequestException as e:
                 # Retry transient network errors with jittered backoff
@@ -1645,11 +1719,17 @@ class TakeoutTUI(App):
                     wait = compute_backoff(attempt)
                     self.call_from_thread(
                         self.log_message,
-                        f"⚠ {filename} network error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s",
+                        f"⚠ {filename} network error (attempt {attempt+1}/{MAX_RETRIES}), "
+                        f"retrying in {wait:.1f}s: {type(e).__name__}: {e}",
                         "warning",
                     )
                     time.sleep(wait)
                     continue
+                self.call_from_thread(
+                    self.log_message,
+                    f"✗ {filename} network failed: {type(e).__name__}: {e}",
+                    "error",
+                )
                 return False, str(e)
 
         return False, "Max retries exceeded"

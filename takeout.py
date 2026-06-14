@@ -5,9 +5,10 @@ Google Takeout Bulk Downloader
 Downloads Google Takeout archives. Simple and robust.
 
 Usage:
-    python takeout.py                    # TUI mode (default)
-    python takeout.py --web              # Web interface
-    python takeout.py --web --port 8080  # Web on custom port
+    python takeout.py                    # Launch the TUI (only interface)
+
+Captures come from the browser extension ("Copy as JSON") or a pasted cURL
+command, entered directly in the TUI.
 
 Features:
     - Parallel downloads (configurable 1-20)
@@ -46,7 +47,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = 1
 MAX_PARALLEL = 20
@@ -815,43 +816,35 @@ class TakeoutDownloader:
 # =============================================================================
 
 def main():
-    """Main entry point - TUI by default, --web for web interface."""
+    """Main entry point. The TUI is the only interface.
+
+    Captures come from the browser extension ("Copy as JSON") and are pasted
+    into the TUI. cURL paste is kept as a fallback for browsers that can't
+    run the extension.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Google Takeout Bulk Downloader',
+        description='Google Takeout Bulk Downloader (TUI)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          # TUI mode (default)
-  %(prog)s --web                    # Web interface
-  %(prog)s --web --port 8080        # Web on custom port
+  %(prog)s                          # Launch the TUI
+
+Paste a JSON payload (from the browser extension's "Copy as JSON" button)
+or a cURL command into the TUI to start downloading.
         """
     )
-
-    # Mode selection
-    parser.add_argument('--web', action='store_true',
-                       help='Start web interface instead of TUI')
-
-    # Web options
-    parser.add_argument('--port', type=int, default=5000,
-                       help='Web server port (default: 5000)')
-    parser.add_argument('--host', default='0.0.0.0',
-                       help='Web server host (default: 0.0.0.0)')
 
     parser.add_argument('--version', '-v', action='version',
                        version=f'%(prog)s {VERSION}')
 
-    args = parser.parse_args()
-
-    if args.web:
-        run_web(args.host, args.port)
-    else:
-        run_tui()
+    parser.parse_args()
+    run_tui()
 
 
 def run_tui():
-    """Run terminal UI."""
+    """Run the terminal UI."""
     try:
         from google_takeout_tui import TakeoutTUI
         app = TakeoutTUI()
@@ -859,19 +852,6 @@ def run_tui():
     except ImportError as e:
         print(f"TUI mode requires textual: {e}")
         print("Install with: pip install textual rich requests")
-        sys.exit(1)
-
-
-def run_web(host: str, port: int):
-    """Run web interface."""
-    try:
-        from google_takeout_web import create_app
-        app, socketio = create_app()
-        print(f"\n🌐 Starting web interface on http://{host}:{port}")
-        socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
-    except ImportError as e:
-        print(f"Web mode requires Flask: {e}")
-        print("Install with: pip install flask flask-socketio requests")
         sys.exit(1)
 
 

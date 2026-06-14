@@ -1,35 +1,51 @@
 {
     "manifest_version": 3,
     "name": "Takeout Downloader Helper",
-    "version": "1.0.0",
-    "description": "Captures Google Takeout download URLs and sends them to your Takeout Downloader server",
+    "version": "2.0.0",
+    "description": "Captures Google Takeout download URLs and copies them as JSON for the Takeout Downloader TUI",
+
+    "minimum_chrome_version": "102",
+
     "permissions": [
         "webRequest",
         "storage",
-        "activeTab"
+        "activeTab",
+        "notifications"
     ],
+
     "host_permissions": [
         "https://takeout.google.com/*",
-        "https://storage.cloud.google.com/takeout*"
+        "https://takeout-download.usercontent.google.com/*",
+        "https://storage.cloud.google.com/*"
     ],
+
     "background": {
-        "service_worker": "background.js"
+        "service_worker": "background.js",
+        "type": "module"
     },
+
     "options_ui": {
         "page": "options.html",
         "open_in_tab": true
     },
+
     "action": {
         "default_popup": "popup.html",
+        "default_title": "Takeout Downloader",
         "default_icon": {
             "16": "icon16.png",
             "48": "icon48.png",
             "128": "icon128.png"
         }
     },
+
     "icons": {
         "16": "icon16.png",
         "48": "icon48.png",
         "128": "icon128.png"
+    },
+
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'self';"
     }
 }

@@ -2,13 +2,9 @@
 requests>=2.28.0
 python-dotenv>=1.0.0
 
-# TUI (default mode)
+# TUI (the only interface)
 textual>=0.50.0
 rich>=13.0.0
 
-# Web interface (--web mode)
-flask>=3.0.0
-flask-socketio>=5.3.0
-
-# For building single binary
+# For building a single binary
 pyinstaller>=6.0.0

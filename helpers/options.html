@@ -1,65 +1,86 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';">
+    <title>Takeout Helper Settings</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 24px; }
+        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 24px; max-width: 640px; margin: 0 auto; line-height: 1.6; }
         h2 { color: #a855f7; margin-bottom: 16px; }
+        h3 { color: #f8fafc; margin-top: 24px; margin-bottom: 8px; font-size: 14px; }
         .section { margin-bottom: 16px; }
-        label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
-        input, select { width: 100%; padding: 10px; background: #2d2d3f; border: 1px solid #4b5563; border-radius: 6px; color: #f8fafc; font-size: 14px; }
-        button { padding: 10px 20px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
-        button:hover { background: #6d28d9; }
-        .status { padding: 12px; background: #2d2d3f; border-radius: 6px; font-size: 14px; margin-top: 12px; }
-        .status.ok { color: #22c55e; }
-        .status.err { color: #ef4444; }
+        label { display: block; color: #94a3b8; font-size: 13px; margin-bottom: 6px; }
+        .row { display: flex; align-items: center; gap: 10px; padding: 10px 0; }
+        input[type="checkbox"] { width: 18px; height: 18px; }
+        .help { font-size: 12px; color: #94a3b8; line-height: 1.6; }
+        .help code { background: #2d2d3f; padding: 2px 6px; border-radius: 4px; }
+        .warning { background: rgba(245, 158, 11, 0.1); border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 16px 0; border-radius: 4px; font-size: 13px; color: #fde68a; }
+        .status { padding: 10px; background: #2d2d3f; border-radius: 6px; font-size: 13px; margin-top: 12px; display: none; }
+        .status.ok { color: #22c55e; display: block; }
+        .status.err { color: #ef4444; display: block; }
+        code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     </style>
 </head>
 <body>
     <h2>⚙️ Takeout Helper Settings</h2>
 
     <div class="section">
-        <label>Downloader Server URL</label>
-        <input type="text" id="serverUrl" value="http://localhost:5000">
+        <div class="row">
+            <input type="checkbox" id="autoCopy">
+            <label for="autoCopy" style="margin: 0; cursor: pointer;">
+                <strong>Auto-copy JSON when a capture happens</strong>
+            </label>
+        </div>
+        <div class="help">
+            When enabled, opening the popup is optional — every new capture
+            goes straight to your clipboard. Recommended if you keep the
+            popup closed most of the time.
+        </div>
     </div>
 
     <div class="section">
-        <label>Authentication User</label>
-        <input type="text" id="authUser" placeholder="admin">
+        <div class="row">
+            <input type="checkbox" id="badgeFilename" checked>
+            <label for="badgeFilename" style="margin: 0; cursor: pointer;">
+                <strong>Show filename suffix on the extension badge</strong>
+            </label>
+        </div>
+        <div class="help">
+            After a capture, the toolbar icon gets a small text overlay
+            showing the last 6 characters of the filename. Helpful when
+            juggling multiple Takeout jobs in different browser tabs.
+        </div>
     </div>
 
-    <div class="section">
-        <label>Authentication Password</label>
-        <input type="password" id="authPass">
+    <h3>What this extension does</h3>
+    <div class="help">
+        Watches network requests to <code>takeout.google.com</code>,
+        <code>takeout-download.usercontent.google.com</code>, and
+        <code>storage.cloud.google.com</code>. When you click any download
+        button on the Takeout page, it captures the URL and the full
+        <code>Cookie</code> header, plus any of <code>User-Agent</code>,
+        <code>Accept</code>, <code>Accept-Language</code>, and
+        <code>Referer</code> that Chrome sent.
+    </div>
+    <div class="help" style="margin-top: 8px;">
+        Nothing is sent to any server. You copy the JSON (or cURL) from
+        the popup and paste it into the Takeout Downloader TUI.
     </div>
 
-    <div class="section">
-        <label>Default Output Directory</label>
-        <input type="text" id="outputDir" value="/opt/takeout">
+    <div class="warning">
+        <strong>Cookie-redirect gotcha:</strong> the request that the
+        extension needs to capture is the one to
+        <code>takeout-download.usercontent.google.com</code> — the FINAL
+        host after Chrome follows the redirect chain. If the popup shows
+        a "Pre-redirect capture" warning, your downloads will return an
+        HTML login page instead of a ZIP. Pause the download in Chrome's
+        Downloads tab, open DevTools → Network, and copy the
+        <code>takeout-download.usercontent.google.com</code> request
+        instead.
     </div>
-
-    <div class="section">
-        <label>Default Parallel Downloads</label>
-        <input type="number" id="parallel" value="6" min="1" max="20">
-    </div>
-
-    <div class="section">
-        <label>Default File Count</label>
-        <input type="number" id="fileCount" value="100" min="1" max="1000">
-    </div>
-
-    <button onclick="save()">Save Settings</button>
 
     <div id="status" class="status"></div>
-
-    <div style="margin-top:24px;font-size:12px;color:#94a3b8;line-height:1.6;">
-        <strong style="color:#f59e0b;">Security notes:</strong><br>
-        • Server URL is validated: only <code>http://</code> or <code>https://</code> are accepted.<br>
-        • For non-localhost URLs you'll be asked to confirm once per session before each send.<br>
-        • Your captured Google session cookie and auth password are stored in <code>chrome.storage.local</code> (plaintext, sandboxed to this extension).<br>
-        • <code>autoSend=true</code> fires on every matching capture — keep it off until you've confirmed the server URL is correct.
-    </div>
 
     <script src="options.js"></script>
 </body>

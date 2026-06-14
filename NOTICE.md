@@ -10,8 +10,11 @@ This repository is a fork of:
 The original project was first published by **Clive Watts**
 (`clive@clivewatts.net`) and later republished and expanded under the
 `Kalainilavann` GitHub account. This fork preserves that authorship in the
-commit history and adds new features, security hardening, a TUI/Web UI,
-aria2c integration, and helper browser tools on top.
+commit history and adds new features, security hardening, a TUI,
+aria2c integration, and a browser extension on top. (Earlier revisions
+of this fork also shipped a Flask/SocketIO web UI, a Tampermonkey
+userscript, and a bookmarklet; these were removed in v6.0.0 in favor of
+an extension-only capture flow — see the change log below.)
 
 ### How to access the previous repository
 
@@ -66,6 +69,7 @@ See [`LICENSE`](./LICENSE) for the full text.
 | 2025-12-05 | Upstream initial commit by Clive Watts (no license declared).                                  |
 | 2025–2026  | Development continues under Kalainilavann's account; still no license file.                    |
 | 2026-06-13 | Fork prepared for publication. `outscorn/`, `_tmp/` test artifacts, and `_final_test.txt` are removed from working tree and rewritten out of git history via `git-filter-repo` (see *Safety cleanup* below). `LICENSE` added under GLWTS Public License. Docker-compose NAS-mount path normalized to `/path/to/downloads`. Remote changed to `AppliedEllipsis/takeout-downloader`. |
+| 2026-06-14 | **v6.0.0** — Web UI removed (`google_takeout_web.py`, `Dockerfile`, `docker-compose.yml`, Flask/SocketIO deps). Tampermonkey userscript and bookmarklet dropped. Architecture is now **TUI + browser extension only**: the extension captures a download request and copies it as JSON, the user pastes it into the TUI. No server, no auto-send, no network egress from the extension. TUI rings the terminal bell and flashes its title bar when the session cookie expires. New `takeout_payload.py` schema module bridges both sides. |
 
 ---
 

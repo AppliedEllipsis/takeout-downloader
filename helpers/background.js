@@ -1,248 +1,239 @@
 // Takeout Downloader Helper - Background Service Worker
-// Captures takeout download requests and stores them for the popup
+// v2.0.0 — capture-only. The user copies JSON from the popup and pastes
+// it into the TUI. No network calls leaving the browser.
+//
+// Why this design?
+//   v1 sent captures to a localhost Flask server automatically. The TUI
+//   has no server now (the web UI was removed). The user is the transport
+//   layer: extension produces JSON, user copies to clipboard, user pastes
+//   into the TUI. Simpler, fewer attack surface, works on any machine.
 
-// Default configuration
+const SCHEMA_VERSION = 1;
+
+// Patterns we capture from. We want the FINAL host in the redirect chain
+// (takeout-download.usercontent.google.com) because that's where the
+// session cookies are valid. We also accept takeout.google.com for the
+// case where the user pauses the download before redirect completes,
+// but flag those as "pre-redirect" so the popup can warn.
+//
+// See https://blog.omgmog.net/post/downloading-google-takeout-to-a-nas/
+// for the full write-up of why pre-redirect captures fail.
+const FINAL_HOST_PATTERNS = [
+    'takeout-download.usercontent.google.com',
+    'storage.cloud.google.com'
+];
+const PAGE_HOST_PATTERNS = [
+    'takeout.google.com'
+];
+
+const ALL_URL_PATTERNS = [
+    ...FINAL_HOST_PATTERNS.map(h => `https://${h}/*`),
+    ...PAGE_HOST_PATTERNS.map(h => `https://${h}/*`)
+];
+
 const DEFAULTS = {
-    serverUrl: 'http://localhost:5000',
-    authUser: '',
-    authPass: '',
-    autoSend: false,
-    outputDir: '/opt/takeout',
-    parallel: 6,
-    fileCount: 100
+    hasCapture: false,
+    captureCount: 0,
+    lastCapture: null,
+    lastError: null,
+    captureTimestamps: []   // rolling buffer of recent capture times (for badge)
 };
 
-// SECURITY: Validate serverUrl before sending data anywhere.
-// Refuse non-HTTP schemes (javascript:, file:, data:, etc.)
-// Warn (do not block) on non-localhost to avoid silent exfiltration.
-function isSafeServerUrl(url) {
-    if (!url || typeof url !== 'string') return false;
-    try {
-        const u = new URL(url);
-        if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-function isLocalhostUrl(url) {
-    try {
-        const u = new URL(url);
-        const h = u.hostname.toLowerCase();
-        return h === 'localhost' || h === '127.0.0.1' || h === '::1';
-    } catch (e) {
-        return false;
-    }
-}
-
-// Initialize storage
-chrome.storage.local.get(DEFAULTS, (settings) => {
-    chrome.storage.local.set(settings);
+// Boot: merge defaults into storage
+chrome.runtime.onInstalled.addListener(() => {
+    chrome.storage.local.get(DEFAULTS, (existing) => {
+        const merged = { ...DEFAULTS };
+        for (const k of Object.keys(existing || {})) {
+            if (k in DEFAULTS) merged[k] = existing[k];
+        }
+        chrome.storage.local.set(merged);
+    });
 });
 
-// Intercept takeout download requests
+// ---------------------------------------------------------------------------
+// Capture: webRequest onBeforeSendHeaders
+// ---------------------------------------------------------------------------
+// Runs in the service worker for every matching request. We pull the Cookie
+// header out of the request headers and persist the capture. We do NOT
+// send it anywhere — that's the user's job (copy from popup, paste to TUI).
 chrome.webRequest.onBeforeSendHeaders.addListener(
     (details) => {
-        const url = details.url;
-        if (url.includes('takeout') || url.includes('storage.cloud.google.com')) {
-            // Extract cookie from headers
-            const cookieHeader = details.requestHeaders
-                .find(h => h.name.toLowerCase() === 'cookie');
-            const cookie = cookieHeader ? cookieHeader.value : '';
+        try {
+            const capture = buildCapture(details);
+            if (!capture) return;
 
-            // Store the captured request
-            const capture = {
-                url: url,
-                cookie: cookie,
-                method: details.method,
-                timestamp: Date.now()
-            };
-
-            chrome.storage.local.set({ lastCapture: capture, hasCapture: true });
-
-            // Auto-send if enabled
-            chrome.storage.local.get(['autoSend', 'serverUrl', 'authUser', 'authPass'], (settings) => {
-                if (settings.autoSend) {
-                    sendToServer(capture, settings);
-                }
+            chrome.storage.local.get(['captureCount', 'captureTimestamps'], (data) => {
+                const count = (data.captureCount || 0) + 1;
+                const stamps = (data.captureTimestamps || []).concat([Date.now()]).slice(-50);
+                chrome.storage.local.set({
+                    lastCapture: capture,
+                    hasCapture: true,
+                    captureCount: count,
+                    captureTimestamps: stamps,
+                    lastError: null
+                });
+                updateBadge();
             });
+        } catch (err) {
+            chrome.storage.local.set({ lastError: err.message || String(err) });
         }
     },
-    { urls: ['https://takeout.google.com/*', 'https://storage.cloud.google.com/takeout*'] },
+    { urls: ALL_URL_PATTERNS },
     ['requestHeaders']
 );
 
-// Send captured data to the downloader server
-function sendToServer(capture, settings) {
-    const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
+function buildCapture(details) {
+    const url = details.url || '';
+    if (!url) return null;
 
-    // SECURITY: refuse to send if serverUrl is malformed or non-HTTP
-    if (!isSafeServerUrl(serverUrl)) {
-        const err = 'Refusing to send: serverUrl is invalid or non-HTTP. Open extension Options to fix.';
-        chrome.storage.local.set({
-            lastSendResult: { error: err },
-            lastSendTime: Date.now()
-        });
-        chrome.notifications.create({
-            type: 'basic',
-            iconUrl: 'icon48.png',
-            title: 'Takeout Downloader - blocked',
-            message: err
-        });
-        return;
+    // Pick out the headers we care about
+    const out = {};
+    let cookie = '';
+    for (const h of (details.requestHeaders || [])) {
+        const name = (h.name || '').toLowerCase();
+        const value = h.value || '';
+        if (name === 'cookie') {
+            cookie = value;
+            continue;
+        }
+        if (name === 'user-agent') out['User-Agent'] = value;
+        else if (name === 'accept') out['Accept'] = value;
+        else if (name === 'accept-language') out['Accept-Language'] = value;
+        else if (name === 'referer') out['Referer'] = value;
+        else if (name === 'origin') out['Origin'] = value;
     }
 
-    // SECURITY: require explicit confirmation for non-localhost serverUrls
-    // when sending for the first time per session.
-    // MV3 service workers can't use window.confirm(), so we set a pending
-    // flag and surface the confirmation in the popup (which has DOM access).
-    if (!isLocalhostUrl(serverUrl)) {
-        chrome.storage.local.get(['confirmedRemoteHost'], (data) => {
-            if (data.confirmedRemoteHost === serverUrl) {
-                doSendToServer(capture, settings);
-            } else {
-                // Save the pending capture and notify the user to confirm in the popup
-                chrome.storage.local.set({
-                    pendingRemoteConfirmation: {
-                        capture: capture,
-                        serverUrl: serverUrl,
-                        timestamp: Date.now()
-                    },
-                    lastSendResult: {
-                        error: 'Remote server not yet confirmed. Open the extension popup to allow sends to ' + serverUrl
-                    },
-                    lastSendTime: Date.now()
-                });
-                chrome.notifications.create({
-                    type: 'basic',
-                    iconUrl: 'icon48.png',
-                    title: 'Takeout Downloader - confirm required',
-                    message: 'New remote server: ' + serverUrl + '. Click the extension icon to allow sends.'
-                });
-                // Set badge to draw attention
-                chrome.action.setBadgeText({ text: '!' });
-                chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
-            }
-        });
-        return;
-    }
+    // Validate it's a takeout URL
+    const lower = url.toLowerCase();
+    const isFinal = FINAL_HOST_PATTERNS.some(p => lower.includes(p));
+    const isPage = PAGE_HOST_PATTERNS.some(p => lower.includes(p));
+    if (!isFinal && !isPage) return null;
 
-    doSendToServer(capture, settings);
+    // Only GET requests carry takeout downloads; skip anything weird
+    if (details.method && details.method.toUpperCase() !== 'GET') return null;
+
+    return {
+        schema: SCHEMA_VERSION,
+        captured_at: new Date().toISOString(),
+        source: 'extension',
+        url: url,
+        method: 'GET',
+        headers: out,
+        cookie: cookie,
+        // Tag pre-redirect captures so the popup can warn the user
+        pre_redirect: isPage && !isFinal
+    };
 }
 
-function doSendToServer(capture, settings) {
-    const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
-    const headers = { 'Content-Type': 'application/json' };
-
-    if (settings.authUser) {
-        headers['Authorization'] = 'Basic ' + btoa(settings.authUser + ':' + settings.authPass);
-    }
-
-    // Build synthetic cURL
-    const curlText = `curl '${capture.url}' -H 'Cookie: ${capture.cookie}'`;
-
-    fetch(serverUrl + '/api/start', {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({
-            curl_input: curlText,
-            url: capture.url,
-            output_dir: settings.outputDir || DEFAULTS.outputDir,
-            parallel: settings.parallel || DEFAULTS.parallel,
-            file_count: settings.fileCount || DEFAULTS.fileCount
-        })
-    })
-    .then(r => r.json())
-    .then(data => {
-        chrome.storage.local.set({
-            lastSendResult: data.error ? { error: data.error } : { success: true },
-            lastSendTime: Date.now()
-        });
-    })
-    .catch(err => {
-        chrome.storage.local.set({
-            lastSendResult: { error: 'Connection failed: ' + err.message },
-            lastSendTime: Date.now()
-        });
+// ---------------------------------------------------------------------------
+// Badge: pulse when a new capture arrives
+// ---------------------------------------------------------------------------
+function updateBadge() {
+    chrome.storage.local.get(['hasCapture', 'lastCapture'], (data) => {
+        if (data.hasCapture && data.lastCapture) {
+            const filename = extractFilename(data.lastCapture.url);
+            const short = filename.length > 8 ? filename.slice(-6) : filename;
+            chrome.action.setBadgeText({ text: short });
+            chrome.action.setBadgeBackgroundColor({ color: '#7c3aed' });
+        } else {
+            chrome.action.setBadgeText({ text: '' });
+        }
     });
 }
 
-// Listen for messages from popup
+function extractFilename(url) {
+    try {
+        const tail = url.split('?')[0].split('/').pop() || '';
+        return tail.replace(/\.\w+$/, '').slice(-8);
+    } catch (e) {
+        return '';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard helper for the popup
+// ---------------------------------------------------------------------------
+// Service workers can't directly write to the clipboard, but they CAN
+// use the offscreen API (MV3) for that. Simpler: the popup (which has
+// a DOM) does the clipboard write. Here we just hand back the JSON.
+function buildPayloadJson(capture) {
+    if (!capture) return null;
+    return JSON.stringify({
+        schema: capture.schema || SCHEMA_VERSION,
+        captured_at: capture.captured_at || new Date().toISOString(),
+        source: capture.source || 'extension',
+        url: capture.url,
+        method: capture.method || 'GET',
+        headers: capture.headers || {},
+        cookie: capture.cookie || ''
+    }, null, 2);
+}
+
+function buildCurlString(capture) {
+    if (!capture) return null;
+    const lines = [`curl '${capture.url}' \\`];
+    const headers = capture.headers || {};
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === 'cookie') continue;  // added separately below
+        lines.push(`  -H '${k}: ${v}' \\`);
+    }
+    if (capture.cookie) lines.push(`  -H 'Cookie: ${capture.cookie}'`);
+    // Strip trailing backslash on the last header line
+    if (lines.length > 1) {
+        lines[lines.length - 1] = lines[lines.length - 1].replace(/ \\\\$/, '');
+    }
+    return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers from popup / options
+// ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.action === 'sendCapture') {
-        chrome.storage.local.get([
-            'lastCapture', 'serverUrl', 'authUser', 'authPass',
-            'outputDir', 'parallel', 'fileCount'
-        ], (settings) => {
-            sendToServer(settings.lastCapture, settings);
-            sendResponse({ status: 'sent' });
-        });
-        return true; // async
-    }
-    if (msg.action === 'updateCookie') {
-        chrome.storage.local.get(['lastCapture', 'serverUrl', 'authUser', 'authPass'], (settings) => {
-            const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
-            if (!isSafeServerUrl(serverUrl)) {
-                sendResponse({ error: 'serverUrl is invalid' });
-                return;
-            }
-            const headers = { 'Content-Type': 'application/json' };
-            if (settings.authUser) {
-                headers['Authorization'] = 'Basic ' + btoa(settings.authUser + ':' + settings.authPass);
-            }
-            const curlText = `curl '${settings.lastCapture.url}' -H 'Cookie: ${settings.lastCapture.cookie}'`;
-            fetch(serverUrl + '/api/update-cookie', {
-                method: 'POST',
-                headers: headers,
-                body: JSON.stringify({ curl_input: curlText, url: settings.lastCapture.url })
-            })
-            .then(r => r.json())
-            .then(data => sendResponse(data))
-            .catch(err => sendResponse({ error: err.message }));
-            return true; // async
-        });
-    }
-    if (msg.action === 'confirmRemote') {
-        // User confirmed in the popup that it's OK to send to the remote server
-        chrome.storage.local.get([
-            'pendingRemoteConfirmation', 'serverUrl', 'authUser', 'authPass',
-            'outputDir', 'parallel', 'fileCount'
-        ], (data) => {
-            const pending = data.pendingRemoteConfirmation;
-            if (!pending) {
-                sendResponse({ error: 'No pending confirmation' });
-                return;
-            }
-            chrome.storage.local.set({
-                confirmedRemoteHost: pending.serverUrl,
-                pendingRemoteConfirmation: null
-            }, () => {
-                chrome.action.setBadgeText({ text: '' });
-                const settings = {
-                    serverUrl: pending.serverUrl,
-                    authUser: data.authUser,
-                    authPass: data.authPass,
-                    outputDir: data.outputDir,
-                    parallel: data.parallel,
-                    fileCount: data.fileCount
-                };
-                doSendToServer(pending.capture, settings);
-                sendResponse({ status: 'confirmed and sent' });
+    if (msg.action === 'getCapture') {
+        chrome.storage.local.get(['lastCapture', 'hasCapture', 'captureCount', 'lastError'], (data) => {
+            sendResponse({
+                capture: data.lastCapture || null,
+                hasCapture: !!data.hasCapture,
+                count: data.captureCount || 0,
+                error: data.lastError || null,
+                json: buildPayloadJson(data.lastCapture),
+                curl: buildCurlString(data.lastCapture)
             });
         });
-        return true; // async
+        return true;  // async
     }
-    if (msg.action === 'denyRemote') {
-        // User denied — clear the pending flag, keep capture so they can retry manually
+
+    if (msg.action === 'clearCapture') {
         chrome.storage.local.set({
-            pendingRemoteConfirmation: null,
-            lastSendResult: { error: 'Remote server denied. Update serverUrl or manually click Send.' },
-            lastSendTime: Date.now()
+            lastCapture: null,
+            hasCapture: false,
+            lastError: null
         }, () => {
-            chrome.action.setBadgeText({ text: '' });
-            sendResponse({ status: 'denied' });
+            updateBadge();
+            sendResponse({ ok: true });
         });
-        return true; // async
+        return true;
+    }
+
+    if (msg.action === 'setPreference') {
+        const allowed = ['autoCopy', 'badgeFilename'];
+        if (!allowed.includes(msg.key)) {
+            sendResponse({ error: 'unknown preference' });
+            return false;
+        }
+        chrome.storage.local.set({ [msg.key]: msg.value }, () => {
+            sendResponse({ ok: true });
+        });
+        return true;
+    }
+
+    if (msg.action === 'getPreferences') {
+        chrome.storage.local.get(['autoCopy', 'badgeFilename'], (data) => {
+            sendResponse({
+                autoCopy: !!data.autoCopy,
+                badgeFilename: data.badgeFilename !== false  // default true
+            });
+        });
+        return true;
     }
 });

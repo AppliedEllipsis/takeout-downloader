@@ -1,129 +1,202 @@
-// Takeout Downloader Helper - Popup Logic
+// Takeout Downloader Helper - Popup Logic v2
+// Copy-as-JSON / Copy-as-cURL. No network calls outside the browser.
 
-// Load settings
-chrome.storage.local.get([
-    'serverUrl', 'authUser', 'authPass', 'outputDir',
-    'parallel', 'fileCount', 'autoSend', 'hasCapture',
-    'lastCapture', 'lastSendResult', 'lastSendTime'
-], (data) => {
-    document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:5000';
-    document.getElementById('authUser').value = data.authUser || '';
-    document.getElementById('authPass').value = data.authPass || '';
-    document.getElementById('outputDir').value = data.outputDir || '/opt/takeout';
-    document.getElementById('parallel').value = data.parallel || 6;
-    document.getElementById('fileCount').value = data.fileCount || 100;
-    document.getElementById('autoSend').checked = data.autoSend || false;
+const els = {
+    statusBox: null,
+    copyJsonBtn: null,
+    copyCurlBtn: null,
+    clearBtn: null,
+    preview: null,
+    autoCopy: null,
+    countPill: null
+};
 
-    // Show AUTO badge when auto-send is on (visual reminder of the silent-exfil risk)
-    updateAutoBadge(data.autoSend);
+function $(id) { return document.getElementById(id); }
 
-    // Update badge whenever the toggle changes
+function setStatus(text, cls) {
+    els.statusBox.textContent = text;
+    els.statusBox.className = 'status ' + (cls || 'dim');
+}
 
-    if (data.hasCapture && data.lastCapture) {
-        const age = Math.round((Date.now() - data.lastCapture.timestamp) / 1000);
-        const filename = data.lastCapture.url.split('/').pop() || 'unknown';
-        const statusEl = document.getElementById('status');
-        statusEl.textContent = `Captured: ${filename.substring(0, 25)} (${age}s ago)`;
-        statusEl.className = 'status ok';
+function shortFilename(url) {
+    if (!url) return 'unknown';
+    const tail = url.split('?')[0].split('/').pop() || url;
+    return tail.length > 30 ? '…' + tail.slice(-27) : tail;
+}
+
+function formatAge(timestamp) {
+    if (!timestamp) return '';
+    const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+    return `${Math.round(seconds / 3600)}h ago`;
+}
+
+function renderCapture(data) {
+    const capture = data.capture;
+    const count = data.count || 0;
+    els.countPill.textContent = String(count);
+    els.countPill.style.display = count > 0 ? 'inline-block' : 'none';
+
+    if (!capture) {
+        setStatus('No capture yet. Start a download on takeout.google.com to capture.', 'dim');
+        els.copyJsonBtn.disabled = true;
+        els.copyCurlBtn.disabled = true;
+        els.clearBtn.disabled = true;
+        els.preview.textContent = 'No capture yet.';
+        return;
     }
 
-    if (data.lastSendResult) {
-        const statusEl = document.getElementById('status');
-        if (data.lastSendResult.success) {
-            statusEl.textContent = 'Last send: started successfully';
-            statusEl.className = 'status ok';
-        } else if (data.lastSendResult.error) {
-            statusEl.textContent = 'Last send error: ' + data.lastSendResult.error;
-            statusEl.className = 'status err';
-        }
-    }
+    const filename = shortFilename(capture.url);
+    const age = formatAge(capture.captured_at ? Date.parse(capture.captured_at) : Date.now());
+    const cookieChars = (capture.cookie || '').length;
 
-    // Check for pending remote confirmation
-    if (data.pendingRemoteConfirmation) {
-        showRemoteConfirmDialog(data.pendingRemoteConfirmation);
-    }
-});
+    els.copyJsonBtn.disabled = false;
+    els.copyCurlBtn.disabled = false;
+    els.clearBtn.disabled = false;
 
-function showRemoteConfirmDialog(pending) {
-    const msg = 'This is the FIRST capture being sent to a remote server:\n\n' +
-                'Server: ' + pending.serverUrl + '\n\n' +
-                'A remote server can see your Google session cookie.\n\n' +
-                'Click OK to allow sends to this server for this session,\n' +
-                'or Cancel to deny.';
-    if (confirm(msg)) {
-        chrome.runtime.sendMessage({ action: 'confirmRemote' }, () => {});
+    // Pre-redirect warning — captured from takeout.google.com (not the final host).
+    // Those cookies are tied to the wrong domain and downloads will return HTML.
+    if (capture.pre_redirect) {
+        setStatus(
+            `⚠ Pre-redirect capture: ${filename} (${age}). ` +
+            `Re-capture from a request to takeout-download.usercontent.google.com.`,
+            'warn'
+        );
+    } else if (!capture.cookie) {
+        setStatus(`✗ No cookie captured. Try clicking the download again.`, 'err');
+    } else if (cookieChars < 100) {
+        setStatus(
+            `⚠ Cookie only ${cookieChars} chars (${age}). ` +
+            `Likely missing __Secure-* markers. Re-capture from final host.`,
+            'warn'
+        );
     } else {
-        chrome.runtime.sendMessage({ action: 'denyRemote' }, () => {});
+        setStatus(`✓ Captured: ${filename} (${age}, cookie ${cookieChars} chars, #${count})`, 'ok');
+    }
+
+    // Build preview JSON
+    const previewObj = {
+        schema: capture.schema || 1,
+        url: capture.url,
+        method: capture.method || 'GET',
+        headers: capture.headers || {},
+        cookie: capture.cookie ? `[${capture.cookie.length} chars]` : ''
+    };
+    els.preview.textContent = JSON.stringify(previewObj, null, 2);
+}
+
+async function copyToClipboard(text, kind) {
+    try {
+        await navigator.clipboard.writeText(text);
+        setStatus(`✓ ${kind} copied! Paste into the TUI.`, 'ok');
+        setTimeout(() => refresh(), 1500);
+    } catch (e) {
+        // Fallback for browsers that block the async clipboard API in popups
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+            document.execCommand('copy');
+            setStatus(`✓ ${kind} copied! Paste into the TUI.`, 'ok');
+        } catch (e2) {
+            setStatus(`✗ Could not copy: ${e2.message}. Select text manually.`, 'err');
+        } finally {
+            document.body.removeChild(ta);
+        }
+        setTimeout(() => refresh(), 1500);
     }
 }
 
-// Save settings on change
-['serverUrl', 'authUser', 'authPass', 'outputDir', 'parallel', 'fileCount'].forEach(id => {
-    document.getElementById(id).addEventListener('change', () => {
-        chrome.storage.local.set({
-            serverUrl: document.getElementById('serverUrl').value,
-            authUser: document.getElementById('authUser').value,
-            authPass: document.getElementById('authPass').value,
-            outputDir: document.getElementById('outputDir').value,
-            parallel: parseInt(document.getElementById('parallel').value) || 6,
-            fileCount: parseInt(document.getElementById('fileCount').value) || 100,
-            autoSend: document.getElementById('autoSend').checked
-        });
-    });
-});
-
-document.getElementById('autoSend').addEventListener('change', () => {
-    const checked = document.getElementById('autoSend').checked;
-    chrome.storage.local.set({ autoSend: checked });
-    updateAutoBadge(checked);
-});
-
-function updateAutoBadge(isOn) {
-    const badge = document.getElementById('autoBadge');
-    if (badge) badge.style.display = isOn ? 'inline' : 'none';
-}
-
-// Send capture to server
-function sendCapture() {
-    const statusEl = document.getElementById('status');
-    statusEl.textContent = 'Sending...';
-    statusEl.className = 'status warn';
-
-    // Save current settings first
-    chrome.storage.local.set({
-        serverUrl: document.getElementById('serverUrl').value,
-        authUser: document.getElementById('authUser').value,
-        authPass: document.getElementById('authPass').value,
-        outputDir: document.getElementById('outputDir').value,
-        parallel: parseInt(document.getElementById('parallel').value) || 6,
-        fileCount: parseInt(document.getElementById('fileCount').value) || 100
-    }, () => {
-        chrome.runtime.sendMessage({ action: 'sendCapture' }, (response) => {
-            statusEl.textContent = 'Sent! Check server for status.';
-            statusEl.className = 'status ok';
-        });
+function refresh() {
+    chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
+        if (chrome.runtime.lastError) {
+            setStatus('Extension error: ' + chrome.runtime.lastError.message, 'err');
+            return;
+        }
+        renderCapture(response || {});
     });
 }
 
-// Update cookie on server
-function updateCookie() {
-    const statusEl = document.getElementById('status');
-    statusEl.textContent = 'Updating cookie...';
-    statusEl.className = 'status warn';
+document.addEventListener('DOMContentLoaded', () => {
+    els.statusBox = $('statusBox');
+    els.copyJsonBtn = $('copyJsonBtn');
+    els.copyCurlBtn = $('copyCurlBtn');
+    els.clearBtn = $('clearBtn');
+    els.preview = $('preview');
+    els.autoCopy = $('autoCopy');
+    els.countPill = $('countPill');
 
-    chrome.storage.local.set({
-        serverUrl: document.getElementById('serverUrl').value,
-        authUser: document.getElementById('authUser').value,
-        authPass: document.getElementById('authPass').value,
-    }, () => {
-        chrome.runtime.sendMessage({ action: 'updateCookie' }, (response) => {
-            if (response && response.error) {
-                statusEl.textContent = 'Error: ' + response.error;
-                statusEl.className = 'status err';
+    refresh();
+
+    // Load preferences
+    chrome.runtime.sendMessage({ action: 'getPreferences' }, (prefs) => {
+        if (prefs && typeof prefs.autoCopy === 'boolean') {
+            els.autoCopy.checked = prefs.autoCopy;
+        }
+    });
+
+    // Wire up buttons
+    els.copyJsonBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
+            if (response && response.json) {
+                copyToClipboard(response.json, 'JSON');
             } else {
-                statusEl.textContent = 'Cookie updated!';
-                statusEl.className = 'status ok';
+                setStatus('No capture to copy.', 'warn');
             }
         });
     });
-}
+
+    els.copyCurlBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
+            if (response && response.curl) {
+                copyToClipboard(response.curl, 'cURL');
+            } else {
+                setStatus('No capture to copy.', 'warn');
+            }
+        });
+    });
+
+    els.clearBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'clearCapture' }, () => {
+            refresh();
+        });
+    });
+
+    els.autoCopy.addEventListener('change', () => {
+        chrome.runtime.sendMessage({
+            action: 'setPreference',
+            key: 'autoCopy',
+            value: els.autoCopy.checked
+        });
+    });
+
+    // Listen for storage changes (auto-refresh after a new capture)
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && (changes.lastCapture || changes.captureCount)) {
+            refresh();
+            // Auto-copy if enabled
+            if (els.autoCopy.checked && changes.lastCapture) {
+                const newCap = changes.lastCapture.newValue;
+                if (newCap && !newCap.pre_redirect && newCap.cookie) {
+                    const json = JSON.stringify({
+                        schema: newCap.schema || 1,
+                        captured_at: newCap.captured_at,
+                        source: newCap.source || 'extension',
+                        url: newCap.url,
+                        method: newCap.method || 'GET',
+                        headers: newCap.headers || {},
+                        cookie: newCap.cookie
+                    }, null, 2);
+                    copyToClipboard(json, 'JSON (auto)');
+                }
+            }
+        }
+    });
+
+    // Refresh every 2s while popup is open so age stays accurate
+    setInterval(refresh, 2000);
+});

@@ -1,71 +1,72 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';">
+    <title>Takeout Downloader</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 16px; min-width: 320px; }
+        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 16px; min-width: 340px; }
         h2 { color: #a855f7; margin-bottom: 12px; font-size: 16px; }
-        .section { margin-bottom: 16px; }
+        .section { margin-bottom: 14px; }
         label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
-        input { width: 100%; padding: 8px; background: #2d2d3f; border: 1px solid #4b5563; border-radius: 6px; color: #f8fafc; font-size: 13px; }
-        button { width: 100%; padding: 10px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; margin-top: 8px; }
+        button { width: 100%; padding: 10px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; margin-top: 6px; }
         button:hover { background: #6d28d9; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .status { padding: 8px; background: #2d2d3f; border-radius: 6px; font-size: 12px; margin-top: 8px; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        button.secondary { background: #3d3d5c; }
+        button.secondary:hover { background: #4d4d6c; }
+        button.success { background: #22c55e; }
+        button.warning { background: #f59e0b; color: #1e1e2e; }
+        .status { padding: 10px; background: #2d2d3f; border-radius: 6px; font-size: 12px; margin-top: 8px; line-height: 1.5; }
         .status.ok { color: #22c55e; }
         .status.err { color: #ef4444; }
         .status.warn { color: #f59e0b; }
-        .toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #94a3b8; }
+        .status.dim { color: #94a3b8; }
+        .toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #94a3b8; margin-top: 6px; }
         .toggle input { width: auto; }
+        pre.payload { background: #0d0d1a; padding: 8px; border-radius: 4px; font-size: 10px; max-height: 120px; overflow: auto; color: #c0c0d0; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+        .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; margin-left: 6px; }
+        .pill.ok { background: #166534; color: #bbf7d0; }
+        .pill.warn { background: #92400e; color: #fed7aa; }
+        .pill.err { background: #991b1b; color: #fecaca; }
+        details { margin-top: 10px; }
+        summary { cursor: pointer; color: #94a3b8; font-size: 11px; padding: 4px 0; }
+        a { color: #a855f7; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .help { font-size: 11px; color: #94a3b8; margin-top: 8px; line-height: 1.5; }
     </style>
 </head>
 <body>
-    <h2>📦 Takeout Downloader</h2>
+    <h2>📦 Takeout Downloader <span id="countPill" style="display:none" class="pill ok">0</span></h2>
+
+    <div id="statusBox" class="status dim">No capture yet. Start a download on takeout.google.com to capture.</div>
 
     <div class="section">
-        <label>Server URL</label>
-        <input type="text" id="serverUrl" value="http://localhost:5000">
+        <button id="copyJsonBtn" disabled>📋 Copy as JSON</button>
+        <button id="copyCurlBtn" class="secondary" disabled>📋 Copy as cURL</button>
+        <button id="clearBtn" class="secondary" disabled style="margin-top:2px;">🗑 Clear capture</button>
     </div>
 
-    <div class="section">
-        <label>Auth User (blank = no auth)</label>
-        <input type="text" id="authUser" placeholder="admin">
+    <details>
+        <summary>Preview capture</summary>
+        <pre class="payload" id="preview">No capture yet.</pre>
+    </details>
+
+    <div class="toggle">
+        <input type="checkbox" id="autoCopy">
+        <span>Auto-copy JSON when captured</span>
     </div>
 
-    <div class="section">
-        <label>Auth Password</label>
-        <input type="password" id="authPass" placeholder="changeme">
+    <div class="help">
+        1. Open <a href="https://takeout.google.com/settings/takeout/downloads" target="_blank">takeout.google.com</a><br>
+        2. Click any <strong>Download</strong> button<br>
+        3. Click the extension icon → <strong>Copy as JSON</strong><br>
+        4. Paste into the Takeout Downloader TUI (<code>Ctrl+Shift+V</code>)<br>
+        <br>
+        When the TUI needs a refreshed capture (cookies expire after a few
+        hundred MB), re-trigger a download on the Takeout page and copy a
+        new JSON — paste it into the TUI to resume.
     </div>
-
-    <div class="section">
-        <label>Output Directory</label>
-        <input type="text" id="outputDir" value="/opt/takeout">
-    </div>
-
-    <div class="section">
-        <label>Parallel Downloads</label>
-        <input type="number" id="parallel" value="6" min="1" max="20">
-    </div>
-
-    <div class="section">
-        <label>File Count</label>
-        <input type="number" id="fileCount" value="100" min="1" max="1000">
-    </div>
-
-    <div class="section">
-        <div class="toggle">
-            <input type="checkbox" id="autoSend">
-            <span>Auto-send on capture</span>
-            <span id="autoBadge" style="display:none;background:#f59e0b;color:#1e1e2e;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">AUTO</span>
-        </div>
-        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">⚠️ When enabled, every captured takeout link is sent to your server automatically. For non-localhost servers you'll be asked to confirm once per session.</div>
-    </div>
-
-    <button id="sendBtn" onclick="sendCapture()">📤 Send Last Capture</button>
-    <button id="updateBtn" onclick="updateCookie()" style="background:#f59e0b;margin-top:4px;">🔄 Update Cookie</button>
-
-    <div id="status" class="status">No capture yet</div>
 
     <script src="popup.js"></script>
 </body>

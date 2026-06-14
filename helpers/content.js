@@ -1,160 +1,214 @@
-// Content script for takeout.google.com — scrapes all download links
-// from the export page and sends them to the background script.
+// Takeout Downloader Helper - Content Script
+// Runs on https://takeout.google.com/* pages. Two responsibilities:
+//
+// 1. Scrape the visible DOM for download links (best-effort, works when
+//    the page renders URLs directly).
+//
+// 2. On demand from the popup, fetch the full export list via the
+//    same internal API the page itself uses. This works even when the
+//    URLs are only loaded via XHR and never appear in the HTML source.
 
-(function () {
+(function() {
     'use strict';
 
-    const FINAL_HOST = 'takeout-download.usercontent.google.com';
-    const ARCHIVE_PATH_RE = /\/manage\/archive\//;
+    const TAKEOUT_URL_RE = /https:\/\/takeout-download\.usercontent\.google\.com\/download\/takeout-[^"'\s<>]+\.zip(?:\?[^"'\s<>]*)?/g;
 
-    // -----------------------------------------------------------------------
-    // Export list (what the user sees on the manage page)
-    // -----------------------------------------------------------------------
+    function extractUrlsFromHtml(html) {
+        if (!html) return [];
+        const matches = html.match(TAKEOUT_URL_RE) || [];
+        return Array.from(new Set(matches));
+    }
+
+    function extractUrlsFromJson(data) {
+        if (!data) return [];
+        const urls = [];
+        const seen = new Set();
+        function walk(node) {
+            if (!node) return;
+            if (typeof node === 'string') {
+                const m = node.match(TAKEOUT_URL_RE);
+                if (m) {
+                    for (const url of m) {
+                        if (!seen.has(url)) {
+                            seen.add(url);
+                            urls.push(url);
+                        }
+                    }
+                }
+                return;
+            }
+            if (Array.isArray(node)) {
+                for (const item of node) walk(item);
+                return;
+            }
+            if (typeof node === 'object') {
+                for (const key of Object.keys(node)) walk(node[key]);
+            }
+        }
+        walk(data);
+        return urls;
+    }
+
+    function findArchiveId() {
+        // The archive ID is in the URL path: /manage/archive/{id}
+        const m = location.pathname.match(/\/manage\/archive\/([a-f0-9-]+)/);
+        if (m) return m[1];
+        // Also check the page's download links for the j= parameter
+        const html = document.documentElement.innerHTML;
+        const jm = html.match(/[?&]j=([a-f0-9-]+)/);
+        if (jm) return jm[1];
+        return null;
+    }
+
+    function findAuthuser() {
+        // From URL: /u/{N}/
+        const m = location.pathname.match(/\/u\/(\d+)\//);
+        if (m) return m[1];
+        // From the cookie
+        const cookies = document.cookie;
+        const cm = cookies.match(/authuser=(\d+)/);
+        if (cm) return cm[1];
+        return '0';
+    }
+
+    async function fetchExportList() {
+        const archiveId = findArchiveId();
+        if (!archiveId) {
+            return { ok: false, error: 'no archive ID in URL' };
+        }
+        const authuser = findAuthuser();
+
+        // Try the internal API endpoints the page itself uses.
+        // We send same-origin requests with cookies automatically attached
+        // because we're running in the page context.
+        const apiUrls = [
+            `/_/TakeoutApiUi/data?archiveId=${archiveId}&authuser=${authuser}`,
+            `/api/v2/manage/archive?id=${archiveId}&authuser=${authuser}`,
+            `/api/v2/manage/archives?authuser=${authuser}`,
+            `/u/${authuser}/manage/archive/${archiveId}?json=1`
+        ];
+
+        const debug = [];
+        for (const apiUrl of apiUrls) {
+            try {
+                const resp = await fetch(apiUrl, {
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json,text/html' },
+                    redirect: 'follow'
+                });
+                if (!resp.ok) {
+                    debug.push(`${apiUrl} -> ${resp.status}`);
+                    continue;
+                }
+                if (resp.url.includes('accounts.google.com')) {
+                    return { ok: false, error: 'cookie expired', debug };
+                }
+                const ctype = resp.headers.get('content-type') || '';
+                let urls = [];
+                if (ctype.includes('json')) {
+                    try {
+                        const data = await resp.json();
+                        urls = extractUrlsFromJson(data);
+                    } catch (e) {
+                        debug.push(`${apiUrl} -> JSON parse error: ${e.message}`);
+                        continue;
+                    }
+                } else {
+                    const html = await resp.text();
+                    urls = extractUrlsFromHtml(html);
+                }
+                debug.push(`${apiUrl} -> ${resp.status} ${ctype} urls=${urls.length}`);
+                if (urls.length > 0) {
+                    return { ok: true, urls, debug, source: apiUrl };
+                }
+            } catch (e) {
+                debug.push(`${apiUrl} -> ERROR: ${e.message}`);
+            }
+        }
+        return { ok: false, error: 'no endpoints returned URLs', debug };
+    }
+
+    // Passively scrape the DOM for download links (best-effort).
     function scrapeExports() {
         const exports = [];
         const seen = new Set();
+        const html = document.documentElement.innerHTML;
 
-        // Strategy 1: Find all <a> tags that look like takeout download links.
-        // On the manage page, Google renders each export as a card with a
-        // "Download" link.
-        const links = document.querySelectorAll('a[href]');
-        for (const link of links) {
-            const url = link.href || '';
-            // The actual download links point to the final host.
-            if (url.includes('takeout-download.usercontent.google.com') &&
-                url.includes('.zip')) {
-                const filename = url.split('?')[0].split('/').pop();
-                if (seen.has(filename)) continue;
-                seen.add(filename);
-                exports.push({ url, filename, text: link.textContent.trim() });
+        // Strategy 1: <a> tags with takeout-download URLs
+        for (const a of document.querySelectorAll('a[href*="takeout-download.usercontent.google.com"]')) {
+            const href = a.getAttribute('href');
+            if (href && !seen.has(href)) {
+                seen.add(href);
+                exports.push({
+                    url: href,
+                    filename: href.split('?')[0].split('/').pop() || ''
+                });
             }
         }
 
-        // Strategy 2: The page may embed download URLs in data attributes or
-        // onclick handlers. Scan all elements for attributes that contain
-        // takeout-download URLs.
-        const allEls = document.querySelectorAll('*');
-        for (const el of allEls) {
+        // Strategy 2: scan all element attributes
+        for (const el of document.querySelectorAll('*')) {
             for (const attr of el.attributes || []) {
-                const val = attr.value || '';
-                if (val.includes('takeout-download') && val.includes('.zip')) {
-                    const filename = val.split('?')[0].split('/').pop();
-                    if (seen.has(filename)) continue;
-                    seen.add(filename);
-                    exports.push({ url: val, filename, text: el.textContent.trim() });
+                if (attr.value && attr.value.includes('takeout-download.usercontent.google.com')
+                    && !seen.has(attr.value)) {
+                    seen.add(attr.value);
+                    exports.push({
+                        url: attr.value,
+                        filename: attr.value.split('?')[0].split('/').pop() || ''
+                    });
                 }
             }
         }
 
-        // Strategy 3: Look at the raw HTML for zip filenames. This catches
-        // cases where the URL is hidden in JS or template data.
-        const html = document.documentElement.innerHTML;
-        const zipMatches = html.match(/takeout-\d{8}T\d{6}Z-\d+-\d{3}\.zip[^\s<"']*/g);
-        if (zipMatches) {
-            for (const match of zipMatches) {
-                const filename = match.split('?')[0];
-                if (seen.has(filename)) continue;
-                seen.add(filename);
-                // We don't have the full URL yet — it will be captured when
-                // the user clicks the download button (webRequest sees it).
-                exports.push({ url: null, filename, text: filename });
+        // Strategy 3: regex over raw HTML for any URLs we might have missed
+        const matches = html.match(TAKEOUT_URL_RE) || [];
+        for (const url of matches) {
+            if (!seen.has(url)) {
+                seen.add(url);
+                exports.push({
+                    url: url,
+                    filename: url.split('?')[0].split('/').pop() || ''
+                });
             }
         }
 
         return exports;
     }
 
-    // -----------------------------------------------------------------------
-    // Sizes: extract "155.3 MB", "1.17 GB", etc. from the page text
-    // -----------------------------------------------------------------------
-    function scrapeSizes() {
-        const sizes = {};
-        const walker = document.createTreeWalker(
-            document.body, NodeFilter.SHOW_TEXT, null, false
-        );
-        let node;
-        while ((node = walker.nextNode())) {
-            const text = node.textContent.trim();
-            const sizeMatch = text.match(/(\d+\.?\d*)\s*(MB|GB|KB)/);
-            if (sizeMatch) {
-                let el = node.parentElement;
-                for (let i = 0; i < 3 && el; i++) {
-                    const elText = el.textContent;
-                    const partMatch = elText.match(/Part\s+(\d+)/);
-                    if (partMatch) {
-                        sizes[partMatch[1]] = {
-                            value: parseFloat(sizeMatch[1]),
-                            unit: sizeMatch[2],
-                            raw: text
-                        };
-                        break;
-                    }
-                    el = el.parentElement;
-                }
-            }
+    // Listen for messages from the popup
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (msg.action === 'contentFetchExports') {
+            fetchExportList().then(sendResponse);
+            return true;  // async response
         }
-        return sizes;
-    }
+        if (msg.action === 'contentScrape') {
+            sendResponse({ ok: true, exports: scrapeExports() });
+            return false;
+        }
+        return false;
+    });
 
-    // -----------------------------------------------------------------------
-    // Intercept clicks on download buttons to capture URLs before navigation
-    // -----------------------------------------------------------------------
-    function interceptClicks() {
-        document.addEventListener('click', (e) => {
-            const el = e.target.closest('a, button, [role="button"]');
-            if (!el) return;
-            const text = (el.textContent || el.innerText || '').toLowerCase();
-            if (!text.includes('download') && !text.includes('export')) return;
-
-            // Try to extract a URL from the element or its ancestors
-            let url = el.href || el.getAttribute('data-url') || '';
-            let parent = el.parentElement;
-            for (let i = 0; i < 3 && parent && !url; i++) {
-                url = parent.getAttribute('data-url') || '';
-                parent = parent.parentElement;
-            }
-
-            if (url && url.includes('takeout')) {
-                chrome.runtime.sendMessage({
-                    action: 'clickIntercept',
-                    url,
-                    text: el.textContent.trim(),
-                    timestamp: new Date().toISOString()
-                });
-            }
-        }, true);
-    }
-
-    // -----------------------------------------------------------------------
-    // Send scraped data to background script
-    // -----------------------------------------------------------------------
-    function sendData() {
+    // Periodic scrape — sends findings to background for popup display
+    function sendScrape() {
         const exports = scrapeExports();
-        const sizes = scrapeSizes();
         if (exports.length > 0) {
             chrome.runtime.sendMessage({
                 action: 'pageScrape',
-                exports,
-                sizes,
-                url: window.location.href,
-                timestamp: new Date().toISOString()
-            });
+                exports: exports,
+                sizes: {},
+                url: location.href,
+                timestamp: Date.now()
+            }).catch(() => {});
         }
     }
+    sendScrape();
+    setInterval(sendScrape, 5000);
 
-    // -----------------------------------------------------------------------
-    // Boot
-    // -----------------------------------------------------------------------
-    interceptClicks();
-    sendData();
-
-    // Re-scan periodically (some pages load content lazily)
-    setInterval(sendData, 2000);
-
-    // Also watch for DOM changes
+    // Re-scrape on DOM changes
+    let scrapeTimer = null;
     const observer = new MutationObserver(() => {
-        clearTimeout(window._takeoutScrapeTimer);
-        window._takeoutScrapeTimer = setTimeout(sendData, 500);
+        if (scrapeTimer) clearTimeout(scrapeTimer);
+        scrapeTimer = setTimeout(sendScrape, 1000);
     });
     observer.observe(document.body, { childList: true, subtree: true });
 })();

@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -116,18 +117,50 @@ class DirectoryPicker(ModalScreen):
                 yield Button("\u2716 Cancel", id="picker-cancel", variant="error")
 
     def _set_cwd(self, path: Path) -> None:
-        try:
-            path = path.expanduser().resolve()
-        except (OSError, ValueError):
-            return
-        if not path.is_dir():
-            return
-        self._cwd = path
-        self.query_one("#picker-cwd", Label).update(str(path))
-        self.query_one("#picker-path-input", Input).value = str(path)
+        """Navigate to a directory.
+
+        Optimistic + threaded: the header/input update to the requested path
+        instantly, the tree is greyed with a loading overlay, and the slow
+        filesystem work (resolve / is_dir / listing) runs off the UI thread so
+        the picker never freezes on JuiceFS / encfs / network mounts.
+        """
+        target = str(path)
+        # Instant feedback — no stale header while the FS is being stat'd.
+        self.query_one("#picker-cwd", Label).update(f"\u23f3 {target}")
+        self.query_one("#picker-path-input", Input).value = target
         tree = self.query_one("#picker-tree", DirectoryTree)
-        tree.path = str(path)
+        tree.loading = True
+        self._load_dir(path)
+
+    @work(thread=True, exclusive=True, group="picker-load")
+    def _load_dir(self, path: Path) -> None:
+        """Resolve + validate a directory off the UI thread, then apply it."""
+        try:
+            resolved = path.expanduser().resolve()
+            ok = resolved.is_dir()
+        except (OSError, ValueError):
+            resolved, ok = None, False
+        self.app.call_from_thread(self._apply_dir, resolved, ok)
+
+    def _apply_dir(self, resolved: Optional[Path], ok: bool) -> None:
+        """Runs on the UI thread once _load_dir has validated the path."""
+        tree = self.query_one("#picker-tree", DirectoryTree)
+        cwd_label = self.query_one("#picker-cwd", Label)
+        if not ok or resolved is None:
+            # Revert the optimistic header to the last good directory.
+            cwd_label.update(f"\u26a0 Not a directory \u2014 staying in {self._cwd}")
+            self.query_one("#picker-path-input", Input).value = str(self._cwd)
+            tree.loading = False
+            self.app.bell()
+            return
+        self._cwd = resolved
+        cwd_label.update(str(resolved))
+        self.query_one("#picker-path-input", Input).value = str(resolved)
+        tree.path = str(resolved)
         tree.reload()
+        # The tree lists its own children in a background worker from here;
+        # drop the overlay so the user sees rows populate as they arrive.
+        tree.loading = False
 
     def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
         # Single click highlights; selecting a directory navigates into it.
@@ -372,6 +405,44 @@ class TakeoutTUI(App):
 
         self.update_stats_display()
 
+        # Focus the payload box so a right-click / Ctrl+Shift+V paste lands
+        # there immediately instead of being swallowed by a focused Button.
+        try:
+            self.query_one("#curl-input", TextArea).focus()
+        except Exception:
+            pass
+
+    def on_paste(self, event) -> None:
+        """App-level paste router.
+
+        Over SSH/tmux a right-click paste arrives as a bracketed-paste event,
+        but Textual only delivers it to the focused widget. If focus is on a
+        button or a settings Input, the payload would be lost (or dumped into
+        the wrong field). We catch paste app-wide and, unless the user is
+        clearly pasting into a small settings field, route it into the
+        payload box and focus it.
+        """
+        text = getattr(event, "text", "") or ""
+        if not text:
+            return
+        focused = self.focused
+        focused_id = getattr(focused, "id", None)
+        # Let pastes into the small settings fields behave normally.
+        if focused_id in ("output-input", "count-input", "parallel-input", "picker-path-input"):
+            return
+        try:
+            box = self.query_one("#curl-input", TextArea)
+        except Exception:
+            return
+        # If the payload box is already focused, let it handle the paste itself.
+        if focused is box:
+            return
+        # Otherwise capture it: replace box content and focus it.
+        box.load_text(text)
+        box.focus()
+        self.log_message(f"Pasted {len(text)} chars into the payload box")
+        event.stop()
+
     def _restore_settings(self) -> None:
         """Pre-fill the input fields from the persisted settings file."""
         s = load_settings()
@@ -438,14 +509,49 @@ class TakeoutTUI(App):
             )
 
     def _fire_alert(self) -> None:
-        """Ring the terminal bell and toggle the title to draw attention."""
+        """Draw attention: terminal bell + title flash + tmux window alert."""
         if not self.needs_refresh:
             return
-        # Audible: terminal bell
+        # Audible: terminal bell. Often silent through tmux/SSH (tmux eats BEL
+        # by default), but harmless — kept as a best-effort.
         self.bell()
-        # Visual: flash the title bar
+        # Visual: flash the title bar.
         self._title_flash_on = not self._title_flash_on
         self.title = "🔔 NEEDS FRESH CAPTURE" if self._title_flash_on else self._base_title
+        # tmux-native: rename the window + emit BEL through the raw PTY so
+        # tmux's monitor-bell/activity lights up the window in the status bar
+        # even when you're looking at a different window/pane. This is the
+        # alert most likely to actually reach you over Docker→tmux→SSH.
+        self._tmux_alert("🔔 TAKEOUT: needs cookie" if self._title_flash_on else "🔔 TAKEOUT")
+
+    @staticmethod
+    def _write_raw(seq: str) -> None:
+        """Write an escape sequence straight to the controlling terminal,
+        bypassing Textual's renderer. Best-effort; never raises."""
+        try:
+            with open("/dev/tty", "w") as tty:
+                tty.write(seq)
+                tty.flush()
+        except OSError:
+            try:
+                sys.__stdout__.write(seq)
+                sys.__stdout__.flush()
+            except Exception:
+                pass
+
+    def _tmux_alert(self, title: str) -> None:
+        """Rename the window (OSC 0) and ring BEL so tmux flags the window.
+
+        tmux with `monitor-bell on` (or `monitor-activity on`) marks the
+        window in the status line on BEL/activity — the practical way to get
+        noticed from another window. The OSC title also renames the tmux
+        window unless `allow-rename`/`automatic-rename` are off.
+        """
+        self._write_raw(f"\033]0;{title}\007")
+
+    def _tmux_alert_clear(self) -> None:
+        """Restore a calm window title once the alert is resolved."""
+        self._write_raw("\033]0;Takeout Downloader\007")
 
     def stop_refresh_alert(self) -> None:
         """Leave "needs refresh" mode and restore normal UI."""
@@ -454,6 +560,7 @@ class TakeoutTUI(App):
             self._refresh_timer.stop()
             self._refresh_timer = None
         self.title = self._base_title
+        self._tmux_alert_clear()
         try:
             self.query_one("#input-section").remove_class("needs-refresh")
         except Exception:

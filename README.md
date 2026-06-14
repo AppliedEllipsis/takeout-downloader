@@ -229,3 +229,21 @@ License](./LICENSE)**. Fork of
 originally by **Clive Watts**. For full attribution, the license history,
 and the safety audit performed before this fork went public, see
 **[`NOTICE.md`](./NOTICE.md)**.
+
+## Support This Project ❤️
+
+If you find this extension useful, then please support its continued development:
+
+### Crypto Donation
+
+If you'd prefer to donate directly via cryptocurrency, you can send Bitcoin to:
+
+```
+bc1q8nrdytlvms0a0zurp04xwfppflcxwgpyrzw5hn
+```
+
+Thank you for supporting free and open source software! 🙏
+
+### Co-vibe coded with AI
+
+Built with human creativity enhanced by artificial intelligence.

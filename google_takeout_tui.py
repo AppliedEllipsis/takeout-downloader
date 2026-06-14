@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
+import time
 from typing import Optional, Dict
 from dataclasses import dataclass
 
@@ -341,7 +342,9 @@ class TakeoutTUI(App):
         Binding("q", "quit", "Quit"),
         Binding("s", "start", "Start"),
         Binding("x", "stop", "Stop"),
-        Binding("c", "clear_log", "Clear Log"),
+        Binding("p", "pause", "Pause"),
+        Binding("c", "continue_dl", "Continue"),
+        Binding("k", "clear_log", "Clear Log"),
         Binding("b", "browse", "Browse dir"),
     ]
 
@@ -399,6 +402,8 @@ class TakeoutTUI(App):
 
                 with Horizontal(id="button-row"):
                     yield Button("▶ Start", id="start-btn", variant="success")
+                    yield Button("⏸ Pause", id="pause-btn", variant="warning", disabled=True)
+                    yield Button("▶ Resume", id="resume-btn", variant="warning", disabled=True)
                     yield Button("⏹ Stop", id="stop-btn", variant="error", disabled=True)
                     yield Button("🗑 Clear", id="clear-btn", variant="default")
 
@@ -434,7 +439,7 @@ class TakeoutTUI(App):
 
         self.log_message(f"Google Takeout Downloader v{VERSION}")
         self.log_message("Paste a JSON payload (extension → Copy as JSON) or a cURL command, then Start")
-        self.log_message("Keys: Q=quit, S=start, X=stop, C=clear, B=browse output dir")
+        self.log_message("Keys: Q=quit  S=start  P=pause  C=continue  X=stop  K=clear log  B=browse dir")
         if ARIA2C_AVAILABLE:
             self.log_message("aria2c detected — available for high-speed downloads")
         else:
@@ -545,6 +550,26 @@ class TakeoutTUI(App):
         log = self.query_one(Log)
         timestamp = datetime.now().strftime("%H:%M:%S")
         log.write_line(f"{timestamp} | {message}")
+        # Pin to bottom so the newest message is always visible. Without this,
+        # long logs scroll past new lines and the user thinks the TUI is silent.
+        try:
+            log.scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def _engine_log(self, message: str) -> None:
+        """Logger injected into TakeoutDownloader. The engine calls this from
+        worker threads, so marshal back onto the UI thread before touching the
+        Log widget. Falls back silently if the app isn't running yet."""
+        try:
+            self.call_from_thread(self.log_message, message)
+        except Exception:
+            # Called from the UI thread itself (e.g. set_curl during start),
+            # or the app is shutting down — write directly, best-effort.
+            try:
+                self.log_message(message)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------------
     # Refresh alert: bell + title flash while waiting for a fresh capture
@@ -694,6 +719,28 @@ class TakeoutTUI(App):
     def action_stop(self) -> None:
         self.stop_download()
 
+    def action_pause(self) -> None:
+        if not self.is_downloading or not self.downloader:
+            return
+        if self.downloader.should_pause:
+            # Already paused — treat 'p' as resume for ergonomics
+            self.action_continue_dl()
+            return
+        self.downloader.should_pause = True
+        self.log_message("⏸ Pause requested — current chunk will finish, then workers park", "warning")
+        self.query_one("#pause-btn", Button).disabled = True
+        self.query_one("#resume-btn", Button).disabled = False
+
+    def action_continue_dl(self) -> None:
+        if not self.is_downloading or not self.downloader:
+            return
+        if not self.downloader.should_pause:
+            return
+        self.downloader.should_pause = False
+        self.log_message("▶ Resume requested — workers will pick up from where they parked", "info")
+        self.query_one("#pause-btn", Button).disabled = False
+        self.query_one("#resume-btn", Button).disabled = True
+
     def action_clear_log(self) -> None:
         self.query_one(Log).clear()
 
@@ -702,6 +749,10 @@ class TakeoutTUI(App):
             self.start_download()
         elif event.button.id == "stop-btn":
             self.stop_download()
+        elif event.button.id == "pause-btn":
+            self.action_pause()
+        elif event.button.id == "resume-btn":
+            self.action_continue_dl()
         elif event.button.id == "clear-btn":
             self.action_clear_log()
         elif event.button.id == "browse-btn":
@@ -859,8 +910,10 @@ class TakeoutTUI(App):
         if self.needs_refresh:
             self.stop_refresh_alert()
 
-        # Create (or recreate) the downloader and feed it the payload via cURL bridge
-        self.downloader = TakeoutDownloader(output_dir, parallel)
+        # Create (or recreate) the downloader and feed it the payload via cURL
+        # bridge. Inject a thread-safe logger so the engine's messages reach
+        # the Log widget instead of print() (which Textual hijacks/crashes on).
+        self.downloader = TakeoutDownloader(output_dir, parallel, logger=self._engine_log)
         if not self.downloader.set_curl(payload.to_curl()):
             self.log_message("ERROR: Failed to load payload into downloader!", "error")
             return
@@ -884,6 +937,8 @@ class TakeoutTUI(App):
 
         self.query_one("#start-btn", Button).disabled = True
         self.query_one("#stop-btn", Button).disabled = False
+        self.query_one("#pause-btn", Button).disabled = False
+        self.query_one("#resume-btn", Button).disabled = True
 
         self.run_download(file_count, parallel)
 
@@ -895,6 +950,7 @@ class TakeoutTUI(App):
 
         self.downloader.file_count = file_count
         self.downloader.should_stop = False
+        self.downloader.should_pause = False
         self.downloader.auth_failed = False
 
         while not self.downloader.should_stop:
@@ -987,6 +1043,15 @@ class TakeoutTUI(App):
         if temp_path.exists():
             resume_from = temp_path.stat().st_size
 
+        # Emit start-of-file log so the user sees activity immediately
+        if resume_from > 0:
+            self.call_from_thread(
+                self.log_message,
+                f"↻ Resuming {filename} from {resume_from / (1024 * 1024):.1f}MB",
+            )
+        else:
+            self.call_from_thread(self.log_message, f"→ Starting {filename}")
+
         # Add to active downloads
         with self._lock:
             status = f"Resuming from {resume_from/(1024*1024):.1f}MB" if resume_from > 0 else "Connecting"
@@ -1030,6 +1095,11 @@ class TakeoutTUI(App):
                             if filename in self.active_downloads:
                                 self.active_downloads[filename].status = f"Rate limited, waiting {wait:.0f}s"
                         self.call_from_thread(self.update_downloads_table)
+                        self.call_from_thread(
+                            self.log_message,
+                            f"⏳ {filename} rate-limited ({response.status_code}), waiting {wait:.0f}s",
+                            "warning",
+                        )
                         time.sleep(wait)
                         continue
                     return False, "RATE_LIMITED"
@@ -1042,10 +1112,19 @@ class TakeoutTUI(App):
                         if head_resp.status_code == 200:
                             expected_size = int(head_resp.headers.get('content-length', 0))
                             if expected_size > 0 and resume_from >= expected_size:
+                                self.call_from_thread(
+                                    self.log_message,
+                                    f"✓ Resume offset >= total ({resume_from} >= {expected_size}) — already complete",
+                                )
                                 temp_path.rename(filepath)
                                 self.downloader.size_history.record_size(filename, resume_from)
                                 return True, "resumed-complete"
                     # File is not complete — restart from scratch
+                    self.call_from_thread(
+                        self.log_message,
+                        f"⚠ {filename} resume invalid, restarting from 0",
+                        "warning",
+                    )
                     temp_path.unlink(missing_ok=True)
                     resume_from = 0
                     with self._lock:
@@ -1064,10 +1143,19 @@ class TakeoutTUI(App):
 
                 if response.status_code == 206:
                     total_size = resume_from + content_length
+                    self.call_from_thread(
+                        self.log_message,
+                        f"✓ Server accepted resume: remaining {content_length/(1024*1024):.1f}MB of {total_size/(1024*1024):.1f}MB total",
+                    )
                 else:
                     total_size = content_length
                     if resume_from > 0:
                         # Server doesn't support resume, start fresh
+                        self.call_from_thread(
+                            self.log_message,
+                            f"⚠ Server doesn't support resume for {filename}, restarting",
+                            "warning",
+                        )
                         resume_from = 0
 
                 if total_size < 1000 and resume_from == 0:
@@ -1085,11 +1173,29 @@ class TakeoutTUI(App):
                 file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
                 downloaded = resume_from
                 last_update = datetime.now()
+                last_logged_pct = -10  # next milestone
+                last_logged_mb = 0
+                chunk_pause_check = 0
 
                 with open(temp_path, file_mode) as f:
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        # Honor stop and pause flags before doing any I/O.
                         if self.downloader.should_stop:
                             return False, "Stopped"
+                        if self.downloader.should_pause:
+                            self.call_from_thread(
+                                self.log_message,
+                                f"⏸ Paused at {downloaded/(1024*1024):.1f}MB ({filename})",
+                            )
+                            # Park the worker until pause is lifted or stop requested.
+                            while self.downloader.should_pause and not self.downloader.should_stop:
+                                time.sleep(0.5)
+                            if self.downloader.should_stop:
+                                return False, "Stopped"
+                            self.call_from_thread(
+                                self.log_message,
+                                f"▶ Resumed {filename} from {downloaded/(1024*1024):.1f}MB",
+                            )
 
                         if chunk:
                             # Check first chunk for ZIP magic (only on fresh downloads)
@@ -1101,7 +1207,7 @@ class TakeoutTUI(App):
                             downloaded += len(chunk)
                             self.stats.bytes_downloaded += len(chunk)
 
-                            # Update progress every 300ms
+                            # Throttled UI update every 300ms
                             now = datetime.now()
                             if (now - last_update).total_seconds() >= 0.3:
                                 with self._lock:
@@ -1111,6 +1217,24 @@ class TakeoutTUI(App):
                                 self.call_from_thread(self.update_stats_display)
                                 last_update = now
 
+                            # Verbose log milestones: every 10% or every ~25MB
+                            if total_size > 0:
+                                pct = int(downloaded * 100 / total_size)
+                                if pct >= last_logged_pct + 10:
+                                    self.call_from_thread(
+                                        self.log_message,
+                                        f"  {filename} {pct}% ({downloaded/(1024*1024):.0f}/{total_size/(1024*1024):.0f}MB)",
+                                    )
+                                    last_logged_pct = pct
+                            else:
+                                mb = downloaded // (25 * 1024 * 1024)
+                                if mb > last_logged_mb:
+                                    self.call_from_thread(
+                                        self.log_message,
+                                        f"  {filename} {downloaded/(1024*1024):.0f}MB",
+                                    )
+                                    last_logged_mb = mb
+
                 # Verify ZIP integrity before finalizing
                 with open(temp_path, 'rb') as f:
                     f.seek(max(0, downloaded - 1024))
@@ -1119,9 +1243,20 @@ class TakeoutTUI(App):
                         temp_path.unlink()
                         return False, "INTEGRITY_FAILED"
 
+                # Sanity check: written size matches Content-Length
+                if total_size > 0 and downloaded != total_size:
+                    self.call_from_thread(
+                        self.log_message,
+                        f"⚠ {filename} size mismatch: got {downloaded}, expected {total_size}",
+                        "warning",
+                    )
+
                 temp_path.rename(filepath)
                 self.downloader.size_history.record_size(filename, downloaded)
-
+                self.call_from_thread(
+                    self.log_message,
+                    f"✓ {filename} done ({downloaded/(1024*1024):.1f}MB)",
+                )
                 return True, ""
 
             except requests.exceptions.HTTPError as e:
@@ -1130,14 +1265,26 @@ class TakeoutTUI(App):
                 # Retry transient errors with jittered backoff
                 if attempt < MAX_RETRIES - 1:
                     import time
-                    time.sleep(compute_backoff(attempt))
+                    wait = compute_backoff(attempt)
+                    self.call_from_thread(
+                        self.log_message,
+                        f"⚠ {filename} HTTP error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s",
+                        "warning",
+                    )
+                    time.sleep(wait)
                     continue
                 return False, str(e)
             except requests.exceptions.RequestException as e:
                 # Retry transient network errors with jittered backoff
                 if attempt < MAX_RETRIES - 1:
                     import time
-                    time.sleep(compute_backoff(attempt))
+                    wait = compute_backoff(attempt)
+                    self.call_from_thread(
+                        self.log_message,
+                        f"⚠ {filename} network error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s",
+                        "warning",
+                    )
+                    time.sleep(wait)
                     continue
                 return False, str(e)
 
@@ -1165,6 +1312,8 @@ class TakeoutTUI(App):
             self.stop_refresh_alert()
         self.query_one("#start-btn", Button).disabled = False
         self.query_one("#stop-btn", Button).disabled = True
+        self.query_one("#pause-btn", Button).disabled = True
+        self.query_one("#resume-btn", Button).disabled = True
         self.active_downloads.clear()
         self.update_downloads_table()
 
@@ -1182,10 +1331,15 @@ class TakeoutTUI(App):
             self.log_message("Refresh cancelled.")
             self.query_one("#start-btn", Button).disabled = False
             self.query_one("#stop-btn", Button).disabled = True
+            self.query_one("#pause-btn", Button).disabled = True
+            self.query_one("#resume-btn", Button).disabled = True
             return
         if self.downloader:
             self.downloader.stop()
             self.log_message("Stopping...")
+            # Stop also clears pause so any parked worker exits.
+            self.query_one("#pause-btn", Button).disabled = True
+            self.query_one("#resume-btn", Button).disabled = True
 
 
 def main():

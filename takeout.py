@@ -405,7 +405,8 @@ class TakeoutDownloader:
     6. Retries transient errors with exponential backoff
     """
 
-    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR, parallel: int = DEFAULT_PARALLEL):
+    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR, parallel: int = DEFAULT_PARALLEL,
+                 logger: Optional[Callable[[str], None]] = None):
         self.output_dir = validate_output_dir(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.size_history = SizeHistory(str(self.output_dir))
@@ -416,36 +417,49 @@ class TakeoutDownloader:
         self.file_count = DEFAULT_FILE_COUNT
         self.parallel = min(max(1, parallel), MAX_PARALLEL)  # Clamp to 1-20
         self.should_stop = False
+        self.should_pause = False
         self.auth_failed = False  # Flag for parallel downloads
         self.stats = DownloadStats()
         self._lock = threading.Lock()  # For thread-safe stats updates
+        # Output sink. Defaults to print() for CLI use; the TUI injects a
+        # callback that routes into its Log widget. NEVER print() directly in
+        # methods the TUI calls — under Textual, print() is captured and can
+        # crash (UnicodeEncodeError on Windows) or be swallowed entirely.
+        self.logger: Callable[[str], None] = logger or print
+
+    def _log(self, message: str) -> None:
+        """Emit a message via the configured sink, never raising."""
+        try:
+            self.logger(message)
+        except Exception:
+            pass
 
     def set_curl(self, curl_text: str) -> bool:
         """Set cookie and URL from cURL command."""
         # Extract cookie
         self.cookie = extract_cookie_from_curl(curl_text)
         if not self.cookie:
-            print("✗ Could not extract cookie from cURL")
+            self._log("✗ Could not extract cookie from cURL")
             return False
 
         # Extract URL
         url = extract_url_from_curl(curl_text)
         if not url:
-            print("✗ Could not extract URL from cURL")
+            self._log("✗ Could not extract URL from cURL")
             return False
 
         # Parse URL parts
         base, file_num, ext, query = extract_url_parts(url)
         if not base:
-            print("✗ Could not parse URL pattern")
+            self._log("✗ Could not parse URL pattern")
             return False
 
         self.base_url = base
         self.extension = ext
         self.query_string = query
 
-        print(f"✓ Cookie: {len(self.cookie)} chars")
-        print(f"✓ URL pattern: {base}XXX{ext}")
+        self._log(f"✓ Cookie: {len(self.cookie)} chars")
+        self._log(f"✓ URL pattern: {base}XXX{ext}")
         return True
 
     def get_filename(self, num: int) -> str:
@@ -480,7 +494,7 @@ class TakeoutDownloader:
             if temp_path.exists():
                 partial_size = temp_path.stat().st_size
                 if partial_size > 0:
-                    print(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
+                    self._log(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
                     if first_missing is None:
                         first_missing = num
                     continue
@@ -497,7 +511,7 @@ class TakeoutDownloader:
 
             # Zero-sized = definitely bad
             if size == 0:
-                print(f"  Deleting zero-sized: {filepath.name}")
+                self._log(f"  Deleting zero-sized: {filepath.name}")
                 filepath.unlink()
                 if first_missing is None:
                     first_missing = num
@@ -506,7 +520,7 @@ class TakeoutDownloader:
             # Check against known size
             expected = self.size_history.get_expected_size(filepath.name)
             if expected and size < expected:
-                print(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
+                self._log(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
                 filepath.unlink()
                 if first_missing is None:
                     first_missing = num
@@ -566,7 +580,7 @@ class TakeoutDownloader:
         if temp_path.exists():
             resume_from = temp_path.stat().st_size
             if resume_from > 0:
-                print(f"  [{filepath.name}] Resuming from {resume_from/(1024*1024):.1f}MB")
+                self._log(f"  [{filepath.name}] Resuming from {resume_from/(1024*1024):.1f}MB")
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -604,7 +618,7 @@ class TakeoutDownloader:
                 if response.status_code in (429, 503):
                     if attempt < MAX_RETRIES - 1:
                         wait = _retry_after_seconds(response) or compute_backoff(attempt)
-                        print(f"  [{filepath.name}] Rate limited ({response.status_code}), waiting {wait:.1f}s...")
+                        self._log(f"  [{filepath.name}] Rate limited ({response.status_code}), waiting {wait:.1f}s...")
                         time.sleep(wait)
                         continue
                     return False, "RATE_LIMITED"
@@ -613,7 +627,7 @@ class TakeoutDownloader:
                 if response.status_code == 416:
                     # Try without range header - file might be complete
                     if resume_from > 0:
-                        print(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
+                        self._log(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
                         # Verify with a fresh request to get content-length
                         head_resp = requests.head(url, headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
                         if head_resp.status_code == 200:
@@ -648,7 +662,7 @@ class TakeoutDownloader:
                     total_size = content_length
                     # Fresh download - reset resume_from
                     if resume_from > 0:
-                        print(f"  [{filepath.name}] Server doesn't support resume, starting fresh")
+                        self._log(f"  [{filepath.name}] Server doesn't support resume, starting fresh")
                         resume_from = 0
 
                 if total_size < 1000 and resume_from == 0:
@@ -677,16 +691,16 @@ class TakeoutDownloader:
 
                             # Progress
                             pct = (downloaded / total_size * 100) if total_size else 0
-                            print(f"\r  [{filepath.name}] {downloaded/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB ({pct:.0f}%)", end='', flush=True)
+                            pass  # progress shown in TUI downloads table
 
-                print()  # Newline after progress
+                self._log()  # Newline after progress
 
                 # Verify ZIP integrity before renaming
                 if not self._verify_zip_integrity(temp_path):
                     temp_path.unlink(missing_ok=True)
                     if attempt < MAX_RETRIES - 1:
                         wait = compute_backoff(attempt)
-                        print(f"  [{filepath.name}] ZIP integrity check failed, retrying in {wait:.1f}s...")
+                        self._log(f"  [{filepath.name}] ZIP integrity check failed, retrying in {wait:.1f}s...")
                         time.sleep(wait)
                         resume_from = 0
                         continue
@@ -706,7 +720,7 @@ class TakeoutDownloader:
                 # Transient HTTP error — retry if attempts remain
                 if attempt < MAX_RETRIES - 1:
                     wait = compute_backoff(attempt)
-                    print(f"  [{filepath.name}] HTTP error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
+                    self._log(f"  [{filepath.name}] HTTP error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
                     time.sleep(wait)
                     continue
                 return False, f"HTTP error: {e}"
@@ -714,7 +728,7 @@ class TakeoutDownloader:
                 # Transient network error — retry if attempts remain
                 if attempt < MAX_RETRIES - 1:
                     wait = compute_backoff(attempt)
-                    print(f"  [{filepath.name}] Network error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
+                    self._log(f"  [{filepath.name}] Network error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
                     time.sleep(wait)
                     continue
                 return False, f"Network error: {e}"
@@ -744,24 +758,24 @@ class TakeoutDownloader:
             outer_attempts += 1
             if outer_attempts < MAX_RETRIES:
                 wait = compute_backoff(outer_attempts - 1)
-                print(f"  [{self.get_filename(num)}] Outer retry {outer_attempts}/{MAX_RETRIES} after error '{error}', waiting {wait:.1f}s...")
+                self._log(f"  [{self.get_filename(num)}] Outer retry {outer_attempts}/{MAX_RETRIES} after error '{error}', waiting {wait:.1f}s...")
                 time.sleep(wait)
 
         return False, error
 
     def prompt_new_curl(self) -> bool:
         """Prompt user for new cURL command. Returns True if successful."""
-        print("\n" + "=" * 60)
-        print("🔐 AUTHENTICATION NEEDED")
-        print("=" * 60)
-        print("\nTo get a new cURL command:")
-        print("1. Go to takeout.google.com in your browser")
-        print("2. Open DevTools (F12) -> Network tab")
-        print("3. Click any download link")
-        print("4. Right-click the request -> Copy -> Copy as cURL")
-        print("   (PowerShell format also supported)")
-        print("\nPaste the cURL command (or 'q' to quit):")
-        print("-" * 60)
+        self._log("\n" + "=" * 60)
+        self._log("🔐 AUTHENTICATION NEEDED")
+        self._log("=" * 60)
+        self._log("\nTo get a new cURL command:")
+        self._log("1. Go to takeout.google.com in your browser")
+        self._log("2. Open DevTools (F12) -> Network tab")
+        self._log("3. Click any download link")
+        self._log("4. Right-click the request -> Copy -> Copy as cURL")
+        self._log("   (PowerShell format also supported)")
+        self._log("\nPaste the cURL command (or 'q' to quit):")
+        self._log("-" * 60)
 
         try:
             lines = []
@@ -794,21 +808,21 @@ class TakeoutDownloader:
         self.should_stop = False
         self.auth_failed = False
 
-        print(f"\nGoogle Takeout Downloader v{VERSION}")
-        print(f"Output: {self.output_dir}")
-        print(f"Max files: {self.file_count}")
-        print(f"Parallel: {self.parallel}")
-        print("-" * 60)
+        self._log(f"\nGoogle Takeout Downloader v{VERSION}")
+        self._log(f"Output: {self.output_dir}")
+        self._log(f"Max files: {self.file_count}")
+        self._log(f"Parallel: {self.parallel}")
+        self._log("-" * 60)
 
         # Initial cURL if not set
         if not self.cookie or not self.base_url:
             if not self.prompt_new_curl():
-                print("No cURL provided, exiting.")
+                self._log("No cURL provided, exiting.")
                 return self.stats
 
         while not self.should_stop:
             # Clean up any bad files first
-            print(f"\nChecking for incomplete downloads...")
+            self._log(f"\nChecking for incomplete downloads...")
             first_needed = self.cleanup_bad_files()
 
             # Build list of files to download
@@ -822,10 +836,10 @@ class TakeoutDownloader:
                 to_download.append(num)
 
             if not to_download:
-                print("\nAll files downloaded!")
+                self._log("\nAll files downloaded!")
                 break
 
-            print(f"\nDownloading {len(to_download)} files starting from {to_download[0]}...")
+            self._log(f"\nDownloading {len(to_download)} files starting from {to_download[0]}...")
 
             # Reset auth flag
             self.auth_failed = False
@@ -841,26 +855,26 @@ class TakeoutDownloader:
                     success, error = self.download_file_with_retry(num)
 
                     if success:
-                        print(f"✓ {filepath.name}")
+                        self._log(f"✓ {filepath.name}")
                         with self._lock:
                             self.stats.completed_files += 1
                         consecutive_404 = 0
 
                     elif error == "AUTH_FAILED":
-                        print(f"\n✗ Auth failed on file {num}")
+                        self._log(f"\n✗ Auth failed on file {num}")
                         self.auth_failed = True
                         break
 
                     elif error == "NOT_FOUND":
                         consecutive_404 += 1
-                        print(f"✗ {filepath.name} not found (404)")
+                        self._log(f"✗ {filepath.name} not found (404)")
                         if consecutive_404 >= 3:
-                            print(f"\n3 consecutive 404s - assuming done")
+                            self._log(f"\n3 consecutive 404s - assuming done")
                             self.should_stop = True
                             break
 
                     else:
-                        print(f"✗ {filepath.name}: {error}")
+                        self._log(f"✗ {filepath.name}: {error}")
                         with self._lock:
                             self.stats.failed_files += 1
                         consecutive_404 = 0
@@ -884,32 +898,32 @@ class TakeoutDownloader:
                             success, error = future.result()
 
                             if success:
-                                print(f"✓ {filepath.name}")
+                                self._log(f"✓ {filepath.name}")
                                 with self._lock:
                                     self.stats.completed_files += 1
 
                             elif error == "AUTH_FAILED":
-                                print(f"\n✗ Auth failed on file {num}")
+                                self._log(f"\n✗ Auth failed on file {num}")
                                 self.auth_failed = True
 
                             elif error == "NOT_FOUND":
-                                print(f"✗ {filepath.name} not found (404)")
+                                self._log(f"✗ {filepath.name} not found (404)")
                                 # Don't track consecutive 404s in parallel mode
 
                             else:
-                                print(f"✗ {filepath.name}: {error}")
+                                self._log(f"✗ {filepath.name}: {error}")
                                 with self._lock:
                                     self.stats.failed_files += 1
 
                         except Exception as e:
-                            print(f"✗ {filepath.name}: {e}")
+                            self._log(f"✗ {filepath.name}: {e}")
                             with self._lock:
                                 self.stats.failed_files += 1
 
             # Handle auth failure - prompt for new cURL and retry
             if self.auth_failed:
                 if not self.prompt_new_curl():
-                    print("No new cURL provided, stopping.")
+                    self._log("No new cURL provided, stopping.")
                     break
                 # Loop will continue and retry remaining files
             else:
@@ -917,18 +931,19 @@ class TakeoutDownloader:
                 break
 
         # Summary
-        print("\n" + "=" * 60)
-        print(f"✅ Done!")
-        print(f"   Completed: {self.stats.completed_files}")
-        print(f"   Skipped:   {self.stats.skipped_files}")
-        print(f"   Failed:    {self.stats.failed_files}")
-        print("=" * 60)
+        self._log("\n" + "=" * 60)
+        self._log(f"✅ Done!")
+        self._log(f"   Completed: {self.stats.completed_files}")
+        self._log(f"   Skipped:   {self.stats.skipped_files}")
+        self._log(f"   Failed:    {self.stats.failed_files}")
+        self._log("=" * 60)
 
         return self.stats
 
     def stop(self):
-        """Stop downloading."""
+        """Stop downloading. Also releases any paused workers so they exit."""
         self.should_stop = True
+        self.should_pause = False
 
 
 # =============================================================================
@@ -970,8 +985,8 @@ def run_tui():
         app = TakeoutTUI()
         app.run()
     except ImportError as e:
-        print(f"TUI mode requires textual: {e}")
-        print("Install with: pip install textual rich requests")
+        self._log(f"TUI mode requires textual: {e}")
+        self._log("Install with: pip install textual rich requests")
         sys.exit(1)
 
 

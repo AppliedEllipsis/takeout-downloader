@@ -12,6 +12,22 @@ All notable changes to this project are documented here.
   mount. Replaced it with a manual, single-level `os.scandir` listing that
   runs off the UI thread and is capped at 1000 entries per directory, so
   the picker can no longer hang.
+- **Paste did not work over SSH → tmux → Docker.** The chain strips the
+  bracketed-paste markers (`ESC[200~ … ESC[201~`), so Textual never
+  receives a paste event — the same class of bug as Claude Code #30239.
+  Added a **file-based input fallback**: type a single `.` in the payload
+  box (or `@filename`) and the TUI reads the payload from `in.json` /
+  `payload.json` / `curl.txt` in the output dir or cwd. Bypasses the
+  terminal clipboard path entirely. The payload box is also focused on
+  launch and an app-level paste router still catches bracketed pastes when
+  they do arrive.
+
+### Changed
+
+- **Default parallel downloads 1 → 10** (`PARALLEL_DOWNLOADS` still
+  overrides).
+- **Default output dir** now prefers `/srv/storage/google-takeout`
+  when it exists, else `./downloads` (`OUTPUT_DIR` still overrides).
 
 ### Changed
 

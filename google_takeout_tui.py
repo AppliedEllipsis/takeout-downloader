@@ -376,7 +376,8 @@ class TakeoutTUI(App):
                 input_section.border_title = "1 · Payload"
                 yield Label(
                     "[bold]Paste payload — JSON from the extension's "
-                    "\"Copy as JSON\", or a cURL command:[/]"
+                    "\"Copy as JSON\", or a cURL command.[/]  "
+                    "[dim]Paste broken over SSH/tmux? Write it to in.json and type just a dot (.)[/]"
                 )
                 yield TextArea(id="curl-input")
 
@@ -439,6 +440,7 @@ class TakeoutTUI(App):
         else:
             self.log_message("Tip: Install aria2c for multi-connection downloads (apt install aria2)")
         self.log_message("Install the browser extension from helpers/ to capture payloads")
+        self.log_message("Paste broken over SSH/tmux? Write JSON to in.json and type a single '.' then Start")
 
         # Restore last-used settings (output dir, file count, parallel).
         self._restore_settings()
@@ -685,6 +687,61 @@ class TakeoutTUI(App):
 
         self.push_screen(DirectoryPicker(start), _on_picked)
 
+    # Where the file-based fallback looks for a payload, in order. The first
+    # readable, non-empty file wins.
+    PAYLOAD_FILENAMES = ("in.json", "payload.json", "curl.txt")
+
+    def _read_payload_file(self, text: str, output_dir: str) -> Optional[str]:
+        """Read a payload from a file (the no-paste fallback).
+
+        Triggered when the payload box is just "." or "@<path>". Pasting
+        through SSH -> tmux -> Docker frequently strips bracketed-paste
+        markers so a normal paste never reaches the app; writing the JSON to
+        a file and typing "." sidesteps the terminal entirely.
+
+        "."        -> search output_dir then cwd for in.json / payload.json /
+                      curl.txt and use the first one found.
+        "@<path>"  -> read exactly that file (absolute, or relative to cwd /
+                      output_dir).
+
+        Returns the file contents, or None (after logging) if nothing usable
+        was found.
+        """
+        candidates: list[Path] = []
+        if text.startswith("@"):
+            raw = text[1:].strip()
+            if not raw:
+                self.log_message("ERROR: '@' needs a filename, e.g. @in.json", "error")
+                return None
+            p = Path(raw).expanduser()
+            if p.is_absolute():
+                candidates.append(p)
+            else:
+                candidates.append(Path(output_dir) / p)
+                candidates.append(Path.cwd() / p)
+        else:  # "."
+            for name in self.PAYLOAD_FILENAMES:
+                candidates.append(Path(output_dir) / name)
+                candidates.append(Path.cwd() / name)
+
+        for cand in candidates:
+            try:
+                if cand.is_file():
+                    content = cand.read_text(encoding="utf-8", errors="replace").strip()
+                    if content:
+                        self.log_message(f"Loaded payload from {cand}")
+                        return content
+            except OSError:
+                continue
+
+        searched = ", ".join(str(c) for c in candidates[:4])
+        self.log_message(
+            f"ERROR: No payload file found. Write your JSON to one of "
+            f"{', '.join(self.PAYLOAD_FILENAMES)} (searched: {searched}…)",
+            "error",
+        )
+        return None
+
     def start_download(self) -> None:
         """Parse the pasted payload and start (or resume) downloading."""
         if self.is_downloading:
@@ -707,6 +764,17 @@ class TakeoutTUI(App):
         if not text:
             self.log_message("ERROR: Paste a JSON payload or cURL command first!", "error")
             return
+
+        # File-based input fallback. Pasting through SSH -> tmux -> Docker
+        # often loses the bracketed-paste markers, so a normal paste never
+        # reaches the app. As a bulletproof workaround, a payload box that
+        # contains just "." (or "@file") reads the payload from a file in the
+        # output dir (or cwd). Write your JSON to in.json and type a dot.
+        if text == "." or text.startswith("@"):
+            loaded = self._read_payload_file(text, output_dir)
+            if loaded is None:
+                return  # error already logged
+            text = loaded
 
         # Parse the payload (auto-detects JSON vs cURL)
         try:

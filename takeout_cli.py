@@ -356,12 +356,20 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
     # Extract archive ID from the download URL's `j=` parameter.
     archive_id = None
     authuser = "0"
+    rapt = None
+    user_id = None
     m = re.search(r"[?&]j=([a-f0-9-]+)", payload.url)
     if m:
         archive_id = m.group(1)
     m = re.search(r"[?&]authuser=(\d+)", payload.url)
     if m:
         authuser = m.group(1)
+    m = re.search(r"[?&]rapt=([^&]+)", payload.url)
+    if m:
+        rapt = m.group(1)
+    m = re.search(r"[?&]user=(\d+)", payload.url)
+    if m:
+        user_id = m.group(1)
     # Also check the cookie for authuser.
     cm = re.search(r"authuser=(\d+)", payload.cookie)
     if cm:
@@ -374,19 +382,28 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
     headers["Cookie"] = payload.cookie
     headers.setdefault("Accept", "text/html,application/xhtml+xml")
 
-    # The Takeout manage page loads archive data via an internal API.
-    # Try several known endpoint patterns. The cookie is valid across all
-    # of them since they're all takeout.google.com endpoints.
+    def _q(base: str, extras: dict) -> str:
+        parts = [base]
+        for k, v in extras.items():
+            if v is not None:
+                parts.append(f"{k}={v}")
+        return "&".join(parts)
+
+    common = {"archiveId": archive_id, "authuser": authuser}
+    if rapt:
+        common["rapt"] = rapt
+    if user_id:
+        common["user"] = user_id
+
     api_endpoints = [
-        # Internal Takeout API
-        f"https://takeout.google.com/_/TakeoutApiUi/data?"
-        f"archiveId={archive_id}&authuser={authuser}",
-        # Old API
-        f"https://takeout.google.com/api/v2/manage/archive?"
-        f"id={archive_id}&authuser={authuser}",
-        # List endpoint (returns all archives for the user)
-        f"https://takeout.google.com/api/v2/manage/archives?"
-        f"authuser={authuser}",
+        _q("https://takeout.google.com/_/TakeoutApiUi/data?", common),
+        _q(f"https://takeout.google.com/api/v2/manage/archive?id={archive_id}&authuser={authuser}",
+           {"rapt": rapt, "user": user_id}),
+        _q(f"https://takeout.google.com/api/v2/manage/archives?authuser={authuser}",
+           {"rapt": rapt, "user": user_id}),
+        _q(f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}?json=1", common),
+        _q(f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}?", common),
+        _q(f"https://takeout.google.com/settings/takeout/downloads?", common),
     ]
 
     for api_url in api_endpoints:
@@ -418,8 +435,10 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
                 debug(f"JSON parse failed: {e}")
 
     # Fall back to fetching the manage page HTML and scraping URLs.
-    page_url = (
-        f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}"
+    page_params = {"rapt": rapt, "user": user_id} if rapt or user_id else {}
+    page_url = _q(
+        f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}",
+        page_params
     )
     debug(f"Fetching manage page: {page_url}")
     try:

@@ -12,6 +12,7 @@ secrets.*
 cookies.*
 curl_*.txt
 auth_*.txt
+ssh_run.py
 
 # =============================================================================
 # Runtime / downloaded data — never belongs in source control

@@ -4,6 +4,7 @@
 
 const els = {
     statusBox: null,
+    errorBox: null,
     copyAllBtn: null,
     clearBtn: null,
     preview: null,
@@ -16,6 +17,18 @@ function $(id) { return document.getElementById(id); }
 function setStatus(text, cls) {
     els.statusBox.textContent = text;
     els.statusBox.className = 'status ' + (cls || 'dim');
+}
+
+function setError(text) {
+    // Sticky error display: doesn't auto-clear, only cleared by a new
+    // action or by the user dismissing it.
+    if (!text) {
+        els.errorBox.style.display = 'none';
+        document.getElementById('errorText').textContent = '';
+    } else {
+        document.getElementById('errorText').textContent = text;
+        els.errorBox.style.display = 'block';
+    }
 }
 
 function shortFilename(url) {
@@ -139,11 +152,18 @@ function refresh() {
 
 document.addEventListener('DOMContentLoaded', () => {
     els.statusBox = $('statusBox');
+    els.errorBox = $('errorBox');
     els.copyAllBtn = $('copyAllBtn');
     els.clearBtn = $('clearBtn');
     els.preview = $('preview');
     els.autoCopy = $('autoCopy');
     els.countPill = $('countPill');
+
+    // Dismiss button on the error box
+    const errorDismiss = document.getElementById('errorDismiss');
+    if (errorDismiss) {
+        errorDismiss.addEventListener('click', () => setError(null));
+    }
 
     refresh();
 
@@ -157,6 +177,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // The one and only copy button: fetches all exports then builds
     // a multi-payload with them.
     els.copyAllBtn.addEventListener('click', async () => {
+        setError(null);  // clear any previous error
         setStatus('Reading capture...', 'dim');
         const response = await chrome.runtime.sendMessage({ action: 'getCapture' });
         if (!response || !response.capture) {
@@ -175,13 +196,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!result || !result.ok) {
             const err = (result && result.error) || 'unknown';
             console.log('Takeout Downloader debug:', result && result.debug);
-            setStatus("✗ Could not fetch exports: " + err, 'err');
+            setStatus('Fetch failed: ' + err, 'err');
+            setError('Could not fetch exports from Takeout. ' +
+                     'Open the browser console (right-click popup > Inspect) for details. ' +
+                     'Try clicking a download on the Takeout page again to refresh the cookie.');
             return;
         }
 
         const urls = result.urls || [];
         if (urls.length === 0) {
-            setStatus('No URLs returned by Takeout API. See console for details.', 'warn');
+            setStatus('No URLs returned by Takeout API.', 'warn');
+            setError('Takeout returned 0 URLs. ' +
+                     'Open the browser console for details. ' +
+                     'The cookie may have expired — click a download again.');
             return;
         }
 
@@ -203,9 +230,11 @@ document.addEventListener('DOMContentLoaded', () => {
             JSON.stringify(payload, null, 2),
             `ALL exports (${exports.length})`
         );
+        setError(null);
     });
 
     els.clearBtn.addEventListener('click', () => {
+        setError(null);
         chrome.runtime.sendMessage({ action: 'clearCapture' }, () => {
             refresh();
         });

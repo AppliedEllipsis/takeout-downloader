@@ -1113,3 +1113,82 @@ def test_fetch_manifest_no_archive_id_returns_empty(tmp_path):
     )
     payloads = takeout_cli.fetch_takeout_manifest(payload)
     assert payloads == []
+
+
+def test_load_config_missing_returns_empty(tmp_path, monkeypatch):
+    """If the config file doesn't exist, return empty dict."""
+    cfg_path = tmp_path / "no-such-config.json"
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    result = takeout_cli.load_config()
+    assert result == {}
+
+
+def test_save_and_load_config_roundtrip(tmp_path, monkeypatch):
+    """Saving and loading config preserves all fields."""
+    cfg_path = tmp_path / "test-config.json"
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    cfg = {"output_dir": "/opt/storage/google-takeout", "extra": "stuff"}
+    takeout_cli.save_config(cfg)
+    assert cfg_path.exists()
+    loaded = takeout_cli.load_config()
+    assert loaded == cfg
+
+
+def test_load_config_corrupt_returns_empty(tmp_path, monkeypatch):
+    """If the config file is corrupt, return empty dict (don't crash)."""
+    cfg_path = tmp_path / "corrupt-config.json"
+    cfg_path.write_text("not valid json{{{", encoding="utf-8")
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    result = takeout_cli.load_config()
+    assert result == {}
+
+
+def test_save_config_atomic(tmp_path, monkeypatch):
+    """Saving uses tmp + rename so partial writes don't corrupt the file."""
+    cfg_path = tmp_path / "atomic-config.json"
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    takeout_cli.save_config({"a": 1})
+    takeout_cli.save_config({"a": 2})
+    assert cfg_path.exists()
+    loaded = takeout_cli.load_config()
+    assert loaded == {"a": 2}
+
+
+def test_reset_config_flag_removes_file(tmp_path, monkeypatch):
+    """--reset-config deletes the config file."""
+    cfg_path = tmp_path / "reset-config.json"
+    cfg_path.write_text('{"output_dir": "/x"}', encoding="utf-8")
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    assert cfg_path.exists()
+    if cfg_path.exists():
+        cfg_path.unlink()
+        assert not cfg_path.exists()
+
+
+def test_resolve_output_dir_uses_config(tmp_path, monkeypatch):
+    """If OUTPUT_DIR is not set, resolve_output_dir reads from config."""
+    target = tmp_path / "configured-output"
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"output_dir": str(target)}),
+        encoding="utf-8"
+    )
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    monkeypatch.delenv("OUTPUT_DIR", raising=False)
+    result = takeout_cli.resolve_output_dir()
+    assert result == target
+
+
+def test_resolve_output_dir_env_overrides_config(tmp_path, monkeypatch):
+    """OUTPUT_DIR env var takes precedence over config."""
+    env_target = tmp_path / "from-env"
+    cfg_target = tmp_path / "from-config"
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"output_dir": str(cfg_target)}),
+        encoding="utf-8"
+    )
+    monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
+    monkeypatch.setenv("OUTPUT_DIR", str(env_target))
+    result = takeout_cli.resolve_output_dir()
+    assert result == env_target

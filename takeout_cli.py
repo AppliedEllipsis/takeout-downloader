@@ -302,8 +302,39 @@ def _install_logger(log_path: Path, max_bytes: int, backup_count: int) -> None:
 # ===========================================================================
 # Output dir
 # ===========================================================================
+def _config_path() -> Path:
+    """Where we persist last-used options. ~/.takeout-cli.json"""
+    return Path(os.environ.get("TAKEOUT_CONFIG") or
+                (Path.home() / ".takeout-cli.json"))
+
+
+def load_config() -> dict:
+    """Read persisted config. Returns {} if missing/corrupt."""
+    p = _config_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    """Persist config atomically. Best-effort; never raises."""
+    p = _config_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as e:
+        debug(f"save_config failed: {e}")
+
+
 def resolve_output_dir() -> Path:
-    raw = os.environ.get("OUTPUT_DIR") or DEFAULT_OUTPUT_DIR
+    raw = (os.environ.get("OUTPUT_DIR")
+           or load_config().get("output_dir")
+           or DEFAULT_OUTPUT_DIR)
     try:
         d = validate_output_dir(raw)
     except ValueError as e:
@@ -1287,10 +1318,26 @@ def main() -> int:
     parser.add_argument("--fresh", "--no-resume", dest="fresh",
                         action="store_true",
                         help="ignore saved state, re-discover from scratch")
+    parser.add_argument("--reset-config", dest="reset_config",
+                        action="store_true",
+                        help="clear ~/.takeout-cli.json (forget last folder)")
     args = parser.parse_args()
+
+    if args.reset_config:
+        p = _config_path()
+        if p.exists():
+            p.unlink()
+            ok(f"Config cleared: {p}")
+        else:
+            info(f"No config file at {p}")
+        return 0
 
     if args.output_dir:
         os.environ["OUTPUT_DIR"] = args.output_dir
+        # Also persist it so subsequent runs default to the same folder.
+        cfg = load_config()
+        cfg["output_dir"] = str(Path(args.output_dir).expanduser().resolve())
+        save_config(cfg)
 
     output_dir = resolve_output_dir()
     log_path = Path(
@@ -1332,6 +1379,11 @@ def main() -> int:
                  f"(rotating at {max_bytes // 1024}KB, "
                  f"keeping {backup_count} backups)")
         output_dir = chosen_output_dir
+        # Persist the chosen folder so next run skips the prompt.
+        cfg = load_config()
+        cfg["output_dir"] = str(output_dir)
+        save_config(cfg)
+        debug(f"Saved output_dir to {_config_path()}")
 
     payload = parse_one_payload()
 

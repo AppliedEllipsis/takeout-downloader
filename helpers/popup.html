@@ -40,6 +40,10 @@
     <h2>📦 Takeout Downloader <span id="countPill" style="display:none" class="pill ok">0</span></h2>
 
     <div id="statusBox" class="status dim">No capture yet. Start a download on takeout.google.com to capture.</div>
+    <div id="errorBox" class="status err" style="display:none; margin-top:6px;">
+        <span id="errorText"></span>
+        <span id="errorDismiss" style="float:right; cursor:pointer; font-weight:bold;">✕</span>
+    </div>
 
     <div class="section">
         <button id="copyAllBtn" class="success" disabled>📋 Copy ALL exports</button>

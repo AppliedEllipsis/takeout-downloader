@@ -60,13 +60,14 @@
 
     <div class="help">
         1. Open <a href="https://takeout.google.com/settings/takeout/downloads" target="_blank">takeout.google.com</a><br>
-        2. Click any <strong>Download</strong> button<br>
-        3. Click the extension icon → <strong>Copy as JSON</strong><br>
-        4. Paste into the Takeout Downloader TUI (<code>Ctrl+Shift+V</code>)<br>
+        2. Click any <strong>Download</strong> button (just one — we capture the cookie)<br>
+        3. Click the extension icon → <strong>Copy ALL exports</strong> to copy a multi-payload with every archive on your account<br>
+        4. Paste into the Takeout Downloader CLI (<code>Ctrl+Shift+V</code>)<br>
         <br>
-        When the TUI needs a refreshed capture (cookies expire after a few
-        hundred MB), re-trigger a download on the Takeout page and copy a
-        new JSON — paste it into the TUI to resume.
+        <strong>Copy ALL</strong> uses your captured cookie to fetch the full
+        export list from Takeout's server, so you only need to click ONE
+        download button. When the CLI needs a refreshed cookie, just click
+        any download again and re-copy.
     </div>
 
     <script src="popup.js"></script>

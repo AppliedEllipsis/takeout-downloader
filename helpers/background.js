@@ -155,6 +155,60 @@ function extractFilename(url) {
 }
 
 // ---------------------------------------------------------------------------
+// URL extraction for the multi-export fetch
+// ---------------------------------------------------------------------------
+const TAKEOUT_URL_RE = /https:\/\/takeout-download\.usercontent\.google\.com\/download\/takeout-[^"'\s<>]+\.zip(?:\?[^"'\s<>]*)?/g;
+
+function extractUrlsFromHtml(html) {
+    if (!html) return [];
+    const matches = html.match(TAKEOUT_URL_RE) || [];
+    // Dedupe
+    return Array.from(new Set(matches));
+}
+
+function extractUrlsFromJson(data) {
+    if (!data) return [];
+    const urls = [];
+    const seen = new Set();
+
+    function walk(node) {
+        if (!node) return;
+        if (typeof node === 'string') {
+            const m = node.match(TAKEOUT_URL_RE);
+            if (m) {
+                for (const url of m) {
+                    if (!seen.has(url)) {
+                        seen.add(url);
+                        urls.push(url);
+                    }
+                }
+            }
+            return;
+        }
+        if (Array.isArray(node)) {
+            for (const item of node) walk(item);
+            return;
+        }
+        if (typeof node === 'object') {
+            // Check known fields first for performance
+            for (const field of ['downloadUrl', 'url', 'link', 'href', 'download_url']) {
+                if (typeof node[field] === 'string') {
+                    walk(node[field]);
+                }
+            }
+            // Then recurse
+            for (const key of Object.keys(node)) {
+                if (!['downloadUrl', 'url', 'link', 'href', 'download_url'].includes(key)) {
+                    walk(node[key]);
+                }
+            }
+        }
+    }
+    walk(data);
+    return urls;
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard helper for the popup
 // ---------------------------------------------------------------------------
 // Service workers can't directly write to the clipboard, but they CAN
@@ -221,6 +275,89 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ ok: true, count: (msg.exports || []).length });
         });
         return true;
+    }
+
+    if (msg.action === 'fetchAllExports') {
+        // The popup asked us to find ALL exports from the user's Takeout
+        // account, using the captured cookie. We:
+        //   1. Extract archiveId + authuser from the captured URL
+        //   2. Try the internal Takeout API endpoints
+        //   3. Fall back to fetching the manage page HTML and scraping it
+        const capture = msg.capture;
+        if (!capture || !capture.url) {
+            sendResponse({ ok: false, error: 'no capture' });
+            return true;
+        }
+
+        const url = capture.url;
+        let archiveId = null;
+        let authuser = '0';
+        const jMatch = url.match(/[?&]j=([a-f0-9-]+)/);
+        if (jMatch) archiveId = jMatch[1];
+        const auMatch = url.match(/[?&]authuser=(\d+)/);
+        if (auMatch) authuser = auMatch[1];
+        const cookieAu = (capture.cookie || '').match(/authuser=(\d+)/);
+        if (cookieAu) authuser = cookieAu[1];
+
+        if (!archiveId) {
+            sendResponse({ ok: false, error: 'no archive ID in capture URL' });
+            return true;
+        }
+
+        const cookieHeader = capture.cookie || '';
+        const userAgent = (capture.headers || {})['User-Agent']
+            || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36';
+
+        // Endpoints to try in order
+        const apiUrls = [
+            `https://takeout.google.com/_/TakeoutApiUi/data?archiveId=${archiveId}&authuser=${authuser}`,
+            `https://takeout.google.com/api/v2/manage/archive?id=${archiveId}&authuser=${authuser}`,
+            `https://takeout.google.com/api/v2/manage/archives?authuser=${authuser}`,
+            `https://takeout.google.com/u/${authuser}/manage/archive/${archiveId}?json=1`
+        ];
+
+        const fetchOpts = {
+            credentials: 'include',
+            headers: {
+                'Cookie': cookieHeader,
+                'User-Agent': userAgent,
+                'Accept': 'application/json,text/html'
+            },
+            redirect: 'follow'
+        };
+
+        (async () => {
+            for (const apiUrl of apiUrls) {
+                try {
+                    const resp = await fetch(apiUrl, fetchOpts);
+                    if (!resp.ok) continue;
+                    if (resp.url.includes('accounts.google.com')) {
+                        sendResponse({
+                            ok: false,
+                            error: 'cookie expired (signin redirect)'
+                        });
+                        return;
+                    }
+                    const ctype = resp.headers.get('content-type') || '';
+                    let urls = [];
+                    if (ctype.includes('json')) {
+                        const data = await resp.json();
+                        urls = extractUrlsFromJson(data);
+                    } else {
+                        const html = await resp.text();
+                        urls = extractUrlsFromHtml(html);
+                    }
+                    if (urls.length > 0) {
+                        sendResponse({ ok: true, urls, source: apiUrl });
+                        return;
+                    }
+                } catch (e) {
+                    // try next endpoint
+                }
+            }
+            sendResponse({ ok: false, error: 'no endpoints returned URLs' });
+        })();
+        return true;  // async
     }
 
     if (msg.action === 'clickIntercept') {

@@ -75,10 +75,9 @@ function renderCapture(data) {
         renderScrape(data.pageScrape);
     }
 
-    // Enable "Copy ALL" if we have a page scrape with exports
-    const hasScrape = data.pageScrape && data.pageScrape.exports &&
-                      data.pageScrape.exports.length > 0;
-    els.copyAllBtn.disabled = !hasScrape;
+    // Enable "Copy ALL" if we have a capture (the cookie lets us fetch
+    // the full export list from the Takeout API server-side).
+    els.copyAllBtn.disabled = !capture || !capture.cookie;
 
     if (!capture) {
         setStatus('No capture yet. Start a download on takeout.google.com to capture.', 'dim');
@@ -200,33 +199,53 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
             const capture = response.capture;
-            const scrape = response.pageScrape;
-            if (!scrape || !scrape.exports || scrape.exports.length === 0) {
-                setStatus('No exports detected on page. The extension could not scrape the list.', 'warn');
+            if (!capture.cookie) {
+                setStatus('No cookie in capture. Re-click a download first.', 'warn');
                 return;
             }
 
-            // Build a multi-export payload with all detected URLs
-            const exports = scrape.exports.filter(e => e.url);
-            if (exports.length === 0) {
-                setStatus('Detected exports but no URLs found. Click each download individually.', 'warn');
-                return;
-            }
+            setStatus('Fetching all exports from Takeout (using your cookie)...', 'dim');
 
-            const payload = {
-                schema: capture.schema || 1,
-                captured_at: new Date().toISOString(),
-                source: 'extension',
-                multi: true,
-                exports: exports.map(exp => ({
-                    url: exp.url,
-                    filename: exp.filename,
-                    size_hint: (scrape.sizes || {})[exp.filename]
-                })),
-                headers: capture.headers || {},
-                cookie: capture.cookie || ''
-            };
-            copyToClipboard(JSON.stringify(payload, null, 2), `ALL exports (${exports.length})`);
+            // Ask the background worker to fetch the Takeout manage page
+            // using the captured cookie. This works even when the content
+            // script couldn't scrape the DOM (e.g. JS-rendered URLs).
+            chrome.runtime.sendMessage(
+                { action: 'fetchAllExports', capture: capture },
+                (fetchResp) => {
+                    if (chrome.runtime.lastError) {
+                        setStatus('Extension error: ' + chrome.runtime.lastError.message, 'err');
+                        return;
+                    }
+                    if (!fetchResp || !fetchResp.ok) {
+                        const err = (fetchResp && fetchResp.error) || 'unknown';
+                        setStatus(`✗ Could not fetch exports: ${err}. Try re-capturing.`, 'err');
+                        return;
+                    }
+
+                    const urls = fetchResp.urls || [];
+                    if (urls.length === 0) {
+                        setStatus('No URLs found in Takeout response.', 'warn');
+                        return;
+                    }
+
+                    // Build a multi-export payload with all detected URLs
+                    const exports = urls.map(url => ({
+                        url: url,
+                        filename: shortFilename(url)
+                    }));
+
+                    const payload = {
+                        schema: capture.schema || 1,
+                        captured_at: new Date().toISOString(),
+                        source: 'extension',
+                        multi: true,
+                        exports: exports,
+                        headers: capture.headers || {},
+                        cookie: capture.cookie || ''
+                    };
+                    copyToClipboard(JSON.stringify(payload, null, 2), `ALL exports (${exports.length})`);
+                }
+            );
         });
     });
 

@@ -634,7 +634,8 @@ def _probe_part(session: requests.Session, url: str,
         resp.close()
 
 
-def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
+def discover_parts(payload: TakeoutPayload, output_dir: Path,
+                    max_parts: int | None = None) -> list[dict]:
     """Probe -001, -002, … until the set ends. Returns list of dicts:
     {num, url, filename, size, have}. Stops early on AuthError after part 1."""
     base, _, ext, query = extract_url_parts(payload.url)
@@ -651,8 +652,12 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
     session = requests.Session()
     base_filename = base.split("/")[-1]
 
-    info(f"Discovering parts (URL pattern: ...{base_filename}<NNN>{ext})")
-    for num in range(1, MAX_PARTS + 1):
+    loop_limit = max_parts if max_parts else MAX_PARTS
+    if max_parts:
+        info(f"Discovering {max_parts} part(s) (URL pattern: ...{base_filename}<NNN>{ext})")
+    else:
+        info(f"Discovering parts (URL pattern: ...{base_filename}<NNN>{ext})")
+    for num in range(1, loop_limit + 1):
         filename = f"{base_filename}{num:03d}{ext}"
         url = f"{base}{num:03d}{ext}"
         if query:
@@ -1091,10 +1096,34 @@ def main() -> int:
 
     # Discover (also validates auth). Re-prompt on auth failure.
     if not parts:
+        info("")
+        info(_c("1;36", "How many parts are in this export?"))
+        info(_c("36", "  (Check your Google Takeout page — it shows the part count."))
+        info(_c("36", "  Press Enter to auto-detect via probes, or type a number.)"))
+        while True:
+            try:
+                raw = input("  parts > ").strip()
+            except EOFError:
+                raw = ""
+            if not raw:
+                user_part_count = None
+                break
+            if raw.lower() in ("q", "quit", "exit"):
+                raise SystemExit(0)
+            try:
+                user_part_count = int(raw)
+                if user_part_count <= 0:
+                    err("  Part count must be a positive number.")
+                    continue
+                break
+            except ValueError:
+                err("  Please enter a number, or press Enter for auto-detect.")
+
         auth_failures = 0
         while True:
             try:
-                parts = discover_parts(payload, output_dir)
+                parts = discover_parts(payload, output_dir,
+                                        max_parts=user_part_count)
                 break
             except AuthError as e:
                 auth_failures += 1

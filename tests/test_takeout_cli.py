@@ -1039,3 +1039,21 @@ def test_probe_treats_unexpected_status_as_missing():
         result = takeout_cli._probe_part(takeout_cli.requests.Session(),
                                           "https://x/1.zip", {})
     assert result is None
+
+
+def test_discover_respects_max_parts_cap(tmp_path):
+    """If the user says there are 3 parts, only probe 3 times."""
+    payload = _fixture_payload()
+
+    def fake_get(self, url, **kw):
+        m = re.search(r"-(\d{3})\.zip", url)
+        n = int(m.group(1)) if m else 1
+        return _FakeResp(url, 206,
+                         {"content-range": f"bytes 0-0/{n * 1000}",
+                          "content-type": "application/octet-stream"})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path, max_parts=3)
+    assert len(parts) == 3
+    assert parts[0]["num"] == 1
+    assert parts[2]["num"] == 3

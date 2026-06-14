@@ -22,14 +22,8 @@ const FINAL_HOST_PATTERNS = [
     'takeout-download.usercontent.google.com',
     'storage.cloud.google.com'
 ];
-const PAGE_HOST_PATTERNS = [
-    'takeout.google.com'
-];
 
-const ALL_URL_PATTERNS = [
-    ...FINAL_HOST_PATTERNS.map(h => `https://${h}/*`),
-    ...PAGE_HOST_PATTERNS.map(h => `https://${h}/*`)
-];
+const ALL_URL_PATTERNS = FINAL_HOST_PATTERNS.map(h => `https://${h}/*`);
 
 const DEFAULTS = {
     hasCapture: false,
@@ -107,11 +101,14 @@ function buildCapture(details) {
         else if (name === 'origin') out['Origin'] = value;
     }
 
-    // Validate it's a takeout URL
+    // Validate it's a takeout download URL on the final redirect host.
+    // We intentionally do NOT capture takeout.google.com page requests here:
+    // the cookie/header set sent to the page before the 302 redirect is not
+    // the same as the one sent to takeout-download.usercontent.google.com,
+    // and capturing it causes "pre-redirect" failures.
     const lower = url.toLowerCase();
     const isFinal = FINAL_HOST_PATTERNS.some(p => lower.includes(p));
-    const isPage = PAGE_HOST_PATTERNS.some(p => lower.includes(p));
-    if (!isFinal && !isPage) return null;
+    if (!isFinal) return null;
 
     // Only GET requests carry takeout downloads; skip anything weird
     if (details.method && details.method.toUpperCase() !== 'GET') return null;
@@ -124,8 +121,7 @@ function buildCapture(details) {
         method: 'GET',
         headers: out,
         cookie: cookie,
-        // Tag pre-redirect captures so the popup can warn the user
-        pre_redirect: isPage && !isFinal
+        pre_redirect: false
     };
 }
 

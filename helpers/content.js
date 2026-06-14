@@ -49,7 +49,7 @@
         return urls;
     }
 
-    function findArchiveId() {
+    function findArchiveId(fallbackUrl) {
         // The archive ID is in the URL path: /manage/archive/{id}
         const m = location.pathname.match(/\/manage\/archive\/([a-f0-9-]+)/);
         if (m) return m[1];
@@ -57,13 +57,23 @@
         const html = document.documentElement.innerHTML;
         const jm = html.match(/[?&]j=([a-f0-9-]+)/);
         if (jm) return jm[1];
+        // Use the captured download URL passed from the popup as fallback
+        if (fallbackUrl) {
+            const fm = fallbackUrl.match(/[?&]j=([a-f0-9-]+)/);
+            if (fm) return fm[1];
+        }
         return null;
     }
 
-    function findAuthuser() {
+    function findAuthuser(fallbackUrl) {
         // From URL: /u/{N}/
         const m = location.pathname.match(/\/u\/(\d+)\//);
         if (m) return m[1];
+        // From the captured URL (authuser parameter)
+        if (fallbackUrl) {
+            const um = fallbackUrl.match(/[?&]authuser=(\d+)/);
+            if (um) return um[1];
+        }
         // From the cookie
         const cookies = document.cookie;
         const cm = cookies.match(/authuser=(\d+)/);
@@ -71,12 +81,12 @@
         return '0';
     }
 
-    async function fetchExportList() {
-        const archiveId = findArchiveId();
+    async function fetchExportList(capturedUrl) {
+        const archiveId = findArchiveId(capturedUrl);
         if (!archiveId) {
-            return { ok: false, error: 'no archive ID in URL' };
+            return { ok: false, error: 'no archive ID in URL or captured URL' };
         }
-        const authuser = findAuthuser();
+        const authuser = findAuthuser(capturedUrl);
 
         // Try the internal API endpoints the page itself uses.
         // We send same-origin requests with cookies automatically attached
@@ -178,7 +188,7 @@
     // Listen for messages from the popup
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.action === 'contentFetchExports') {
-            fetchExportList().then(sendResponse);
+            fetchExportList(msg.url).then(sendResponse);
             return true;  // async response
         }
         if (msg.action === 'contentScrape') {

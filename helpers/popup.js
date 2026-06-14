@@ -67,13 +67,7 @@ function renderCapture(data) {
 
     els.clearBtn.disabled = false;
 
-    if (capture.pre_redirect) {
-        setStatus(
-            `⚠ Pre-redirect capture: ${filename} (${age}). ` +
-            `Re-capture from a request to takeout-download.usercontent.google.com.`,
-            'warn'
-        );
-    } else if (!capture.cookie) {
+    if (!capture.cookie) {
         setStatus('✗ No cookie captured. Try clicking the download again.', 'err');
     } else if (cookieChars < 100) {
         setStatus(
@@ -134,7 +128,7 @@ async function fetchAllExportsFromContentScript(capture) {
         return { ok: false, error: 'open the Takeout manage page first' };
     }
     try {
-        return await chrome.tabs.sendMessage(tab.id, { action: 'contentFetchExports' });
+        return await chrome.tabs.sendMessage(tab.id, { action: 'contentFetchExports', url: capture.url });
     } catch (e) {
         return { ok: false, error: 'content script unreachable: ' + e.message };
     }

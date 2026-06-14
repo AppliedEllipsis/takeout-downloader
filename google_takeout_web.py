@@ -13,6 +13,13 @@ import threading
 import time
 from functools import wraps
 from pathlib import Path
+
+# Load .env file if present (for standalone use; Docker uses environment vars directly)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, rely on OS environment
 from datetime import datetime
 from typing import Optional
 
@@ -104,7 +111,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', generate_secret_key())
 socketio = SocketIO(app, cors_allowed_origins=CORS_ORIGINS, async_mode='threading')
 
 # Default settings
-DEFAULT_OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/downloads')
+DEFAULT_OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/opt/takeout')
 DEFAULT_PARALLEL = int(os.environ.get('PARALLEL_DOWNLOADS', '6'))
 DEFAULT_FILE_COUNT = int(os.environ.get('FILE_COUNT', '100'))
 
@@ -182,7 +189,7 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
     temp_path = output_path.with_suffix('.downloading')
 
     # Retry loop instead of recursion for 416 handling
-    for _attempt in range(3):
+    for _attempt in range(MAX_RETRIES):
         resume_from = 0
 
         # Check for existing partial download to resume
@@ -1751,10 +1758,10 @@ def main():
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
-    # WARNING: For production use, deploy with gunicorn + gevent instead of
-    # the development server. The built-in werkzeug server is not suitable
-    # for production workloads.
-    socketio.run(app, host=args.host, port=args.port, debug=args.debug)
+    # The development werkzeug server requires allow_unsafe_werkzeug=True.
+    # For production, use gunicorn with gevent/eventlet workers instead.
+    # Docker container uses the development server for simplicity.
+    socketio.run(app, host=args.host, port=args.port, debug=args.debug, allow_unsafe_werkzeug=True)
 
 
 if __name__ == '__main__':

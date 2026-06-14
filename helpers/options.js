@@ -6,7 +6,7 @@ chrome.storage.local.get([
     document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:5000';
     document.getElementById('authUser').value = data.authUser || '';
     document.getElementById('authPass').value = data.authPass || '';
-    document.getElementById('outputDir').value = data.outputDir || '/downloads';
+    document.getElementById('outputDir').value = data.outputDir || '/opt/takeout';
     document.getElementById('parallel').value = data.parallel || 6;
     document.getElementById('fileCount').value = data.fileCount || 100;
 });

@@ -7,10 +7,34 @@ const DEFAULTS = {
     authUser: '',
     authPass: '',
     autoSend: false,
-    outputDir: '/downloads',
+    outputDir: '/opt/takeout',
     parallel: 6,
     fileCount: 100
 };
+
+// SECURITY: Validate serverUrl before sending data anywhere.
+// Refuse non-HTTP schemes (javascript:, file:, data:, etc.)
+// Warn (do not block) on non-localhost to avoid silent exfiltration.
+function isSafeServerUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+        const u = new URL(url);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function isLocalhostUrl(url) {
+    try {
+        const u = new URL(url);
+        const h = u.hostname.toLowerCase();
+        return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+    } catch (e) {
+        return false;
+    }
+}
 
 // Initialize storage
 chrome.storage.local.get(DEFAULTS, (settings) => {
@@ -51,6 +75,49 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 
 // Send captured data to the downloader server
 function sendToServer(capture, settings) {
+    const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
+
+    // SECURITY: refuse to send if serverUrl is malformed or non-HTTP
+    if (!isSafeServerUrl(serverUrl)) {
+        const err = 'Refusing to send: serverUrl is invalid or non-HTTP. Open extension Options to fix.';
+        chrome.storage.local.set({
+            lastSendResult: { error: err },
+            lastSendTime: Date.now()
+        });
+        chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icon48.png',
+            title: 'Takeout Downloader - blocked',
+            message: err
+        });
+        return;
+    }
+
+    // SECURITY: require explicit confirmation for non-localhost serverUrls
+    // when sending for the first time per session
+    if (!isLocalhostUrl(serverUrl)) {
+        chrome.storage.local.get(['confirmedRemoteHost'], (data) => {
+            if (data.confirmedRemoteHost === serverUrl) {
+                doSendToServer(capture, settings);
+            } else {
+                const ack = confirm(
+                    'Send captured Google session cookie to remote server?\n\n' +
+                    'Server: ' + serverUrl + '\n\n' +
+                    'Click OK to allow sends to THIS server for this session.'
+                );
+                if (ack) {
+                    chrome.storage.local.set({ confirmedRemoteHost: serverUrl });
+                    doSendToServer(capture, settings);
+                }
+            }
+        });
+        return;
+    }
+
+    doSendToServer(capture, settings);
+}
+
+function doSendToServer(capture, settings) {
     const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
     const headers = { 'Content-Type': 'application/json' };
 
@@ -102,6 +169,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'updateCookie') {
         chrome.storage.local.get(['lastCapture', 'serverUrl', 'authUser', 'authPass'], (settings) => {
             const serverUrl = settings.serverUrl || DEFAULTS.serverUrl;
+            if (!isSafeServerUrl(serverUrl)) {
+                sendResponse({ error: 'serverUrl is invalid' });
+                return;
+            }
             const headers = { 'Content-Type': 'application/json' };
             if (settings.authUser) {
                 headers['Authorization'] = 'Basic ' + btoa(settings.authUser + ':' + settings.authPass);

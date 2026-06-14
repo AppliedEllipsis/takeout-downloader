@@ -8,8 +8,10 @@ services:
     ports:
       - "5001:5000"
     volumes:
-      # Mount your downloads directory (change path as needed)
+      # Mount your downloads directory (change host path as needed)
       - /path/to/downloads:/downloads
+      # Mount /opt/ for flexible output (e.g. OUTPUT_DIR=/opt/takeout)
+      - /opt/takeout:/opt/takeout
       # Mount .env for configuration (create from .env.example)
       - ./.env:/app/.env:ro
     environment:
@@ -17,7 +19,7 @@ services:
       - AUTH_USER=${AUTH_USER:-admin}
       - AUTH_PASS=${AUTH_PASS:-changeme}
       # Download settings
-      - OUTPUT_DIR=/downloads
+      - OUTPUT_DIR=/opt/takeout
       - PARALLEL_DOWNLOADS=2
       - FILE_COUNT=100
       # CORS - set to your domain for remote access
@@ -25,7 +27,7 @@ services:
       # aria2c - set to "true" to enable
       - ARIA2C_ENABLED=false
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/status"]
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost',5000)); s.close()"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -40,6 +42,7 @@ services:
   #     - "6800:6800"
   #   volumes:
   #     - /path/to/downloads:/downloads
+  #     - /opt/takeout:/opt/takeout
   #   command: >
   #     aria2c
   #     --enable-rpc

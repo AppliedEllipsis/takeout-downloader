@@ -10,7 +10,7 @@
 // @grant        GM_notification
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @connect      *
+// @connect      localhost
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -21,17 +21,24 @@
     // CONFIGURATION - Edit these or set via the script settings panel
     // =========================================================================
     const DEFAULT_SERVER = 'http://localhost:5000';
-    const DEFAULT_AUTH_USER = 'admin';
-    const DEFAULT_AUTH_PASS = 'changeme';
+
+    // SECURITY: validate serverUrl before sending
+    function isSafeServerUrl(url) {
+        if (!url || typeof url !== 'string') return false;
+        try {
+            const u = new URL(url);
+            return u.protocol === 'http:' || u.protocol === 'https:';
+        } catch (e) { return false; }
+    }
 
     function getServerUrl() {
         return GM_getValue('serverUrl', DEFAULT_SERVER);
     }
     function getAuthUser() {
-        return GM_getValue('authUser', DEFAULT_AUTH_USER);
+        return GM_getValue('authUser', '');
     }
     function getAuthPass() {
-        return GM_getValue('authPass', DEFAULT_AUTH_PASS);
+        return GM_getValue('authPass', '');
     }
 
     // =========================================================================
@@ -203,9 +210,22 @@
         }
 
         const serverUrl = getServerUrl();
+
+        // SECURITY: refuse invalid or non-HTTP URLs
+        if (!isSafeServerUrl(serverUrl)) {
+            GM_notification({
+                title: 'Takeout Helper - blocked',
+                text: 'serverUrl is invalid. Open userscript settings to fix.'
+            });
+            return;
+        }
+
         const authUser = getAuthUser();
         const authPass = getAuthPass();
-        const credentials = btoa(`${authUser}:${authPass}`);
+        const headers = { 'Content-Type': 'application/json' };
+        if (authUser) {
+            headers['Authorization'] = 'Basic ' + btoa(`${authUser}:${authPass}`);
+        }
 
         // Build a synthetic cURL command from captured data
         const curlText = `curl '${lastCurlData.url}' -H 'Cookie: ${lastCurlData.cookie}'`;
@@ -219,14 +239,11 @@
         GM_xmlhttpRequest({
             method: 'POST',
             url: `${serverUrl}/api/start`,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Basic ${credentials}`
-            },
+            headers: headers,
             data: JSON.stringify({
                 curl_input: curlText,
                 url: lastCurlData.url,
-                output_dir: '/downloads',
+                output_dir: '/opt/takeout',
                 parallel: 6,
                 file_count: 100
             }),

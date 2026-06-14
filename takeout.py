@@ -33,6 +33,13 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Load .env file if present (for standalone use; Docker uses environment vars directly)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import requests
 
 # =============================================================================
@@ -172,10 +179,14 @@ def extract_url_parts(url: str) -> Tuple[Optional[str], Optional[int], Optional[
     #          file_num = 003
     match = re.search(r'(.*takeout-\d{8}T\d{6}Z-\d+-)(\d{3})(\.\w+)$', url_path)
     if not match:
-        # Try alternate pattern without timestamp
-        match = re.search(r'(.*takeout-[^-]+-\d+-)(\d{3})(\.\w+)$', url_path)
+        # Try pattern with timestamp but no batch number: takeout-TIMESTAMP-FILENUM.zip
+        # Example: takeout-20260613T071725Z-001.zip
+        match = re.search(r'(.*takeout-\d{8}T\d{6}Z-)(\d{3})(\.\w+)$', url_path)
         if not match:
-            return None, None, None, ''
+            # Try alternate pattern without timestamp
+            match = re.search(r'(.*takeout-[^-]+-\d+-)(\d{3})(\.\w+)$', url_path)
+            if not match:
+                return None, None, None, ''
 
     base = match.group(1)
     file_num = int(match.group(2))

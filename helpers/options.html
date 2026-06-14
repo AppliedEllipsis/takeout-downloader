@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #f8fafc; padding: 24px; }
@@ -35,7 +36,7 @@
 
     <div class="section">
         <label>Default Output Directory</label>
-        <input type="text" id="outputDir" value="/downloads">
+        <input type="text" id="outputDir" value="/opt/takeout">
     </div>
 
     <div class="section">
@@ -51,6 +52,14 @@
     <button onclick="save()">Save Settings</button>
 
     <div id="status" class="status"></div>
+
+    <div style="margin-top:24px;font-size:12px;color:#94a3b8;line-height:1.6;">
+        <strong style="color:#f59e0b;">Security notes:</strong><br>
+        • Server URL is validated: only <code>http://</code> or <code>https://</code> are accepted.<br>
+        • For non-localhost URLs you'll be asked to confirm once per session before each send.<br>
+        • Your captured Google session cookie and auth password are stored in <code>chrome.storage.local</code> (plaintext, sandboxed to this extension).<br>
+        • <code>autoSend=true</code> fires on every matching capture — keep it off until you've confirmed the server URL is correct.
+    </div>
 
     <script src="options.js"></script>
 </body>

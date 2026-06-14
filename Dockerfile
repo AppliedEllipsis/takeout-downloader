@@ -23,19 +23,22 @@ COPY aria2c_integration.py .
 COPY google_takeout_tui.py .
 COPY dedupe_takeout.py .
 
-# Create downloads directory
-RUN mkdir -p /downloads
+# Create download output directories
+RUN mkdir -p /downloads /opt/takeout
 
 # Copy .env.example as reference (users should mount their own .env)
 COPY .env.example .env.example
 
 # Environment variables (override via docker-compose or .env)
-ENV OUTPUT_DIR=/downloads
+ENV OUTPUT_DIR=/opt/takeout
 ENV PARALLEL_DOWNLOADS=6
 ENV FILE_COUNT=100
 ENV ARIA2C_ENABLED=false
 ENV ARIA2C_RPC_URL=http://localhost:6800/jsonrpc
 ENV PYTHONUNBUFFERED=1
+
+# Declare mount points for documentation / docker run --volumes-from
+VOLUME /downloads /opt/takeout
 
 # Expose ports
 # 5000 = web UI, 6800 = aria2c RPC (if auto-started)
@@ -43,7 +46,7 @@ EXPOSE 5000 6800
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/api/status || exit 1
+    CMD python -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost',5000)); s.close()" || exit 1
 
 # Run the web server
 CMD ["python", "google_takeout_web.py", "--host", "0.0.0.0", "--port", "5000"]

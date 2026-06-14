@@ -9,10 +9,15 @@ chrome.storage.local.get([
     document.getElementById('serverUrl').value = data.serverUrl || 'http://localhost:5000';
     document.getElementById('authUser').value = data.authUser || '';
     document.getElementById('authPass').value = data.authPass || '';
-    document.getElementById('outputDir').value = data.outputDir || '/downloads';
+    document.getElementById('outputDir').value = data.outputDir || '/opt/takeout';
     document.getElementById('parallel').value = data.parallel || 6;
     document.getElementById('fileCount').value = data.fileCount || 100;
     document.getElementById('autoSend').checked = data.autoSend || false;
+
+    // Show AUTO badge when auto-send is on (visual reminder of the silent-exfil risk)
+    updateAutoBadge(data.autoSend);
+
+    // Update badge whenever the toggle changes
 
     if (data.hasCapture && data.lastCapture) {
         const age = Math.round((Date.now() - data.lastCapture.timestamp) / 1000);
@@ -50,8 +55,15 @@ chrome.storage.local.get([
 });
 
 document.getElementById('autoSend').addEventListener('change', () => {
-    chrome.storage.local.set({ autoSend: document.getElementById('autoSend').checked });
+    const checked = document.getElementById('autoSend').checked;
+    chrome.storage.local.set({ autoSend: checked });
+    updateAutoBadge(checked);
 });
+
+function updateAutoBadge(isOn) {
+    const badge = document.getElementById('autoBadge');
+    if (badge) badge.style.display = isOn ? 'inline' : 'none';
+}
 
 // Send capture to server
 function sendCapture() {

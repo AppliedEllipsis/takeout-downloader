@@ -63,6 +63,10 @@ services:
       # `--rm`. (Engine reads TAKEOUT_SETTINGS; default would be $HOME, which
       # is ephemeral in a container.)
       TAKEOUT_SETTINGS: /downloads/.takeout_settings.json
+      # Mirror every log line to a file on the host's downloads volume so you
+      # can `tail -f downloads/takeout.log` from a second SSH session even if
+      # the TUI itself is frozen or hidden. Override with TAKEOUT_LOG_FILE.
+      TAKEOUT_LOG_FILE: /downloads/takeout.log
       # /opt is an allowed output root by default, but list it explicitly in
       # case you point OUTPUT_DIR at a deep JuiceFS path.
       ALLOWED_DIRS: /opt:/downloads

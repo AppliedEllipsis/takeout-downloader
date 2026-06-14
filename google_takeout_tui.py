@@ -453,6 +453,17 @@ class TakeoutTUI(App):
         self.log_message("Install the browser extension from helpers/ to capture payloads")
         self.log_message("Paste broken over SSH/tmux? Write JSON to in.json and type a single '.' then Start")
 
+        # Startup diagnostics so the user can see exactly what's resolved and
+        # where the TUI is looking for files. Visible in the on-screen log AND
+        # mirrored to the log file (TAKEOUT_LOG_FILE, default ./takeout.log)
+        # which can be `tail -f`'d from another SSH session.
+        log_file = os.environ.get("TAKEOUT_LOG_FILE", "./takeout.log")
+        self.log_message(f"Log file: {os.path.abspath(log_file)}")
+        self.log_message(f"CWD: {os.getcwd()}")
+        self.log_message(f"Default output dir: {DEFAULT_OUTPUT_DIR}")
+        self.log_message(f"Payload search roots: output_dir, cwd, /downloads, /downloads/drop, /drop, $HOME")
+        self.log_message(f"Payload filenames: {', '.join(self.PAYLOAD_FILENAMES)}")
+
         # Restore last-used settings (output dir, file count, parallel).
         self._restore_settings()
 
@@ -583,14 +594,29 @@ class TakeoutTUI(App):
         })
 
     def log_message(self, message: str, level: str = "info"):
-        """Add a message to the log."""
+        """Add a message to the log widget AND mirror it to a file.
+
+        The on-screen Log widget can scroll past new lines or be hidden when
+        the user resizes panes, so every message also goes to a plain-text
+        file (default: ./takeout.log, override with TAKEOUT_LOG_FILE). The
+        user can `tail -f takeout.log` from a second SSH session to watch
+        progress even if the TUI itself is unfocused or stuck.
+        """
         log = self.query_one(Log)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log.write_line(f"{timestamp} | {message}")
+        line = f"{timestamp} | {message}"
+        log.write_line(line)
         # Pin to bottom so the newest message is always visible. Without this,
         # long logs scroll past new lines and the user thinks the TUI is silent.
         try:
             log.scroll_end(animate=False)
+        except Exception:
+            pass
+        # Mirror to file (best-effort — never raise from a log call).
+        try:
+            log_path = os.environ.get("TAKEOUT_LOG_FILE", "./takeout.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
         except Exception:
             pass
 
@@ -970,22 +996,22 @@ class TakeoutTUI(App):
 
     def start_download(self) -> None:
         """Parse the pasted payload and start (or resume) downloading."""
-        # Always confirm the button/keypress registered — "no feedback" is
-        # worse than an error message.
+        # Loud diagnostic block so we can always tell from the log file what
+        # state the TUI was in when Start was pressed. Without this, "nothing
+        # happens" is impossible to debug.
+        self.log_message("=" * 60)
         self.log_message("Start pressed…")
-        if self.is_downloading:
-            self.log_message("Already downloading — press Stop (x) first.", "warning")
-            return
-
+        self.log_message(f"  is_downloading = {self.is_downloading}")
         text = self.query_one("#curl-input", TextArea).text.strip()
+        self.log_message(f"  payload box   = {len(text)} chars, first 80: {text[:80]!r}")
         output_dir = self.query_one("#output-input", Input).value.strip() or DEFAULT_OUTPUT_DIR
-
+        self.log_message(f"  output_dir    = {output_dir}")
         try:
             file_count = int(self.query_one("#count-input", Input).value.strip() or DEFAULT_FILE_COUNT)
             file_count = min(max(1, file_count), MAX_FILE_COUNT)
         except ValueError:
             file_count = DEFAULT_FILE_COUNT
-
+        self.log_message(f"  file_count    = {file_count}")
         try:
             parallel = min(max(1, int(self.query_one("#parallel-input", Input).value.strip() or DEFAULT_PARALLEL)), MAX_PARALLEL)
         except ValueError:

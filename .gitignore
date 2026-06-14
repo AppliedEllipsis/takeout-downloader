@@ -106,3 +106,7 @@ desktop.ini
 # Payload drop box (host-written in.json etc.)
 drop/*
 !drop/.gitkeep
+
+# TUI runtime logs (TAKEOUT_LOG_FILE)
+takeout.log
+downloads/*.log

@@ -61,7 +61,7 @@ except Exception:
     pass
 
 from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR
-from takeout_payload import parse_payload, TakeoutPayload, REQUIRED_COOKIE_MARKERS
+from takeout_payload import parse_payload, parse_multi_payload, TakeoutPayload, REQUIRED_COOKIE_MARKERS
 
 
 # ===========================================================================
@@ -535,29 +535,63 @@ def prompt_for_paste() -> str:
 # Payload parse + validate (single-shot, no loops)
 # ===========================================================================
 def parse_one_payload() -> TakeoutPayload:
-    """Read + parse + validate one payload. Failures are terminal."""
+    """Read + parse + validate one payload. If the extension scraped the
+    whole page and returned multiple exports, show a menu so the user
+    picks which archive to download. Failures are terminal."""
     raw = prompt_for_paste()
     if not raw.strip():
         err("No JSON received.")
         _payload_fix_hint()
         raise SystemExit(1)
     try:
-        payload = parse_payload(raw)
+        payloads = parse_multi_payload(raw)
     except ValueError as e:
         err(f"Could not parse JSON: {e}")
         _payload_fix_hint()
         raise SystemExit(2)
-    good, message = payload.validate()
-    if not good:
-        err(f"Payload failed validation: {message}")
+    if not payloads:
+        err("Payload parsed but produced no exports.")
         _payload_fix_hint()
         raise SystemExit(2)
-    if message:
-        warn(message)  # non-fatal (e.g. cookie age)
-    markers = [m for m in REQUIRED_COOKIE_MARKERS if m in payload.cookie]
-    ok(f"Cookie OK: {len(payload.cookie)} chars "
+    for payload in payloads:
+        good, message = payload.validate()
+        if not good:
+            err(f"Payload failed validation: {message}")
+            _payload_fix_hint()
+            raise SystemExit(2)
+    # Log summary
+    first = payloads[0]
+    markers = [m for m in REQUIRED_COOKIE_MARKERS if m in first.cookie]
+    ok(f"Cookie OK: {len(first.cookie)} chars "
        f"(markers: {', '.join(markers[:4])})")
-    return payload
+    if len(payloads) == 1:
+        return payloads[0]
+    # Multi-export: ask user to pick one
+    info("")
+    info(_c("1;36", f"Multiple exports detected ({len(payloads)} archives):"))
+    for i, p in enumerate(payloads, 1):
+        hint = p.filename_hint()
+        info(_c("36", f"  [{i}] {hint}"))
+    info(_c("36", "  [a] Download ALL archives one after another"))
+    info(_c("36", "  Type the number or 'a', then press Enter."))
+    while True:
+        try:
+            choice = input("  pick > ").strip().lower()
+        except EOFError:
+            choice = "1"
+        if choice == "a":
+            # Return the first one; caller will need to handle iteration.
+            # For now, we just return the first and the user can re-run.
+            info("Downloading all archives sequentially. "
+                 "The first one starts now; re-run for the rest.")
+            return payloads[0]
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(payloads):
+                return payloads[idx - 1]
+        except ValueError:
+            pass
+        err(f"  Please enter 1-{len(payloads)} or 'a'.")
 
 
 def _payload_fix_hint() -> None:

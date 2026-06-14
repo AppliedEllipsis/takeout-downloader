@@ -4,6 +4,7 @@
 const els = {
     statusBox: null,
     copyJsonBtn: null,
+    copyAllBtn: null,
     copyCurlBtn: null,
     clearBtn: null,
     preview: null,
@@ -32,11 +33,52 @@ function formatAge(timestamp) {
     return `${Math.round(seconds / 3600)}h ago`;
 }
 
+function renderScrape(scrape) {
+    if (!scrape || !scrape.exports || scrape.exports.length === 0) return;
+
+    // Build a small DOM list of detected exports
+    let container = document.getElementById('scrapeBox');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'scrapeBox';
+        container.className = 'scrape-box';
+        container.innerHTML = '<h4>Detected exports on this page</h4>';
+        els.preview.parentElement.insertBefore(container, els.preview);
+    }
+
+    const list = document.createElement('ul');
+    for (const exp of scrape.exports.slice(0, 20)) {
+        const li = document.createElement('li');
+        li.textContent = exp.filename || shortFilename(exp.url);
+        list.appendChild(li);
+    }
+    if (scrape.exports.length > 20) {
+        const li = document.createElement('li');
+        li.textContent = `… and ${scrape.exports.length - 20} more`;
+        list.appendChild(li);
+    }
+
+    // Replace previous list
+    const oldList = container.querySelector('ul');
+    if (oldList) oldList.remove();
+    container.appendChild(list);
+}
+
 function renderCapture(data) {
     const capture = data.capture;
     const count = data.count || 0;
     els.countPill.textContent = String(count);
     els.countPill.style.display = count > 0 ? 'inline-block' : 'none';
+
+    // Always show scraped exports if available
+    if (data.pageScrape) {
+        renderScrape(data.pageScrape);
+    }
+
+    // Enable "Copy ALL" if we have a page scrape with exports
+    const hasScrape = data.pageScrape && data.pageScrape.exports &&
+                      data.pageScrape.exports.length > 0;
+    els.copyAllBtn.disabled = !hasScrape;
 
     if (!capture) {
         setStatus('No capture yet. Start a download on takeout.google.com to capture.', 'dim');
@@ -124,6 +166,7 @@ function refresh() {
 document.addEventListener('DOMContentLoaded', () => {
     els.statusBox = $('statusBox');
     els.copyJsonBtn = $('copyJsonBtn');
+    els.copyAllBtn = $('copyAllBtn');
     els.copyCurlBtn = $('copyCurlBtn');
     els.clearBtn = $('clearBtn');
     els.preview = $('preview');
@@ -147,6 +190,43 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 setStatus('No capture to copy.', 'warn');
             }
+        });
+    });
+
+    els.copyAllBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
+            if (!response || !response.capture) {
+                setStatus('No capture to copy. Click a download first.', 'warn');
+                return;
+            }
+            const capture = response.capture;
+            const scrape = response.pageScrape;
+            if (!scrape || !scrape.exports || scrape.exports.length === 0) {
+                setStatus('No exports detected on page. The extension could not scrape the list.', 'warn');
+                return;
+            }
+
+            // Build a multi-export payload with all detected URLs
+            const exports = scrape.exports.filter(e => e.url);
+            if (exports.length === 0) {
+                setStatus('Detected exports but no URLs found. Click each download individually.', 'warn');
+                return;
+            }
+
+            const payload = {
+                schema: capture.schema || 1,
+                captured_at: new Date().toISOString(),
+                source: 'extension',
+                multi: true,
+                exports: exports.map(exp => ({
+                    url: exp.url,
+                    filename: exp.filename,
+                    size_hint: (scrape.sizes || {})[exp.filename]
+                })),
+                headers: capture.headers || {},
+                cookie: capture.cookie || ''
+            };
+            copyToClipboard(JSON.stringify(payload, null, 2), `ALL exports (${exports.length})`);
         });
     });
 

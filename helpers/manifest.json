@@ -24,6 +24,16 @@
         "type": "module"
     },
 
+    "content_scripts": [
+        {
+            "matches": [
+                "https://takeout.google.com/*"
+            ],
+            "js": ["content.js"],
+            "run_at": "document_idle"
+        }
+    ],
+
     "options_ui": {
         "page": "options.html",
         "open_in_tab": true

@@ -194,24 +194,56 @@ function buildCurlString(capture) {
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'getCapture') {
-        chrome.storage.local.get(['lastCapture', 'hasCapture', 'captureCount', 'lastError'], (data) => {
+        chrome.storage.local.get(['lastCapture', 'hasCapture', 'captureCount', 'lastError', 'pageScrape'], (data) => {
             sendResponse({
                 capture: data.lastCapture || null,
                 hasCapture: !!data.hasCapture,
                 count: data.captureCount || 0,
                 error: data.lastError || null,
                 json: buildPayloadJson(data.lastCapture),
-                curl: buildCurlString(data.lastCapture)
+                curl: buildCurlString(data.lastCapture),
+                pageScrape: data.pageScrape || null
             });
         });
         return true;  // async
+    }
+
+    if (msg.action === 'pageScrape') {
+        // Content script sent us the list of exports from the DOM.
+        chrome.storage.local.set({
+            pageScrape: {
+                exports: msg.exports || [],
+                sizes: msg.sizes || {},
+                url: msg.url,
+                timestamp: msg.timestamp
+            }
+        }, () => {
+            sendResponse({ ok: true, count: (msg.exports || []).length });
+        });
+        return true;
+    }
+
+    if (msg.action === 'clickIntercept') {
+        // A download button was clicked. Store the URL so the popup can
+        // correlate it with the page-scraped exports.
+        chrome.storage.local.get(['clickIntercepts'], (data) => {
+            const intercepts = (data.clickIntercepts || []).concat([{
+                url: msg.url,
+                text: msg.text,
+                timestamp: msg.timestamp
+            }]).slice(-20);
+            chrome.storage.local.set({ clickIntercepts: intercepts });
+        });
+        sendResponse({ ok: true });
+        return false;
     }
 
     if (msg.action === 'clearCapture') {
         chrome.storage.local.set({
             lastCapture: null,
             hasCapture: false,
-            lastError: null
+            lastError: null,
+            pageScrape: null
         }, () => {
             updateBadge();
             sendResponse({ ok: true });

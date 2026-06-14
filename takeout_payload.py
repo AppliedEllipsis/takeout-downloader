@@ -305,3 +305,61 @@ def parse_payload(text: str) -> TakeoutPayload:
     if text.startswith("{"):
         return TakeoutPayload.from_json(text)
     return TakeoutPayload.from_curl(text)
+
+
+def parse_multi_payload(text: str) -> list[TakeoutPayload]:
+    """Parse a multi-export payload produced by the extension's
+    "Copy ALL exports" button.
+
+    Returns a list of TakeoutPayload objects, one per export.
+    If the payload is not multi, returns a single-element list
+    with the regular payload.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty input")
+    if not text.startswith("{"):
+        return [TakeoutPayload.from_curl(text)]
+
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Payload must be a JSON object")
+
+    # Not a multi payload → regular single-export
+    if not data.get("multi"):
+        return [TakeoutPayload.from_json(text)]
+
+    # Multi payload: extract shared fields and clone per-export
+    base = {
+        "schema": data.get("schema", 1),
+        "captured_at": data.get("captured_at")
+        or datetime.now(timezone.utc).isoformat(),
+        "source": data.get("source", "extension"),
+        "headers": data.get("headers", {}) or {},
+        "cookie": data.get("cookie", ""),
+    }
+
+    exports = data.get("exports", [])
+    if not exports:
+        raise ValueError("Multi payload has no exports")
+
+    payloads: list[TakeoutPayload] = []
+    for exp in exports:
+        url = exp.get("url") if isinstance(exp, dict) else str(exp)
+        if not url:
+            continue
+        payload = TakeoutPayload(
+            url=url,
+            cookie=base["cookie"],
+            headers=dict(DEFAULT_HEADERS, **base.get("headers", {})),
+            method="GET",
+            captured_at=base["captured_at"],
+            source=base["source"],
+            schema=base["schema"],
+        )
+        payloads.append(payload)
+
+    if not payloads:
+        raise ValueError("Multi payload has no valid export URLs")
+
+    return payloads

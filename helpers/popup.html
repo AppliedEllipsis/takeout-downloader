@@ -42,9 +42,7 @@
     <div id="statusBox" class="status dim">No capture yet. Start a download on takeout.google.com to capture.</div>
 
     <div class="section">
-        <button id="copyJsonBtn" disabled>📋 Copy as JSON</button>
         <button id="copyAllBtn" class="success" disabled>📋 Copy ALL exports</button>
-        <button id="copyCurlBtn" class="secondary" disabled>📋 Copy as cURL</button>
         <button id="clearBtn" class="secondary" disabled style="margin-top:2px;">🗑 Clear capture</button>
     </div>
 
@@ -64,10 +62,9 @@
         3. Click the extension icon → <strong>Copy ALL exports</strong> to copy a multi-payload with every archive on your account<br>
         4. Paste into the Takeout Downloader CLI (<code>Ctrl+Shift+V</code>)<br>
         <br>
-        <strong>Copy ALL</strong> uses your captured cookie to fetch the full
-        export list from Takeout's server, so you only need to click ONE
-        download button. When the CLI needs a refreshed cookie, just click
-        any download again and re-copy.
+        <strong>Copy ALL</strong> fetches the full export list from Takeout's
+        server using your captured cookie. The CLI shows a menu to pick which
+        archive to download (sorted smallest first).
     </div>
 
     <script src="popup.js"></script>

@@ -157,37 +157,8 @@ function extractFilename(url) {
 // ---------------------------------------------------------------------------
 // Clipboard helper for the popup
 // ---------------------------------------------------------------------------
-// Service workers can't directly write to the clipboard, but they CAN
-// use the offscreen API (MV3) for that. Simpler: the popup (which has
-// a DOM) does the clipboard write. Here we just hand back the JSON.
-function buildPayloadJson(capture) {
-    if (!capture) return null;
-    return JSON.stringify({
-        schema: capture.schema || SCHEMA_VERSION,
-        captured_at: capture.captured_at || new Date().toISOString(),
-        source: capture.source || 'extension',
-        url: capture.url,
-        method: capture.method || 'GET',
-        headers: capture.headers || {},
-        cookie: capture.cookie || ''
-    }, null, 2);
-}
-
-function buildCurlString(capture) {
-    if (!capture) return null;
-    const lines = [`curl '${capture.url}' \\`];
-    const headers = capture.headers || {};
-    for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === 'cookie') continue;  // added separately below
-        lines.push(`  -H '${k}: ${v}' \\`);
-    }
-    if (capture.cookie) lines.push(`  -H 'Cookie: ${capture.cookie}'`);
-    // Strip trailing backslash on the last header line
-    if (lines.length > 1) {
-        lines[lines.length - 1] = lines[lines.length - 1].replace(/ \\\\$/, '');
-    }
-    return lines.join('\n');
-}
+// The popup (which has a DOM) does the clipboard write directly. The
+// background just hands back the captured data on request.
 
 // ---------------------------------------------------------------------------
 // Message handlers from popup / options
@@ -200,8 +171,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 hasCapture: !!data.hasCapture,
                 count: data.captureCount || 0,
                 error: data.lastError || null,
-                json: buildPayloadJson(data.lastCapture),
-                curl: buildCurlString(data.lastCapture),
                 pageScrape: data.pageScrape || null
             });
         });

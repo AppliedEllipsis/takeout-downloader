@@ -1,11 +1,10 @@
-// Takeout Downloader Helper - Popup Logic v2
-// Copy-as-JSON / Copy-as-cURL. No network calls outside the browser.
+// Takeout Downloader Helper - Popup Logic v3
+// One button: "Copy ALL exports". Always produces a multi-export JSON
+// payload by fetching the full export list from Takeout's API.
 
 const els = {
     statusBox: null,
-    copyJsonBtn: null,
     copyAllBtn: null,
-    copyCurlBtn: null,
     clearBtn: null,
     preview: null,
     autoCopy: null,
@@ -33,56 +32,17 @@ function formatAge(timestamp) {
     return `${Math.round(seconds / 3600)}h ago`;
 }
 
-function renderScrape(scrape) {
-    if (!scrape || !scrape.exports || scrape.exports.length === 0) return;
-
-    // Build a small DOM list of detected exports
-    let container = document.getElementById('scrapeBox');
-    if (!container) {
-        container = document.createElement('div');
-        container.id = 'scrapeBox';
-        container.className = 'scrape-box';
-        container.innerHTML = '<h4>Detected exports on this page</h4>';
-        els.preview.parentElement.insertBefore(container, els.preview);
-    }
-
-    const list = document.createElement('ul');
-    for (const exp of scrape.exports.slice(0, 20)) {
-        const li = document.createElement('li');
-        li.textContent = exp.filename || shortFilename(exp.url);
-        list.appendChild(li);
-    }
-    if (scrape.exports.length > 20) {
-        const li = document.createElement('li');
-        li.textContent = `… and ${scrape.exports.length - 20} more`;
-        list.appendChild(li);
-    }
-
-    // Replace previous list
-    const oldList = container.querySelector('ul');
-    if (oldList) oldList.remove();
-    container.appendChild(list);
-}
-
 function renderCapture(data) {
     const capture = data.capture;
     const count = data.count || 0;
     els.countPill.textContent = String(count);
     els.countPill.style.display = count > 0 ? 'inline-block' : 'none';
 
-    // Always show scraped exports if available
-    if (data.pageScrape) {
-        renderScrape(data.pageScrape);
-    }
-
-    // Enable "Copy ALL" if we have a capture (the cookie lets us fetch
-    // the full export list from the Takeout API server-side).
+    // Enable "Copy ALL" if we have a capture with a cookie.
     els.copyAllBtn.disabled = !capture || !capture.cookie;
 
     if (!capture) {
         setStatus('No capture yet. Start a download on takeout.google.com to capture.', 'dim');
-        els.copyJsonBtn.disabled = true;
-        els.copyCurlBtn.disabled = true;
         els.clearBtn.disabled = true;
         els.preview.textContent = 'No capture yet.';
         return;
@@ -92,12 +52,8 @@ function renderCapture(data) {
     const age = formatAge(capture.captured_at ? Date.parse(capture.captured_at) : Date.now());
     const cookieChars = (capture.cookie || '').length;
 
-    els.copyJsonBtn.disabled = false;
-    els.copyCurlBtn.disabled = false;
     els.clearBtn.disabled = false;
 
-    // Pre-redirect warning — captured from takeout.google.com (not the final host).
-    // Those cookies are tied to the wrong domain and downloads will return HTML.
     if (capture.pre_redirect) {
         setStatus(
             `⚠ Pre-redirect capture: ${filename} (${age}). ` +
@@ -105,7 +61,7 @@ function renderCapture(data) {
             'warn'
         );
     } else if (!capture.cookie) {
-        setStatus(`✗ No cookie captured. Try clicking the download again.`, 'err');
+        setStatus('✗ No cookie captured. Try clicking the download again.', 'err');
     } else if (cookieChars < 100) {
         setStatus(
             `⚠ Cookie only ${cookieChars} chars (${age}). ` +
@@ -113,25 +69,25 @@ function renderCapture(data) {
             'warn'
         );
     } else {
-        setStatus(`✓ Captured: ${filename} (${age}, cookie ${cookieChars} chars, #${count})`, 'ok');
+        setStatus(
+            `✓ Captured: ${filename} (${age}, cookie ${cookieChars} chars, #${count}). ` +
+            `Click Copy ALL exports to fetch the full archive list.`,
+            'ok'
+        );
     }
 
-    // Build preview JSON
-    const previewObj = {
-        schema: capture.schema || 1,
+    // Show a preview of just the captured URL (no cookie text)
+    els.preview.textContent = JSON.stringify({
         url: capture.url,
-        method: capture.method || 'GET',
-        headers: capture.headers || {},
-        cookie: capture.cookie ? `[${capture.cookie.length} chars]` : ''
-    };
-    els.preview.textContent = JSON.stringify(previewObj, null, 2);
+        cookie: `[${(capture.cookie || '').length} chars]`,
+        captured_at: capture.captured_at
+    }, null, 2);
 }
 
 async function copyToClipboard(text, kind) {
     try {
         await navigator.clipboard.writeText(text);
-        setStatus(`✓ ${kind} copied! Paste into the TUI.`, 'ok');
-        setTimeout(() => refresh(), 1500);
+        setStatus(`✓ ${kind} copied! Paste into the CLI.`, 'ok');
     } catch (e) {
         // Fallback for browsers that block the async clipboard API in popups
         const ta = document.createElement('textarea');
@@ -142,13 +98,32 @@ async function copyToClipboard(text, kind) {
         ta.select();
         try {
             document.execCommand('copy');
-            setStatus(`✓ ${kind} copied! Paste into the TUI.`, 'ok');
+            setStatus(`✓ ${kind} copied! Paste into the CLI.`, 'ok');
         } catch (e2) {
             setStatus(`✗ Could not copy: ${e2.message}. Select text manually.`, 'err');
         } finally {
             document.body.removeChild(ta);
         }
-        setTimeout(() => refresh(), 1500);
+    }
+}
+
+async function fetchAllExportsFromContentScript(capture) {
+    // Delegate to the content script on the active Takeout tab. It runs
+    // in the page context where cookies attach automatically and there's
+    // no CORS preflight issue. Service workers can't reliably do
+    // same-origin fetches in MV3, and the popup itself can hit preflight
+    // failures with custom headers.
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) {
+        return { ok: false, error: 'no active tab' };
+    }
+    if (!tab.url || !tab.url.startsWith('https://takeout.google.com/')) {
+        return { ok: false, error: 'open the Takeout manage page first' };
+    }
+    try {
+        return await chrome.tabs.sendMessage(tab.id, { action: 'contentFetchExports' });
+    } catch (e) {
+        return { ok: false, error: 'content script unreachable: ' + e.message };
     }
 }
 
@@ -164,9 +139,7 @@ function refresh() {
 
 document.addEventListener('DOMContentLoaded', () => {
     els.statusBox = $('statusBox');
-    els.copyJsonBtn = $('copyJsonBtn');
     els.copyAllBtn = $('copyAllBtn');
-    els.copyCurlBtn = $('copyCurlBtn');
     els.clearBtn = $('clearBtn');
     els.preview = $('preview');
     els.autoCopy = $('autoCopy');
@@ -181,22 +154,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Wire up buttons
-    els.copyJsonBtn.addEventListener('click', () => {
-        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
-            if (response && response.json) {
-                copyToClipboard(response.json, 'JSON');
-            } else {
-                setStatus('No capture to copy.', 'warn');
-            }
-        });
-    });
-
+    // The one and only copy button: fetches all exports then builds
+    // a multi-payload with them.
     els.copyAllBtn.addEventListener('click', async () => {
         setStatus('Reading capture...', 'dim');
         const response = await chrome.runtime.sendMessage({ action: 'getCapture' });
         if (!response || !response.capture) {
-            setStatus('No capture to copy. Click a download first.', 'warn');
+            setStatus('No capture. Click a download on the Takeout page first.', 'warn');
             return;
         }
         const capture = response.capture;
@@ -205,45 +169,22 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        setStatus('Fetching all exports from Takeout (using page context)...', 'dim');
-
-        // Delegate to the content script on the active Takeout tab. It
-        // runs in the page context where cookies attach automatically and
-        // there's no CORS preflight issue. Service workers can't reliably
-        // do same-origin fetches in MV3, and the popup itself can hit
-        // preflight failures with custom headers.
-        let result;
-        try {
-            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (!tab || !tab.id) {
-                setStatus('No active tab found.', 'err');
-                return;
-            }
-            if (!tab.url || !tab.url.startsWith('https://takeout.google.com/')) {
-                setStatus('Open the Takeout manage page first, then click Copy ALL.', 'warn');
-                return;
-            }
-            result = await chrome.tabs.sendMessage(tab.id, { action: 'contentFetchExports' });
-        } catch (e) {
-            setStatus('Could not reach the Takeout page: ' + e.message, 'err');
-            return;
-        }
+        setStatus('Fetching all exports from Takeout...', 'dim');
+        const result = await fetchAllExportsFromContentScript(capture);
 
         if (!result || !result.ok) {
             const err = (result && result.error) || 'unknown';
-            const debug = (result && result.debug) || [];
-            console.log('Takeout Downloader debug:', debug);
-            setStatus("✗ Could not fetch exports: " + err + ". Check console for details.", 'err');
+            console.log('Takeout Downloader debug:', result && result.debug);
+            setStatus("✗ Could not fetch exports: " + err, 'err');
             return;
         }
 
         const urls = result.urls || [];
         if (urls.length === 0) {
-            setStatus('No URLs in API response. Check console for details.', 'warn');
+            setStatus('No URLs returned by Takeout API. See console for details.', 'warn');
             return;
         }
 
-        // Build a multi-export payload with all detected URLs
         const exports = urls.map(url => ({
             url: url,
             filename: shortFilename(url)
@@ -258,18 +199,10 @@ document.addEventListener('DOMContentLoaded', () => {
             headers: capture.headers || {},
             cookie: capture.cookie || ''
         };
-        await copyToClipboard(JSON.stringify(payload, null, 2),
-                              `ALL exports (${exports.length})`);
-    });
-
-    els.copyCurlBtn.addEventListener('click', () => {
-        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
-            if (response && response.curl) {
-                copyToClipboard(response.curl, 'cURL');
-            } else {
-                setStatus('No capture to copy.', 'warn');
-            }
-        });
+        await copyToClipboard(
+            JSON.stringify(payload, null, 2),
+            `ALL exports (${exports.length})`
+        );
     });
 
     els.clearBtn.addEventListener('click', () => {
@@ -290,22 +223,6 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.onChanged.addListener((changes, area) => {
         if (area === 'local' && (changes.lastCapture || changes.captureCount)) {
             refresh();
-            // Auto-copy if enabled
-            if (els.autoCopy.checked && changes.lastCapture) {
-                const newCap = changes.lastCapture.newValue;
-                if (newCap && !newCap.pre_redirect && newCap.cookie) {
-                    const json = JSON.stringify({
-                        schema: newCap.schema || 1,
-                        captured_at: newCap.captured_at,
-                        source: newCap.source || 'extension',
-                        url: newCap.url,
-                        method: newCap.method || 'GET',
-                        headers: newCap.headers || {},
-                        cookie: newCap.cookie
-                    }, null, 2);
-                    copyToClipboard(json, 'JSON (auto)');
-                }
-            }
         }
     });
 

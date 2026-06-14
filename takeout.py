@@ -421,6 +421,10 @@ class TakeoutDownloader:
         self.auth_failed = False  # Flag for parallel downloads
         self.stats = DownloadStats()
         self._lock = threading.Lock()  # For thread-safe stats updates
+        # Cached output-dir snapshot from the most recent cleanup_bad_files()
+        # call, so callers (the TUI download-list loop) can reuse it instead
+        # of re-stat'ing every file on a slow FUSE mount a third time.
+        self._last_snapshot: dict = {}
         # Output sink. Defaults to print() for CLI use; the TUI injects a
         # callback that routes into its Log widget. NEVER print() directly in
         # methods the TUI calls — under Textual, print() is captured and can
@@ -477,58 +481,100 @@ class TakeoutDownloader:
         """Get local file path for file number."""
         return self.output_dir / self.get_filename(num)
 
+    def scan_output_dir(self) -> dict:
+        """Snapshot the output directory in a SINGLE os.scandir() pass.
+
+        Returns {filename: size_bytes} for every regular file present.
+
+        WHY THIS EXISTS: the old code called Path.exists()+Path.stat() once
+        per file (and did so THREE times — preview, cleanup, download-list).
+        On a network/FUSE mount (JuiceFS) each of those is a round-trip, so a
+        100-file takeout meant ~300+ serial round-trips that took >10 minutes
+        of dead silence — long enough for the Google cookie to expire before
+        a single byte downloaded. One scandir() collapses that to a single
+        directory read.
+        """
+        snapshot: dict = {}
+        try:
+            with os.scandir(self.output_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            snapshot[entry.name] = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except (OSError, FileNotFoundError):
+            pass
+        return snapshot
+
     def cleanup_bad_files(self) -> int:
         """
         Clean up zero-sized and incomplete files.
         Returns the first file number that needs downloading.
 
         Note: .downloading files are preserved for resume support.
+
+        Uses a single scandir() snapshot instead of per-file stat() calls so
+        it stays fast on network/FUSE mounts (see scan_output_dir).
         """
+        snapshot = self.scan_output_dir()
+        # Cache so callers (e.g. the TUI download-list loop) can reuse this
+        # single scandir() snapshot instead of re-stat'ing every file.
+        self._last_snapshot = snapshot
         first_missing = None
 
         for num in range(1, self.file_count + 1):
+            filename = self.get_filename(num)
             filepath = self.get_filepath(num)
             temp_path = filepath.with_suffix('.downloading')
 
             # Check if there's a partial download to resume
-            if temp_path.exists():
-                partial_size = temp_path.stat().st_size
+            partial_size = snapshot.get(temp_path.name)
+            if partial_size is not None:
                 if partial_size > 0:
-                    self._log(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
+                    self._log(f"  Found partial: {filename} ({partial_size/(1024*1024):.1f}MB to resume)")
                     if first_missing is None:
                         first_missing = num
                     continue
                 else:
                     # Zero-sized partial, delete it
-                    temp_path.unlink()
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
 
-            if not filepath.exists():
+            size = snapshot.get(filename)
+            if size is None:
                 if first_missing is None:
                     first_missing = num
                 continue
 
-            size = filepath.stat().st_size
-
             # Zero-sized = definitely bad
             if size == 0:
-                self._log(f"  Deleting zero-sized: {filepath.name}")
-                filepath.unlink()
+                self._log(f"  Deleting zero-sized: {filename}")
+                try:
+                    filepath.unlink()
+                except OSError:
+                    pass
                 if first_missing is None:
                     first_missing = num
                 continue
 
             # Check against known size
-            expected = self.size_history.get_expected_size(filepath.name)
+            expected = self.size_history.get_expected_size(filename)
             if expected and size < expected:
-                self._log(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
-                filepath.unlink()
+                self._log(f"  Deleting incomplete: {filename} ({size} < {expected})")
+                try:
+                    filepath.unlink()
+                except OSError:
+                    pass
                 if first_missing is None:
                     first_missing = num
                 continue
 
             # File looks good, record its size
             if not expected:
-                self.size_history.record_size(filepath.name, size)
+                self.size_history.record_size(filename, size)
 
         return first_missing if first_missing is not None else 1
 

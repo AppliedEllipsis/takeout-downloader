@@ -369,6 +369,8 @@ class TakeoutTUI(App):
         # Refresh-alert state (cookie expired, waiting for a fresh paste)
         self.needs_refresh = False
         self._refresh_timer = None
+        self._watch_timer = None
+        self._payload_mtimes: dict = {}
         self._title_flash_on = False
         self._base_title = f"Google Takeout Downloader v{VERSION}"
         # Remember the last run parameters so Resume can pick up where it left off
@@ -738,23 +740,37 @@ class TakeoutTUI(App):
         alert = self.query_one("#alert-panel", Static)
         alert.update(
             f"🔔 [bold red]COOKIE EXPIRED[/] — {reason}\n"
-            "Re-capture in the browser → extension → Copy as JSON → paste above → click [bold]Resume[/]."
+            "[bold]How to resume (pick one):[/]\n"
+            "  1. Overwrite [bold]in.json[/] on the host with a fresh capture — "
+            "the TUI auto-detects it and resumes. No clicks needed.\n"
+            "  2. Or paste fresh JSON above, then press [bold]Resume (s)[/].\n"
+            "Already-downloaded files are kept; it picks up where it stopped."
         )
 
-        # Re-label Start as Resume
+        # Re-label Start as Resume and keep it clearly enabled/readable.
         start_btn = self.query_one("#start-btn", Button)
         start_btn.label = "▶ Resume"
         start_btn.disabled = False
-        self.query_one("#stop-btn", Button).disabled = True
+        start_btn.variant = "warning"
+        self.query_one("#stop-btn", Button).disabled = False
+        self.query_one("#stop-btn", Button).label = "✖ Cancel wait"
 
-        self.log_message(f"🔔 AUTH EXPIRED — {reason} Paste a fresh capture and click Resume.")
+        self.log_message(
+            f"🔔 AUTH EXPIRED — {reason}", "error"
+        )
+        self.log_message(
+            "→ Overwrite in.json on the host to auto-resume, or paste JSON + press Resume (s)."
+        )
 
-        # Audible + visual alert loop
+        # Audible + visual alert loop, plus the auto-resume file watcher.
         self._fire_alert()  # immediate
         if self._refresh_timer is None:
             self._refresh_timer = self.set_interval(
                 self.REFRESH_ALERT_INTERVAL, self._fire_alert
             )
+        if getattr(self, "_watch_timer", None) is None:
+            # Poll for a fresh capture more often than the (slower) alert flash.
+            self._watch_timer = self.set_interval(2.0, self._watch_for_fresh_capture)
 
     def _fire_alert(self) -> None:
         """Draw attention: terminal bell + title flash + tmux window alert."""
@@ -807,6 +823,9 @@ class TakeoutTUI(App):
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
             self._refresh_timer = None
+        if getattr(self, "_watch_timer", None) is not None:
+            self._watch_timer.stop()
+            self._watch_timer = None
         self.title = self._base_title
         self._tmux_alert_clear()
         try:
@@ -816,6 +835,12 @@ class TakeoutTUI(App):
         self.query_one("#alert-panel", Static).update("")
         start_btn = self.query_one("#start-btn", Button)
         start_btn.label = "▶ Start"
+        start_btn.variant = "success"
+        try:
+            stop_btn = self.query_one("#stop-btn", Button)
+            stop_btn.label = "⏹ Stop"
+        except Exception:
+            pass
 
     def update_stats_display(self):
         """Update the stats panel."""
@@ -1017,27 +1042,60 @@ class TakeoutTUI(App):
         """
         if not self.downloader:
             return
+        # ONE directory snapshot instead of 2-3 stat() calls per file. On a
+        # FUSE mount (JuiceFS) each stat() is a network round-trip; 100 files
+        # x 2 calls = 200 round-trips that took ~4.5 min on the user's server
+        # and burned the cookie before downloads even started. scandir() reads
+        # the whole listing in one syscall — names + sizes come for free.
+        sizes: dict[str, int] = {}
+        scan_err: Optional[str] = None
+        snap = {"done": False}
+
+        def _scan():
+            try:
+                with os.scandir(str(self.downloader.output_dir)) as it:
+                    for entry in it:
+                        try:
+                            sizes[entry.name] = entry.stat().st_size
+                        except OSError:
+                            sizes[entry.name] = -1
+            except OSError as e:
+                nonlocal scan_err
+                scan_err = str(e)
+            finally:
+                snap["done"] = True
+
+        t = threading.Thread(target=_scan, daemon=True)
+        t.start()
+        t.join(10.0)  # whole-dir snapshot, generous timeout
+        if not snap["done"]:
+            self.call_from_thread(
+                self.log_message,
+                "⚠ Directory listing is slow (FUSE/JuiceFS) — skipping preview, "
+                "downloads will still proceed",
+                "warning",
+            )
+            self.queue_preview = []
+            return
+        if scan_err:
+            self.call_from_thread(
+                self.log_message, f"⚠ Could not list output dir: {scan_err}", "warning"
+            )
+
         preview: list[tuple[str, str]] = []
         for num in range(1, file_count + 1):
             try:
                 filename = self.downloader.get_filename(num)
-                filepath = self.downloader.get_filepath(num)
-                temp = filepath.with_suffix(".downloading")
-                size = self._safe_stat(filepath)
+                temp_name = filename.rsplit(".", 1)[0] + ".downloading"
+                size = sizes.get(filename)
+                temp_size = sizes.get(temp_name)
                 if size is not None and size > 0:
                     preview.append((filename, "exists"))
-                    continue
-                temp_size = self._safe_stat(temp)
-                if temp_size is not None and temp_size > 0:
+                elif temp_size is not None and temp_size > 0:
                     preview.append((filename, "resume"))
-                    continue
-                if size == 0:
-                    # File exists but is empty — treat as missing
+                elif size == 0:
                     preview.append((filename, "missing"))
                 else:
-                    # size is None: either not found OR stat timed out.
-                    # Default to "queued" so the engine attempts the download;
-                    # if the file really doesn't exist, it'll 404 quickly.
                     preview.append((filename, "queued"))
             except Exception as e:  # invalid filename, etc. — don't crash preview
                 preview.append((f"file #{num}", f"error: {e}"))
@@ -1367,13 +1425,18 @@ class TakeoutTUI(App):
             self.call_from_thread(self.log_message, "Checking files...")
             first_needed = self.downloader.cleanup_bad_files()
 
-            # Build download list
+            # Build download list. Reuse the snapshot cleanup_bad_files just
+            # took (single scandir) instead of stat'ing every file again — on
+            # a FUSE mount the per-file stat loop was the third silent crawl
+            # that burned ~12 min and expired the cookie before any download.
+            snapshot = getattr(self.downloader, "_last_snapshot", {}) or {}
             to_download = []
             for num in range(first_needed, file_count + 1):
-                filepath = self.downloader.get_filepath(num)
-                if filepath.exists() and filepath.stat().st_size > 0:
-                    expected = self.downloader.size_history.get_expected_size(filepath.name)
-                    if not expected or filepath.stat().st_size >= expected:
+                filename = self.downloader.get_filename(num)
+                size = snapshot.get(filename)
+                if size and size > 0:
+                    expected = self.downloader.size_history.get_expected_size(filename)
+                    if not expected or size >= expected:
                         self.stats.skipped_files += 1
                         continue
                 to_download.append(num)
@@ -1746,8 +1809,91 @@ class TakeoutTUI(App):
         self.is_downloading = False
         self.active_downloads.clear()
         self.update_downloads_table()
+        # Snapshot the current payload-file mtimes so the watcher can detect a
+        # fresh capture written on the host and auto-resume (see _watch_for_fresh
+        # _capture). This sidesteps the broken SSH/tmux paste AND the
+        # hard-to-read disabled buttons — the user just overwrites in.json.
+        self._snapshot_payload_mtimes()
         # Beep + flash + prompt for a fresh capture
         self.start_refresh_alert("Google rejected the session (expired after a few files).")
+
+    def _payload_watch_paths(self) -> list:
+        """The set of files the auto-resume watcher monitors for a fresh capture.
+
+        Mirrors _read_payload_file's search roots so a host-written in.json in
+        any mounted location triggers an auto-resume."""
+        try:
+            output_dir = self.query_one("#output-input", Input).value.strip() or DEFAULT_OUTPUT_DIR
+        except Exception:
+            output_dir = DEFAULT_OUTPUT_DIR
+        roots = [
+            Path(output_dir), Path.cwd(),
+            Path("/downloads"), Path("/downloads/drop"), Path("/drop"),
+            Path("/work"), Path("/work/drop"), Path.home(),
+        ]
+        paths = []
+        seen = set()
+        for root in roots:
+            for name in self.PAYLOAD_FILENAMES:
+                p = root / name
+                if p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+        return paths
+
+    def _snapshot_payload_mtimes(self) -> None:
+        """Record current mtimes of all watched payload files."""
+        self._payload_mtimes = {}
+        for p in self._payload_watch_paths():
+            m = self._safe_mtime(p)
+            if m is not None:
+                self._payload_mtimes[str(p)] = m
+
+    def _safe_mtime(self, path: Path, timeout: float = 1.0):
+        """stat().st_mtime with a timeout so a hung FUSE mount can't block."""
+        result = {"mtime": None}
+
+        def _do():
+            try:
+                result["mtime"] = path.stat().st_mtime
+            except OSError:
+                pass
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(timeout)
+        return result["mtime"]
+
+    def _watch_for_fresh_capture(self) -> None:
+        """Poll watched payload files; auto-resume when one is newer than the
+        snapshot taken at auth-failure time. Runs on the refresh-alert timer."""
+        if not self.needs_refresh:
+            return
+        prev = getattr(self, "_payload_mtimes", {})
+        for p in self._payload_watch_paths():
+            m = self._safe_mtime(p)
+            if m is None:
+                continue
+            old = prev.get(str(p))
+            if old is None or m > old:
+                # A fresh capture appeared (new file or rewritten). Auto-resume.
+                self.log_message(
+                    f"\U0001F195 Fresh capture detected at {p} \u2014 auto-resuming…"
+                )
+                self._payload_mtimes[str(p)] = m
+                try:
+                    content = p.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    continue
+                if not content:
+                    continue
+                # Load into the box and trigger the normal resume path.
+                try:
+                    box = self.query_one("#curl-input", TextArea)
+                    box.load_text(content)
+                except Exception:
+                    pass
+                self.start_download()
+                return
 
     def download_complete(self):
         """Handle download completion."""

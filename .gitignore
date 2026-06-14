@@ -1,36 +1,98 @@
-# Environment and secrets
+# =============================================================================
+# Secrets & credentials — DO NOT COMMIT
+# =============================================================================
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+cookies.*
+curl_*.txt
+auth_*.txt
 
-# Virtual environment
-venv/
-.venv/
+# =============================================================================
+# Runtime / downloaded data — never belongs in source control
+# =============================================================================
+downloads/
+takeout-*.zip
+*.zip
+*.tgz
+*.tar.gz
+*.tbz2
+*.partial
+*.downloading
 
+# =============================================================================
+# Local test / scratch artifacts
+# =============================================================================
+_tmp/
+_tmp*
+_final_test*
+test_*.txt
+*.test.json
+*.test.log
+
+# =============================================================================
+# Outscorn directory — removed from history; do NOT re-add
+# (See NOTICE.md — these zips contained suspicious payloads.)
+# =============================================================================
+outscorn/
+outscorn/
+
+# =============================================================================
 # Python
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
 
-# Downloads
-downloads/
-*.zip
+# =============================================================================
+# Virtual environments
+# =============================================================================
+venv/
+.venv/
+env/
+ENV/
 
-# IDE
+# =============================================================================
+# PyInstaller / build artifacts
+# =============================================================================
+build/
+dist/
+*.spec
+*.exe
+*.app
+
+# =============================================================================
+# Chrome / browser extension build artifacts
+# =============================================================================
+helpers/*.crx
+helpers/*.pem
+helpers/icons/
+helpers/build/
+
+# =============================================================================
+# IDE / editor
+# =============================================================================
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# OS
+# =============================================================================
+# OS junk
+# =============================================================================
 .DS_Store
 Thumbs.db
-
-# PyInstaller build artifacts
-build/
-dist/
-*.spec
-
-# Helper extension build artifacts
-helpers/*.crx
-helpers/*.pem
-helpers/icons/
+desktop.ini

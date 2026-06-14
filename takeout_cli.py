@@ -32,13 +32,16 @@ Environment variables
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +73,14 @@ MAX_AUTH_REPROMPTS = int(os.environ.get("MAX_AUTH_REPROMPTS", "5"))
 # Output helpers
 # ===========================================================================
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+LOG_PATH = Path(
+    os.environ.get(
+        "TAKEOUT_LOG_FILE",
+        str(Path(os.environ.get("OUTPUT_DIR") or DEFAULT_OUTPUT_DIR) / "takeout_cli.log"),
+    )
+).expanduser()
+LOG_MAX_BYTES = int(os.environ.get("TAKEOUT_LOG_MAX_BYTES", str(500 * 1024)))
+LOG_BACKUP_COUNT = int(os.environ.get("TAKEOUT_LOG_BACKUP_COUNT", "3"))
 
 
 def _c(code: str, text: str) -> str:
@@ -78,28 +89,85 @@ def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
+def _install_logger(log_path: Path) -> logging.Logger:
+    """Install a rotating file handler + a stream handler on a dedicated logger.
+
+    Returns the logger so callers can also emit .debug() etc.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("takeout_cli")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    # Reset handlers (matters when --help re-runs main() in tests).
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    fmt = logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File — rotated when over LOG_MAX_BYTES, keeps LOG_BACKUP_COUNT backups.
+    try:
+        fh = RotatingFileHandler(
+            log_path,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+            delay=True,  # don't create file until first write
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError as e:
+        # If we can't open the log file, fall back silently — the screen
+        # handler below still works. Surface this to the user loudly though.
+        sys.stderr.write(f"WARN: cannot open log file {log_path}: {e}\n")
+
+    # Stream — INFO+ on stdout, so the screen output stays clean.
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    return logger
+
+
+log = logging.getLogger("takeout_cli")
+
+
 def info(msg: str) -> None:
-    print(_c("36", "• ") + msg)
+    log.info(msg)
 
 
 def ok(msg: str) -> None:
-    print(_c("32", "OK  ") + msg)
+    log.info(msg)
 
 
 def warn(msg: str) -> None:
-    print(_c("33", "WARN") + " " + msg)
+    log.warning(msg)
 
 
 def err(msg: str) -> None:
-    print(_c("31", "ERR ") + " " + msg)
+    log.error(msg)
+
+
+def debug(msg: str) -> None:
+    log.debug(msg)
 
 
 def header(msg: str) -> None:
     bar = "=" * max(40, len(msg) + 4)
-    print()
-    print(_c("1;35", bar))
-    print(_c("1;35", f"  {msg}"))
-    print(_c("1;35", bar))
+    log.info("")
+    log.info(bar)
+    log.info(f"  {msg}")
+    log.info(bar)
+
+
+def section(msg: str) -> None:
+    """Mid-run subheader (less heavy than header())."""
+    log.info("")
+    log.info(f"--- {msg} ---")
 
 
 def human_size(n: int) -> str:
@@ -156,10 +224,12 @@ def _search_payload_files() -> list[Path]:
 
 def read_payload() -> str:
     """Read a JSON payload from (in priority order):
-      1. PAYLOAD_FILE env var
+      1. PAYLOAD_FILE env var (if file exists)
       2. First existing file in search roots (in.json / payload.json / curl.txt)
       3. Piped stdin
       4. Interactive prompt with brace-balance detection
+
+    Returns "" on EOF without input (the caller decides what to do).
     """
     pf = os.environ.get("PAYLOAD_FILE")
     if pf:
@@ -178,11 +248,11 @@ def read_payload() -> str:
         if data.strip():
             return data
 
-    print()
-    print(_c("1", "Paste your JSON payload (the extension's 'Copy as JSON')."))
-    print("  Auto-detects when the JSON is complete. Press Enter after paste.")
-    print(f"  Or Ctrl-C to quit.")
-    print()
+    info("")
+    info(_c("1", "Paste your JSON payload (the extension's 'Copy as JSON')."))
+    info("  Auto-detects when the JSON is complete. Press Enter after paste.")
+    info("  Or Ctrl-C to quit.")
+    info("")
 
     lines: list[str] = []
     depth = 0
@@ -257,6 +327,10 @@ def _probe_part(session: requests.Session, url: str,
     try:
         ctype = resp.headers.get("content-type", "")
         final_host = resp.url.split("/")[2] if "/" in resp.url else ""
+        debug(f"  <- {resp.status_code} "
+              f"ct={ctype[:30]} host={final_host} "
+              f"cr={resp.headers.get('content-range','')[:40]} "
+              f"cl={resp.headers.get('content-length','')}")
         if final_host.endswith("accounts.google.com"):
             raise AuthError(f"redirected to {final_host}")
         if "text/html" in ctype:
@@ -302,21 +376,27 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
         if query:
             url += f"?{query}"
 
+        debug(f"probe #{num:03d} GET {url}")
         try:
             size = _probe_part(session, url, headers)
         except AuthError as e:
             if num == 1:
+                debug(f"probe #{num:03d} -> AuthError({e})")
                 raise  # auth bad from the start
             warn(f"Auth failed probing part {num:03d} ({e}); "
                  f"stopping discovery, {len(parts)} parts discovered so far.")
             break
 
         if size is None:
+            debug(f"probe #{num:03d} -> 404 (not found)")
             consecutive_misses += 1
             if consecutive_misses >= CONSECUTIVE_404_STOP:
+                debug(f"  {CONSECUTIVE_404_STOP} consecutive misses; "
+                      "end of set")
                 break
             continue
         consecutive_misses = 0
+        debug(f"probe #{num:03d} -> {size} bytes")
 
         dest = output_dir / filename
         have = dest.exists() and dest.stat().st_size > 0 and (
@@ -326,9 +406,9 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
             "num": num, "url": url, "filename": filename,
             "size": size, "have": have,
         })
-        flag = _c("32", "have") if have else "need"
+        flag = "have" if have else "need"
         size_str = human_size(size) if size else "unknown"
-        print(f"   {num:03d}  {size_str:>10}  {flag}")
+        info(f"   {num:03d}  {size_str:>10}  {flag}")
 
     return parts
 
@@ -436,27 +516,50 @@ def resolve_output_dir() -> Path:
 # Main loop
 # ===========================================================================
 def prompt_payload_until_valid(reason: str = "") -> TakeoutPayload:
-    """Read + parse + validate; loop until the user supplies a usable payload."""
+    """Read + parse + validate the payload once.
+
+    Failures are terminal — we exit with a clear error explaining what's wrong
+    and how to fix it. Looping on a bad payload (a) wastes the cookie (b) hides
+    the error in a flood of repeated messages (c) makes the user fight the same
+    parse error repeatedly. The user can fix the payload and re-run.
+    """
     if reason:
         warn(reason)
-    while True:
-        try:
-            raw = read_payload()
-        except (EOFError, KeyboardInterrupt):
-            raise SystemExit(1)
-        if not raw.strip():
-            err("No input received. Try again, or Ctrl-C to quit.")
-            continue
-        try:
-            payload = parse_payload_strict(raw)
-        except ValueError as e:
-            err(f"Invalid payload: {e}")
-            continue
-        # parse_payload_strict already enforces good=True; warn on cookie age
-        markers = [m for m in REQUIRED_COOKIE_MARKERS if m in payload.cookie]
-        ok(f"Cookie OK: {len(payload.cookie)} chars "
-           f"(markers: {', '.join(markers[:4])})")
-        return payload
+    try:
+        raw = read_payload()
+    except (EOFError, KeyboardInterrupt):
+        err("No payload received.")
+        raise SystemExit(1)
+    if not raw.strip():
+        err("No payload received.")
+        _payload_fix_hint()
+        raise SystemExit(1)
+    try:
+        payload = parse_payload_strict(raw)
+    except ValueError as e:
+        err(f"Invalid payload: {e}")
+        _payload_fix_hint()
+        raise SystemExit(2)
+    markers = [m for m in REQUIRED_COOKIE_MARKERS if m in payload.cookie]
+    ok(f"Cookie OK: {len(payload.cookie)} chars "
+       f"(markers: {', '.join(markers[:4])})")
+    return payload
+
+
+def _payload_fix_hint() -> None:
+    """Tell the user exactly where to put the payload and how to invoke."""
+    out = os.environ.get("OUTPUT_DIR") or DEFAULT_OUTPUT_DIR
+    info("How to fix:")
+    info(f"  1. Re-capture in your browser: takeout.google.com -> Manage "
+         f"exports -> Download -> click the extension icon -> Copy as JSON")
+    info(f"  2. Save to one of these locations:")
+    info(f"     {out}/in.json")
+    info(f"     {out}/payload.json")
+    info(f"     {out}/curl.txt")
+    info(f"     /downloads/in.json   /downloads/drop/in.json   /work/in.json")
+    info(f"  3. Re-run, or pipe the JSON directly:")
+    info(f"     docker compose run --rm takeout-cli < fresh.json")
+    info(f"     PAYLOAD_FILE=/path/to/in.json python takeout_cli.py")
 
 
 def looks_like_auth_failure(parts: list[dict], incomplete: list[dict]) -> bool:
@@ -487,8 +590,21 @@ def main() -> int:
     if args.output_dir:
         os.environ["OUTPUT_DIR"] = args.output_dir
 
+    # Install rotating logger NOW so everything below (including exceptions)
+    # gets captured to the log file. The helper functions (info/ok/warn/...)
+    # resolve `log` via module globals at call time, so rebinding here makes
+    # them write through the freshly-installed handlers.
+    global log
+    log = _install_logger(LOG_PATH)
+
+    info(f"Log file: {LOG_PATH} "
+         f"(rotating at {LOG_MAX_BYTES//1024}KB, "
+         f"keeping {LOG_BACKUP_COUNT} backups)")
+    info(f"Python: {sys.version.split()[0]} on {sys.platform}")
+    info(f"Working dir: {Path.cwd()}")
+
     header("Google Takeout Downloader (aria2c)")
-    print()
+    info("")
 
     if not detect_aria2c():
         err("aria2c not found on PATH. Install it (apt install aria2) and retry.")
@@ -557,7 +673,7 @@ def main() -> int:
             if attempt >= 5:
                 warn("5 retries exhausted; giving up on these parts:")
                 for p in incomplete[:10]:
-                    print(f"   {p['num']:03d}  {p['filename']}")
+                    info(f"   {p['num']:03d}  {p['filename']}")
                 break
             continue
 
@@ -565,9 +681,9 @@ def main() -> int:
         warn(f"{len(incomplete)} parts still incomplete; "
              "looks like the cookie expired mid-run.")
         for p in incomplete[:10]:
-            print(f"   {p['num']:03d}  {p['filename']}")
+            info(f"   {p['num']:03d}  {p['filename']}")
         if len(incomplete) > 10:
-            print(f"   ... and {len(incomplete) - 10} more")
+            info(f"   ... and {len(incomplete) - 10} more")
         payload = prompt_payload_until_valid(
             "Re-capture the request in your browser, then paste the new JSON "
             "below (or save to in.json / payload.json in the output dir, or "
@@ -584,22 +700,31 @@ def main() -> int:
     header("Done")
     complete, incomplete = verify_parts(parts, output_dir)
     grand = sum(p["size"] for p in complete)
-    print()
+    info("")
     if incomplete:
         err(f"{len(incomplete)} parts still missing in {output_dir}:")
         for p in incomplete[:10]:
-            print(f"   {p['num']:03d}  {p['filename']}")
+            info(f"   {p['num']:03d}  {p['filename']}")
         if len(incomplete) > 10:
-            print(f"   ... and {len(incomplete) - 10} more")
+            info(f"   ... and {len(incomplete) - 10} more")
         return 1
     ok(f"All {len(complete)} parts downloaded — {human_size(grand)} in {output_dir}")
     return 0
 
 
 if __name__ == "__main__":
+    # Catch uncaught exceptions in the log file with a full traceback. Without
+    # this, an exception in `main()` would dump to stderr and the file handler
+    # would close without ever writing it — making postmortem impossible.
+    def _excepthook(exc_type, exc_value, exc_tb):
+        logging.getLogger("takeout_cli").error(
+            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb)
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print()
+        info("")
         warn("Interrupted. Partially-downloaded parts are kept; resume by re-running.")
         sys.exit(130)

@@ -48,10 +48,29 @@ import requests
 
 VERSION = "6.1.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-DEFAULT_PARALLEL = 1
+DEFAULT_PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "10"))
 MAX_PARALLEL = 20
-DEFAULT_FILE_COUNT = 100
-DEFAULT_OUTPUT_DIR = "./downloads"
+DEFAULT_FILE_COUNT = int(os.environ.get("FILE_COUNT", "100"))
+
+def _default_output_dir() -> str:
+    """Pick a sensible default output directory.
+
+    Priority: OUTPUT_DIR env var > the JuiceFS takeout path if it exists >
+    ./downloads. The JuiceFS preference means a server with that mount gets a
+    useful default without any config.
+    """
+    env = os.environ.get("OUTPUT_DIR", "").strip()
+    if env:
+        return env
+    preferred = "/srv/storage/google-takeout"
+    try:
+        if Path(preferred).is_dir():
+            return preferred
+    except OSError:
+        pass
+    return "./downloads"
+
+DEFAULT_OUTPUT_DIR = _default_output_dir()
 SIZE_HISTORY_FILE = ".takeout_sizes.json"
 MAX_FILE_COUNT = 1000
 # Retry tuning. Defaults raised from 3→6 based on field reports that

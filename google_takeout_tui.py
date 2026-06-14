@@ -30,7 +30,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Header, Footer, Static, Button, Input, Label,
-    Log, DataTable, TextArea, DirectoryTree
+    Log, DataTable, TextArea, ListView, ListItem
 )
 from textual.binding import Binding
 from textual import work
@@ -68,7 +68,17 @@ class DirectoryPicker(ModalScreen):
     Dismisses with the chosen absolute path (str) on "Use this folder", or
     None on Cancel. Symlinks are followed (resolve), so a path like
     ./downloads/opt -> /opt lands on the real target.
+
+    Why not Textual's DirectoryTree? It stats every entry to render and
+    recurses lazily on the UI thread; on a slow/large JuiceFS/encfs FUSE
+    mount that locks the whole app (the "froze, had to docker kill" hang).
+    This picker instead lists ONE level at a time with os.scandir, off the
+    UI thread, with a bounded entry cap, so it can't freeze.
     """
+
+    # Cap entries listed per directory — a 100k-entry dir would otherwise
+    # take forever to render. We show the cap was hit in the header.
+    MAX_ENTRIES = 1000
 
     CSS = """
     DirectoryPicker {
@@ -85,13 +95,14 @@ class DirectoryPicker(ModalScreen):
     #picker-title { text-style: bold; color: $primary; height: 1; }
     #picker-cwd { color: $text-muted; height: 1; margin-bottom: 1; }
     #picker-path-input { margin-bottom: 1; }
-    #picker-tree { height: 1fr; border: round $secondary; }
+    #picker-list { height: 1fr; border: round $secondary; }
     #picker-buttons { height: 3; align: center middle; margin-top: 1; }
     #picker-buttons Button { margin: 0 1; }
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("backspace", "go_up", "Up"),
     ]
 
     def __init__(self, start_dir: str = ".") -> None:
@@ -103,72 +114,101 @@ class DirectoryPicker(ModalScreen):
         except (OSError, ValueError):
             p = Path.cwd()
         self._cwd = p
+        # Maps a ListItem's index to the child Path it represents.
+        self._entries: list[Path] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker-card"):
             yield Label("Select output directory", id="picker-title")
             yield Label(str(self._cwd), id="picker-cwd")
             yield Input(value=str(self._cwd), placeholder="Type or paste a path, then Enter", id="picker-path-input")
-            tree = DirectoryTree(str(self._cwd), id="picker-tree")
-            yield tree
+            yield ListView(id="picker-list")
             with Horizontal(id="picker-buttons"):
                 yield Button("\u2191 Up", id="picker-up", variant="default")
                 yield Button("\u2705 Use this folder", id="picker-use", variant="success")
                 yield Button("\u2716 Cancel", id="picker-cancel", variant="error")
 
+    def on_mount(self) -> None:
+        self._set_cwd(self._cwd)
+
     def _set_cwd(self, path: Path) -> None:
         """Navigate to a directory.
 
-        Optimistic + threaded: the header/input update to the requested path
-        instantly, the tree is greyed with a loading overlay, and the slow
-        filesystem work (resolve / is_dir / listing) runs off the UI thread so
-        the picker never freezes on JuiceFS / encfs / network mounts.
+        Optimistic + threaded: the header/input update instantly, the list is
+        greyed, and the slow filesystem work (resolve / is_dir / scandir) runs
+        off the UI thread so the picker never freezes on JuiceFS / encfs /
+        network mounts.
         """
         target = str(path)
-        # Instant feedback — no stale header while the FS is being stat'd.
         self.query_one("#picker-cwd", Label).update(f"\u23f3 {target}")
         self.query_one("#picker-path-input", Input).value = target
-        tree = self.query_one("#picker-tree", DirectoryTree)
-        tree.loading = True
-        self._load_dir(path)
+        self.query_one("#picker-list", ListView).loading = True
+        self._scan_dir(path)
 
     @work(thread=True, exclusive=True, group="picker-load")
-    def _load_dir(self, path: Path) -> None:
-        """Resolve + validate a directory off the UI thread, then apply it."""
+    def _scan_dir(self, path: Path) -> None:
+        """Resolve + list a directory off the UI thread, then apply it.
+
+        Only the immediate children are listed (one level), directories
+        first, capped at MAX_ENTRIES. No recursion, no per-entry stat beyond
+        the is_dir() that scandir already caches.
+        """
         try:
             resolved = path.expanduser().resolve()
-            ok = resolved.is_dir()
         except (OSError, ValueError):
-            resolved, ok = None, False
-        self.app.call_from_thread(self._apply_dir, resolved, ok)
+            self.app.call_from_thread(self._apply_scan, None, [], False, False)
+            return
+        dirs: list[Path] = []
+        truncated = False
+        try:
+            with os.scandir(resolved) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=True):
+                            dirs.append(Path(entry.path))
+                    except OSError:
+                        continue  # unreadable entry — skip
+                    if len(dirs) >= self.MAX_ENTRIES:
+                        truncated = True
+                        break
+        except (OSError, ValueError):
+            self.app.call_from_thread(self._apply_scan, resolved, [], False, False)
+            return
+        dirs.sort(key=lambda p: p.name.lower())
+        self.app.call_from_thread(self._apply_scan, resolved, dirs, True, truncated)
 
-    def _apply_dir(self, resolved: Optional[Path], ok: bool) -> None:
-        """Runs on the UI thread once _load_dir has validated the path."""
-        tree = self.query_one("#picker-tree", DirectoryTree)
+    def _apply_scan(self, resolved: Optional[Path], dirs: list, ok: bool, truncated: bool) -> None:
+        """Runs on the UI thread once _scan_dir has produced a listing."""
+        lv = self.query_one("#picker-list", ListView)
         cwd_label = self.query_one("#picker-cwd", Label)
         if not ok or resolved is None:
-            # Revert the optimistic header to the last good directory.
-            cwd_label.update(f"\u26a0 Not a directory \u2014 staying in {self._cwd}")
+            cwd_label.update(f"\u26a0 Can't open \u2014 staying in {self._cwd}")
             self.query_one("#picker-path-input", Input).value = str(self._cwd)
-            tree.loading = False
-            self.app.bell()
+            lv.loading = False
             return
         self._cwd = resolved
-        cwd_label.update(str(resolved))
+        suffix = f"  ({len(dirs)} dirs{', capped' if truncated else ''})"
+        cwd_label.update(str(resolved) + suffix)
         self.query_one("#picker-path-input", Input).value = str(resolved)
-        tree.path = str(resolved)
-        tree.reload()
-        # The tree lists its own children in a background worker from here;
-        # drop the overlay so the user sees rows populate as they arrive.
-        tree.loading = False
+        self._entries = dirs
+        lv.clear()
+        for d in dirs:
+            lv.append(ListItem(Label(f"\U0001F4C1 {d.name}")))
+        lv.loading = False
+        lv.index = 0
 
-    def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
-        # Single click highlights; selecting a directory navigates into it.
-        self._set_cwd(Path(event.path))
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Enter a subdirectory when its row is activated."""
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._entries):
+            self._set_cwd(self._entries[idx])
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "picker-path-input":
             self._set_cwd(Path(event.value))
+
+    def action_go_up(self) -> None:
+        self._set_cwd(self._cwd.parent)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "picker-up":

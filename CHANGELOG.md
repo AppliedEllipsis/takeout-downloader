@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUI froze after browsing into a large/slow directory** (had to
+  `docker kill`). Textual's `DirectoryTree` stats every entry and recurses
+  on the UI thread, which locks the whole app on a big JuiceFS/encfs FUSE
+  mount. Replaced it with a manual, single-level `os.scandir` listing that
+  runs off the UI thread and is capped at 1000 entries per directory, so
+  the picker can no longer hang.
+
+### Changed
+
+- **Default parallel downloads raised 1 → 10** (`PARALLEL_DOWNLOADS` env
+  still overrides).
+- **Default output directory** now prefers `/srv/storage/google-takeout`
+  when it exists, falling back to `./downloads`. `OUTPUT_DIR` env still
+  takes priority over both.
+
 ### Added
 
 - **Docker `/opt` mount** — `docker-compose.yml` recursively binds host

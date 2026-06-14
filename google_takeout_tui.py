@@ -31,7 +31,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Header, Footer, Static, Button, Input, Label,
-    Log, DataTable, TextArea, ListView, ListItem
+    Log, DataTable, TextArea, ListView, ListItem, ProgressBar
 )
 from textual.binding import Binding
 from textual import work
@@ -55,12 +55,17 @@ except ImportError:
 
 
 @dataclass
+@dataclass
 class ActiveDownload:
     """Track an active download."""
     filename: str
     downloaded: int = 0
     total: int = 0
     status: str = "Starting"
+    # Speed/ETA tracking — updated every progress tick.
+    last_speed_mbps: float = 0.0
+    last_tick_bytes: int = 0
+    last_tick_time: float = 0.0
 
 
 class DirectoryPicker(ModalScreen):
@@ -426,10 +431,15 @@ class TakeoutTUI(App):
                 downloads_section.border_title = "3 · Active downloads"
                 yield DataTable(id="downloads-table")
 
+            # Per-file progress bars (one row per active download)
+            with Vertical(id="progress-section") as progress_section:
+                progress_section.border_title = "4 · Live progress bars"
+                yield Static("(no active downloads)", id="progress-display")
+
             # Log section
             with Vertical(id="log-section") as log_section:
-                log_section.border_title = "4 · Activity log"
-                yield Log(highlight=True)
+                log_section.border_title = "5 · Activity log"
+                yield Log(highlight=True, max_lines=2000)
 
         yield Footer()
 
@@ -615,6 +625,14 @@ class TakeoutTUI(App):
             log.scroll_end(animate=False)
         except Exception:
             pass
+        # Force a repaint. Textual batches widget updates; without an explicit
+        # refresh, lines written from call_from_thread may sit in the buffer
+        # without rendering until the next animation frame. This is what was
+        # causing "log file shows changes but the TUI shows nothing".
+        try:
+            log.refresh()
+        except Exception:
+            pass
         # Errors must be unmissable: ring the bell, flash the title. This works
         # even when the user is looking at another pane in tmux (if `set -g
         # monitor-bell on` is set).
@@ -770,6 +788,63 @@ class TakeoutTUI(App):
 
         self.bytes_at_last_update = self.stats.bytes_downloaded
         self.last_update_time = now
+
+    def update_progress_display(self) -> None:
+        """Render per-file progress bars with speed, ETA, bytes.
+
+        Shows one line per active download with:
+          filename  [████████░░░░░░] 45%  120/267MB  5.2MB/s  ETA 28s
+        Plus a footer with overall totals. Falls back to "(idle)" when no
+        active downloads.
+        """
+        panel = self.query_one("#progress-display", Static)
+        with self._lock:
+            active = dict(self.active_downloads)
+        if not active:
+            panel.update("[dim](no active downloads — paste a payload and press Start)[/]")
+            return
+        lines: list[str] = []
+        # Overall speed from last update_stats_display cycle
+        now = datetime.now()
+        elapsed = (now - self.last_update_time).total_seconds() or 1
+        bytes_diff = self.stats.bytes_downloaded - self.bytes_at_last_update
+        overall_speed_mb = (bytes_diff / elapsed) / (1024 * 1024) if elapsed > 0 else 0
+        for filename, dl in active.items():
+            if dl.total > 0:
+                pct = min(100, int((dl.downloaded / dl.total) * 100))
+                # 20-char bar
+                filled = int(pct / 5)
+                bar = "█" * filled + "░" * (20 - filled)
+                done_mb = dl.downloaded / (1024 * 1024)
+                total_mb = dl.total / (1024 * 1024)
+                remaining_mb = total_mb - done_mb
+                # Per-file speed estimate from progress deltas (best-effort)
+                if dl.last_speed_mbps > 0 and remaining_mb > 0:
+                    eta_s = remaining_mb / dl.last_speed_mbps
+                    eta_str = f"ETA {int(eta_s)}s"
+                else:
+                    eta_str = ""
+                lines.append(
+                    f"{filename[:30]:30s} [{bar}] {pct:3d}%  "
+                    f"{done_mb:6.1f}/{total_mb:6.1f}MB  "
+                    f"{dl.last_speed_mbps:5.1f}MB/s  {eta_str}"
+                )
+            else:
+                lines.append(f"{filename[:30]:30s} [░░░░░░░░░░░░░░░░░░░░]  --   connecting...")
+        # Footer: overall throughput + queue preview summary
+        queued = sum(1 for _, s in self.queue_preview if s == "queued")
+        resume = sum(1 for _, s in self.queue_preview if s == "resume")
+        existing = sum(1 for _, s in self.queue_preview if s == "exists")
+        lines.append(
+            f"[dim]Overall: {overall_speed_mb:.1f} MB/s  |  "
+            f"queue: {queued}  resume: {resume}  done: {existing}  |  "
+            f"bytes: {self.stats.bytes_downloaded/(1024*1024):.1f}MB[/]"
+        )
+        panel.update("\n".join(lines))
+        try:
+            panel.refresh()
+        except Exception:
+            pass
 
     def update_downloads_table(self):
         """Update the active downloads table.
@@ -1416,9 +1491,18 @@ class TakeoutTUI(App):
                             if (now - last_update).total_seconds() >= 0.3:
                                 with self._lock:
                                     if filename in self.active_downloads:
-                                        self.active_downloads[filename].downloaded = downloaded
+                                        ad = self.active_downloads[filename]
+                                        ad.downloaded = downloaded
+                                        # Per-file speed: bytes since last tick / elapsed
+                                        tick_elapsed = (now - datetime.fromtimestamp(ad.last_tick_time)).total_seconds() if ad.last_tick_time else 0.3
+                                        if tick_elapsed > 0 and ad.last_tick_time:
+                                            tick_bytes = downloaded - ad.last_tick_bytes
+                                            ad.last_speed_mbps = (tick_bytes / tick_elapsed) / (1024 * 1024)
+                                        ad.last_tick_bytes = downloaded
+                                        ad.last_tick_time = now.timestamp()
                                 self.call_from_thread(self.update_downloads_table)
                                 self.call_from_thread(self.update_stats_display)
+                                self.call_from_thread(self.update_progress_display)
                                 last_update = now
 
                             # Verbose log milestones: every 10% or every ~25MB

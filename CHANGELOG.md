@@ -4,6 +4,32 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Docker `/opt` mount** — `docker-compose.yml` recursively binds host
+  `/opt` with `rslave` propagation so JuiceFS / encfs FUSE submounts
+  (e.g. `/srv/storage`) are visible inside the container instead of
+  showing as empty dirs. Settings persist on the `/downloads` volume
+  (`TAKEOUT_SETTINGS`) so they survive `docker compose run --rm`.
+- **Directory browser** in the TUI — a Browse button (and `b` key) opens a
+  modal `DirectoryPicker`: navigate the tree, type/paste a path, or go Up.
+  Symlinks resolve, so `./downloads/opt -> /opt` lands on the real target.
+  Navigation is optimistic + threaded with a loading overlay, so slow
+  JuiceFS / network mounts no longer freeze the UI or leave a stale header.
+- **Settings persistence** — output dir, file count, and parallelism are
+  saved on Start and restored on next launch. `ALLOWED_DIRS` env var lets
+  you whitelist extra output roots (e.g. a deep JuiceFS path).
+- **Paste routing** — the payload box is focused on launch, and an
+  app-level paste router catches right-click / `Ctrl+Shift+V` pastes from
+  anywhere (a common SSH+tmux problem where paste was swallowed by a
+  focused button) and drops them into the payload box.
+- **tmux-native refresh alert** — alongside the bell + title flash, the
+  cookie-expired alert renames the terminal/tmux window and emits BEL
+  through the raw PTY so tmux's `monitor-bell`/`monitor-activity` flags the
+  window in the status line even from another pane. (The audible bell
+  rarely survives Docker→tmux→SSH; the visual + tmux alerts are what
+  actually reach you.)
+
 ### Fixed
 
 - **Extension always reported "No cookie captured".** The MV3

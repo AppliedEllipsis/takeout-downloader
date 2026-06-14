@@ -74,12 +74,23 @@ class TakeoutTUI(App):
     #input-section {
         height: auto;
         padding: 1;
-        border: solid $primary;
+        border: round $primary;
         margin-bottom: 1;
     }
 
     #input-section.needs-refresh {
         border: heavy $error;
+    }
+
+    #settings-labels {
+        height: 1;
+    }
+
+    .field-label {
+        width: 1fr;
+        margin-right: 1;
+        color: $text-muted;
+        text-style: bold;
     }
 
     #curl-input {
@@ -114,16 +125,20 @@ class TakeoutTUI(App):
         text-style: bold;
     }
 
-    #stats-panel {
-        height: 3;
-        padding: 1;
-        background: $surface-darken-1;
+    #stats-section {
+        height: auto;
+        border: round $success;
         margin-bottom: 1;
+    }
+
+    #stats-panel {
+        height: 1;
+        padding: 0 1;
     }
 
     #downloads-section {
         height: 12;
-        border: solid $secondary;
+        border: round $secondary;
         margin-bottom: 1;
     }
 
@@ -133,7 +148,7 @@ class TakeoutTUI(App):
 
     #log-section {
         height: 1fr;
-        border: solid $accent;
+        border: round $accent;
     }
 
     Log {
@@ -175,12 +190,20 @@ class TakeoutTUI(App):
 
         with Container(id="main-container"):
             # Input section
-            with Vertical(id="input-section"):
+            with Vertical(id="input-section") as input_section:
+                input_section.border_title = "1 · Payload"
                 yield Label(
                     "[bold]Paste payload — JSON from the extension's "
                     "\"Copy as JSON\", or a cURL command:[/]"
                 )
                 yield TextArea(id="curl-input")
+
+                # Per-field labels so the meaning stays visible after the
+                # placeholder text is replaced by a value.
+                with Horizontal(id="settings-labels"):
+                    yield Label("Output directory", classes="field-label")
+                    yield Label("Max files (parts)", classes="field-label")
+                    yield Label(f"Parallel (1-{MAX_PARALLEL})", classes="field-label")
 
                 with Horizontal(id="settings-row"):
                     yield Input(value=DEFAULT_OUTPUT_DIR, placeholder="Output dir", id="output-input")
@@ -196,14 +219,18 @@ class TakeoutTUI(App):
             yield Static("", id="alert-panel")
 
             # Stats panel
-            yield Static("", id="stats-panel")
+            with Vertical(id="stats-section") as stats_section:
+                stats_section.border_title = "2 · Totals"
+                yield Static("", id="stats-panel")
 
             # Active downloads table
-            with Vertical(id="downloads-section"):
+            with Vertical(id="downloads-section") as downloads_section:
+                downloads_section.border_title = "3 · Active downloads"
                 yield DataTable(id="downloads-table")
 
             # Log section
-            with Vertical(id="log-section"):
+            with Vertical(id="log-section") as log_section:
+                log_section.border_title = "4 · Activity log"
                 yield Log(highlight=True)
 
         yield Footer()

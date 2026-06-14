@@ -369,6 +369,12 @@ class TakeoutTUI(App):
         # Remember the last run parameters so Resume can pick up where it left off
         self._last_file_count = DEFAULT_FILE_COUNT
         self._last_parallel = DEFAULT_PARALLEL
+        # Pre-download queue preview: list of (filename, status) where status
+        # is "queued", "exists" (already on disk, will skip), or "resume"
+        # (.downloading partial present). Populated after set_curl succeeds,
+        # before any worker thread starts. The downloads table shows it so
+        # the user sees what's coming.
+        self.queue_preview: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -489,6 +495,37 @@ class TakeoutTUI(App):
         box.focus()
         self.log_message(f"Pasted {len(text)} chars into the payload box")
         event.stop()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Auto-expand "." / "@file" in the payload box on every keystroke.
+
+        The user shouldn't have to hit Start just to load a payload file —
+        typing the dot alone is enough to materialize the JSON into the box
+        (and then they can still review/edit before Start). Anything beyond a
+        bare "." or "@<path>" is left alone (mid-typing is preserved).
+        """
+        try:
+            box = self.query_one("#curl-input", TextArea)
+        except Exception:
+            return
+        # Only the payload box drives this; ignore changes from any other
+        # TextArea (the picker has its own).
+        if event.text_area is not box:
+            return
+        text = box.text.strip()
+        if not text or text == "." or text.startswith("@"):
+            output_dir = self.query_one("#output-input", Input).value.strip() or DEFAULT_OUTPUT_DIR
+            loaded = self._read_payload_file(text, output_dir) if text else None
+            if loaded:
+                # Replace the dot/file-ref with the actual payload contents.
+                # `load_text` resets the cursor to the top; that's fine — the
+                # user usually wants to skim what was loaded.
+                box.load_text(loaded)
+                preview_chars = min(len(loaded), 80)
+                self.log_message(
+                    f"Auto-loaded {len(loaded)} chars from file into payload box "
+                    f"(preview: {loaded[:preview_chars]!r}{'...' if len(loaded) > 80 else ''})"
+                )
 
     def _restore_settings(self) -> None:
         """Pre-fill the input fields from the persisted settings file.
@@ -694,20 +731,108 @@ class TakeoutTUI(App):
         self.last_update_time = now
 
     def update_downloads_table(self):
-        """Update the active downloads table."""
+        """Update the active downloads table.
+
+        The table has two layers:
+          1. The queue preview (set by _build_queue_preview after payload
+             parse) — shows every expected file with its disposition:
+             • queued   — will be fetched
+             ↻ resume  — has a .downloading partial
+             ✓ exists  — already on disk, will be skipped
+             ✗ missing — 0-byte final file present (will retry)
+          2. Live progress overlay — when a file is actively downloading, its
+             row is replaced with a live progress / size / status. When it
+             finishes, the row stays visible (status -> "done" or "skipped").
+
+        This way the user always sees the full file list (what's coming, what
+        finished, what failed) instead of just the currently active workers.
+        """
         table = self.query_one("#downloads-table", DataTable)
         table.clear()
 
         with self._lock:
-            for filename, dl in self.active_downloads.items():
-                if dl.total > 0:
-                    percent = int((dl.downloaded / dl.total) * 100)
-                    progress = f"{percent}%"
-                    size_str = f"{dl.downloaded/(1024*1024):.1f}/{dl.total/(1024*1024):.1f} MB"
+            active = dict(self.active_downloads)
+
+        # Start with the queue preview (or an empty list if not built yet).
+        rows: list[tuple[str, str, str, str]] = []
+        for filename, status in self.queue_preview:
+            if status == "exists":
+                rows.append((filename, "✓", "on disk", "skip"))
+            elif status == "resume":
+                rows.append((filename, "↻", "partial", "resume"))
+            elif status == "missing":
+                rows.append((filename, "✗", "0 B", "MISSING"))
+            else:
+                rows.append((filename, "•", "—", "queued"))
+
+        # Overlay active downloads on top of the preview rows.
+        for filename, dl in active.items():
+            if dl.total > 0:
+                percent = int((dl.downloaded / dl.total) * 100)
+                progress = f"{percent}%"
+                size_str = f"{dl.downloaded/(1024*1024):.1f}/{dl.total/(1024*1024):.1f} MB"
+            else:
+                progress = "..."
+                size_str = f"{dl.downloaded/(1024*1024):.1f} MB"
+            new_row = (filename, progress, size_str, dl.status)
+            replaced = False
+            for i, (fn, _, _, _) in enumerate(rows):
+                if fn == filename:
+                    rows[i] = new_row
+                    replaced = True
+                    break
+            if not replaced:
+                rows.append(new_row)
+
+        # Render
+        if not rows:
+            table.add_row("(no payload loaded yet — paste JSON or type '.' to load)", "", "", "")
+            return
+        for row in rows:
+            table.add_row(*row)
+        # Summary footer
+        if self.queue_preview:
+            queued = sum(1 for _, s in self.queue_preview if s == "queued")
+            resume = sum(1 for _, s in self.queue_preview if s == "resume")
+            existing = sum(1 for _, s in self.queue_preview if s == "exists")
+            table.add_row(
+                f"[{len(self.queue_preview)} files]",
+                "",
+                f"q:{queued} r:{resume} done:{existing}",
+                f"active:{len(active)}",
+            )
+
+    def _build_queue_preview(self, file_count: int) -> None:
+        """Populate self.queue_preview by inspecting the output directory.
+
+        For each file N in 1..file_count, determine whether:
+          - the final file is on disk and complete -> "exists" (skip)
+          - a .downloading partial exists         -> "resume"
+          - a .downloading partial exists but     -> "resume" (will restart if
+            server says 416 Range Not Satisfiable   from 0 on validation failure)
+          - nothing on disk                        -> "queued"
+        This is purely a *preview* — the engine's cleanup_bad_files still
+        re-validates before downloading.
+        """
+        if not self.downloader:
+            return
+        preview: list[tuple[str, str]] = []
+        for num in range(1, file_count + 1):
+            try:
+                filename = self.downloader.get_filename(num)
+                filepath = self.downloader.get_filepath(num)
+                temp = filepath.with_suffix(".downloading")
+                if filepath.exists() and filepath.stat().st_size > 0:
+                    preview.append((filename, "exists"))
+                elif temp.exists() and temp.stat().st_size > 0:
+                    preview.append((filename, "resume"))
+                elif filepath.exists():
+                    preview.append((filename, "missing"))
                 else:
-                    progress = "..."
-                    size_str = f"{dl.downloaded/(1024*1024):.1f} MB"
-                table.add_row(filename, progress, size_str, dl.status)
+                    preview.append((filename, "queued"))
+            except Exception as e:  # invalid filename, etc. — don't crash preview
+                preview.append((f"file #{num}", f"error: {e}"))
+        self.queue_preview = preview
 
     # ------------------------------------------------------------------------
     # Actions / buttons
@@ -922,6 +1047,24 @@ class TakeoutTUI(App):
         verb = "Resuming" if was_refreshing else "Starting"
         self.log_message(f"{verb}: {file_count} files, {parallel} parallel (cookie {cookie_chars} chars)")
         self.log_message(f"Output: {output_dir}")
+
+        # Build the queue preview NOW (after set_curl, before clearing state)
+        # so the user sees what's queued / resumable / already done before
+        # any worker thread fires. This populates the downloads table with
+        # the full expected file list.
+        try:
+            self._build_queue_preview(file_count)
+            queued = sum(1 for _, s in self.queue_preview if s == "queued")
+            resume = sum(1 for _, s in self.queue_preview if s == "resume")
+            existing = sum(1 for _, s in self.queue_preview if s == "exists")
+            self.log_message(
+                f"Queue: {queued} to download, {resume} to resume, "
+                f"{existing} already on disk (will skip)"
+            )
+            self.update_downloads_table()
+        except Exception as e:
+            # Preview is best-effort; downloads still proceed without it.
+            self.log_message(f"⚠ Could not build queue preview: {e}", "warning")
 
         # Reset run state. Preserve cumulative stats on resume so the user sees
         # total progress, but reset on a fresh start.

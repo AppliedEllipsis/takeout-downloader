@@ -141,9 +141,11 @@ services:
   #     echo '{...}' > downloads/in.json
   #     docker compose run --rm takeout-cli
   #
-  # Pass flags after the service name. With equals signs use a space:
+  # Pass flags after the service name. NOTE: use SPACE not = with --out:
   #   docker compose run --rm takeout-cli --out /opt/storage/...
-  # With equals signs Docker Compose may strip them; use space separator.
+  # If you use --out=/path the equals sign confuses Docker Compose/runc
+  # into thinking --out is an executable. Space is required.
+  # Alternatively, set OUTPUT_DIR in .env to avoid the flag entirely.
   takeout-cli:
     build: .
     image: takeout-downloader:latest

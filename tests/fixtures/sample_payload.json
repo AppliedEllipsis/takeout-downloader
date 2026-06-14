@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "captured_at": "2026-06-14T07:45:02.413Z",
+  "source": "extension",
+  "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=4&user=853339084521&authuser=3",
+  "method": "GET",
+  "headers": {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://takeout.google.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+  },
+  "cookie": "SID=PLACEHOLDER; __Secure-1PSID=PLACEHOLDER; HSID=PLACEHOLDER; SSID=PLACEHOLDER; APISID=PLACEHOLDER; SAPISID=PLACEHOLDER"
+}

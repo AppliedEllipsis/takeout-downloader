@@ -122,6 +122,143 @@ download, right-click the request to
 `takeout-download.usercontent.google.com` → **Copy as cURL** (bash or
 PowerShell), and paste that into the same box.
 
+## Commands
+
+Every command you'll actually run, in one place. **CLI** is the
+recommended path; **TUI** is opt-in for users with a local terminal.
+
+### Setup (one-time per machine)
+
+```bash
+# Install Python deps for native (non-Docker) usage.
+pip install -r requirements.txt
+
+# Optional but recommended: install aria2c for the CLI's high-speed backend.
+# Debian/Ubuntu:  apt install aria2
+# macOS:          brew install aria2
+```
+
+### Load the browser extension (one-time per browser)
+
+`chrome://extensions` (or `edge://extensions`) → enable **Developer
+mode** → **Load unpacked** → select the `helpers/` folder. Pin the
+extension to the toolbar so you can see the popup.
+
+### Capture a JSON payload (every download)
+
+1. [takeout.google.com](https://takeout.google.com) → **Manage exports**.
+2. Click **Download** on any part. Let the request fire (so the redirect
+   to `takeout-download.usercontent.google.com` completes), then cancel
+   the browser download.
+3. Click the extension icon → **Copy as JSON**.
+4. Paste into your terminal (CLI) or the TUI's payload box.
+
+### CLI — native Python (no Docker)
+
+```bash
+# Paste the JSON at the prompt, then Enter.
+python takeout_cli.py
+
+# Or pipe a saved file:
+python takeout_cli.py < in.json
+
+# Or point at a file explicitly:
+PAYLOAD_FILE=./in.json python takeout_cli.py
+```
+
+Useful flags:
+
+```bash
+python takeout_cli.py -p 5          # 5 concurrent downloads (aria2c -j 5)
+python takeout_cli.py --max-parts 200  # cap discovery at 200 parts
+python takeout_cli.py --output-dir /srv/storage/google-takeout/me
+```
+
+Useful env vars (also accept from `.env`):
+
+| var | default | what |
+|-----|---------|------|
+| `OUTPUT_DIR` | auto (JuiceFS if present, else `./downloads`) | where archives land |
+| `PARALLEL_DOWNLOADS` | `3` | concurrent downloads |
+| `MAX_PARTS` | `500` | discovery safety cap |
+| `MAX_AUTH_REPROMPTS` | `5` | fresh-cookie prompts before giving up |
+| `TAKEOUT_LOG_FILE` | `<output>/takeout_cli.log` | log file path |
+| `TAKEOUT_LOG_MAX_BYTES` | `512000` | rotate log at this size |
+| `TAKEOUT_LOG_BACKUP_COUNT` | `3` | keep N rotated backups |
+| `NO_COLOR` | unset | disable ANSI colours |
+
+After a run, parse the log:
+
+```bash
+python takeout_cli_analyze.py downloads/takeout_cli.log
+python takeout_cli_analyze.py downloads/takeout_cli.log --json
+python takeout_cli_analyze.py downloads/takeout_cli.log --last=30
+python takeout_cli_analyze.py downloads/takeout_cli.log --follow
+```
+
+### CLI — Docker (recommended for SSH→tmux→Docker)
+
+```bash
+docker compose build                       # one-time per machine
+docker compose run --rm takeout-cli        # paste the JSON at the prompt
+
+# Or pipe a file from the host:
+echo '<paste your JSON here>' > downloads/in.json
+docker compose run --rm takeout-cli < downloads/in.json
+```
+
+The container mounts:
+
+- `./downloads` → `/downloads` (default output + resume state)
+- `./drop` → `/downloads/drop` (drop box)
+- `.` → `/work` (your project folder)
+- `/opt` → `/opt` (recursive bind, JuiceFS submounts visible)
+
+### TUI — native Python
+
+```bash
+python takeout.py
+```
+
+The TUI's payload box is focused on launch. If paste doesn't work (SSH
+→ tmux + bracketed-paste markers get stripped), drop a file into the
+output dir as `in.json`, `payload.json`, or `curl.txt` and type a
+single `.` in the payload box.
+
+### TUI — Docker (opt-in)
+
+The TUI service is hidden behind the `tui` profile because it needs a
+real terminal and Textual's paste/redraw is fragile over SSH.
+
+```bash
+docker compose --profile tui run --rm takeout
+```
+
+Same volumes and outputs as the CLI container.
+
+### Inspecting logs
+
+```bash
+# Live-tail the CLI's log from another SSH window:
+tail -f downloads/takeout_cli.log
+
+# Live-tail the TUI's log:
+tail -f downloads/takeout.log
+
+# Structured summary (CLI only):
+python takeout_cli_analyze.py downloads/takeout_cli.log
+```
+
+### Reset / wipe state
+
+```bash
+# Remove a partial download and start fresh:
+rm downloads/*.downloading
+
+# Wipe everything (downloads + state + logs):
+rm -rf downloads/*
+```
+
 ## The JSON payload
 
 The extension produces a self-contained, inspectable payload — you can
@@ -203,14 +340,16 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 
 ```
 ├── takeout.py                # Core engine: parsing, download, resume, integrity
-├── google_takeout_tui.py     # Textual terminal UI (the only interface)
+├── google_takeout_tui.py     # Textual TUI (opt-in, profile `tui`)
+├── takeout_cli.py            # Terminal-only CLI (default service)
+├── takeout_cli_analyze.py    # Offline log analyzer for takeout_cli
 ├── takeout_payload.py        # JSON payload schema shared with the extension
 ├── aria2c_integration.py     # Optional aria2c RPC backend
 ├── dedupe_takeout.py         # Deduplicate downloaded archives by hash
 ├── build.py                  # PyInstaller single-binary build
-├── Dockerfile                # Self-contained TUI image (Python deps + aria2c)
+├── Dockerfile                # Self-contained image (Python deps + aria2c)
 ├── docker-compose.yml        # `docker compose run --rm takeout-cli`
-│                             # (`takeout` is the TUI service, profile `tui`)
+│                             # (`takeout` is the TUI, profile `tui`)
 ├── requirements.txt          # Python dependencies
 └── helpers/                  # Browser extension (Chromium MV3)
     ├── manifest.json

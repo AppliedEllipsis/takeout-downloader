@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI service failed at startup with `can't open file
+  '/app/takeout_cli.py'`.** The Dockerfile was written when the project
+  was TUI-only; `takeout_cli.py` and `takeout_cli_analyze.py` were not in
+  the `COPY` list. Added both. Also relaxed `ENTRYPOINT` from
+  `python takeout.py` to plain `python` so per-service `command:` cleanly
+  selects the script.
+
 ### Changed
 
 - **TUI is opt-in via Docker profile.** The TUI service (`takeout`) now

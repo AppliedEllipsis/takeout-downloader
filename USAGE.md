@@ -17,14 +17,15 @@ network between the browser and the TUI.
 3. [Install the browser extension](#3-install-the-browser-extension)
 4. [Create a Takeout export](#4-create-a-takeout-export)
 5. [Capture a payload](#5-capture-a-payload)
-6. [Run the TUI](#6-run-the-tui)
-7. [Cookie expiry and the refresh alert](#7-cookie-expiry-and-the-refresh-alert)
-8. [cURL fallback (no extension)](#8-curl-fallback-no-extension)
-9. [aria2c integration](#9-aria2c-integration)
-10. [Deduplication](#10-deduplication)
-11. [Configuration reference](#11-configuration-reference)
-12. [Troubleshooting](#12-troubleshooting)
-13. [After the download: processing photo archives](#13-after-the-download-processing-photo-archives)
+6. [Run the CLI](#6-run-the-cli)  ← recommended
+7. [Run the TUI (opt-in)](#7-run-the-tui-opt-in)
+8. [Cookie expiry and the refresh alert](#8-cookie-expiry-and-the-refresh-alert)
+9. [cURL fallback (no extension)](#9-curl-fallback-no-extension)
+10. [aria2c integration](#10-aria2c-integration)
+11. [Deduplication](#11-deduplication)
+12. [Configuration reference](#12-configuration-reference)
+13. [Troubleshooting](#13-troubleshooting)
+14. [After the download: processing photo archives](#14-after-the-download-processing-photo-archives)
 
 ---
 
@@ -167,35 +168,140 @@ The JSON looks like this (cookie shown truncated):
 
 ---
 
-## 6. Run the TUI
+## 6. Run the CLI
+
+The CLI is the recommended entrypoint — it works reliably over
+SSH → tmux → Docker chains and uses aria2c's native progress display.
+
+### Native
+
+```bash
+python takeout_cli.py
+```
+
+You'll see:
+
+```
+==========================================
+  Google Takeout Downloader — paste, go.
+==========================================
+
+Paste the JSON payload from the browser extension.
+  (Right-click in terminal -> Paste, then press Enter.)
+  The reader detects when the JSON is complete automatically.
+  Press Ctrl-C to quit.
+```
+
+Right-click in the terminal, choose **Paste**, press **Enter**. The
+reader auto-detects when the JSON is complete (brace-balance scan,
+string-aware) so you don't need Ctrl-D.
+
+The CLI then:
+
+1. **Discovers** all parts (numbered ZIPs) via 1-byte Range probes —
+   this also validates auth up front.
+2. **Downloads** with aria2c, native console progress (speed/ETA/total).
+3. **Verifies** each part: size matches the probe + ZIP EOCD signature.
+4. **Resumes** partials with aria2c's `-c` flag.
+5. **Re-prompts** for a fresh JSON if the cookie dies mid-run.
+
+### Docker
+
+```bash
+docker compose build                  # one-time
+docker compose run --rm takeout-cli   # paste the JSON at the prompt
+```
+
+Or pipe a file from the host (handy for scripting):
+
+```bash
+echo '<paste your JSON here>' > downloads/in.json
+docker compose run --rm takeout-cli < downloads/in.json
+```
+
+### Useful flags
+
+```bash
+python takeout_cli.py -p 5              # 5 concurrent downloads
+python takeout_cli.py --max-parts 200   # cap discovery at 200 parts
+python takeout_cli.py --output-dir /srv/storage/google-takeout/me
+```
+
+### Useful env vars
+
+| var | default | what |
+|-----|---------|------|
+| `OUTPUT_DIR` | auto (JuiceFS if present, else `./downloads`) | where archives land |
+| `PARALLEL_DOWNLOADS` | `3` | concurrent downloads (`-j` to aria2c) |
+| `MAX_PARTS` | `500` | discovery safety cap |
+| `MAX_AUTH_REPROMPTS` | `5` | fresh-cookie prompts before giving up |
+| `TAKEOUT_LOG_FILE` | `<output>/takeout_cli.log` | log file path |
+| `TAKEOUT_LOG_MAX_BYTES` | `512000` | rotate log at this size |
+| `TAKEOUT_LOG_BACKUP_COUNT` | `3` | keep N rotated backups |
+| `NO_COLOR` | unset | disable ANSI colours |
+
+### After a run
+
+```bash
+# Structured summary
+python takeout_cli_analyze.py downloads/takeout_cli.log
+
+# Machine-readable
+python takeout_cli_analyze.py downloads/takeout_cli.log --json
+
+# Live tail
+python takeout_cli_analyze.py downloads/takeout_cli.log --follow
+```
+
+---
+
+## 7. Run the TUI (opt-in)
+
+The TUI is opt-in because Textual's paste/redraw is fragile over SSH
+→ tmux → Docker. Use it only on a local terminal.
+
+### Native
 
 ```bash
 python takeout.py
 ```
 
-1. Paste the JSON payload into the big text area at the top.
-2. Set the output directory, max files, and parallel count.
-3. Click **▶ Start** (or press `S`).
+The TUI's payload box is focused on launch. If paste doesn't work
+(bracketed-paste markers get stripped over SSH+tmux+bracketed-paste),
+drop a file into the output dir as `in.json`, `payload.json`, or
+`curl.txt` and type a single `.` in the payload box.
 
-The TUI shows a live table of active downloads, a stats line (done / failed /
-skipped / MB / speed), and a scrolling log.
+### Docker
 
-Keys: `S` start · `X` stop · `C` clear log · `Q` quit.
+```bash
+docker compose --profile tui run --rm takeout
+```
 
-Settings:
-
-| Field | Meaning | Default |
-|-------|---------|---------|
-| Output dir | Where parts are saved (must be under cwd, home, `/opt/`, `/downloads/`, `/tmp/`) | `./downloads` |
-| Max files | Highest part number to try (stops early on the first 404) | `100` |
-| Parallel | Concurrent downloads, 1–20 | `1` |
-
----
-
-## 7. Cookie expiry and the refresh alert
+## 8. Cookie expiry and the refresh alert
 
 Google sessions for Takeout downloads expire fast — often after ~5–7 parts
-(~10–15 GB). When that happens mid-run, the TUI:
+(~10–15 GB). When that happens mid-run:
+
+### CLI behavior
+
+The CLI's discovery probe is also its auth check — if Google returns a
+signin page (302 → `accounts.google.com` → HTML) on any probe, the CLI
+prints a re-prompt:
+
+```
+[ERROR] Auth failed during discovery (redirected to accounts.google.com).
+[INFO]  Re-capture in your browser, then paste the new JSON below.
+```
+
+You right-click in the terminal → Paste the fresh JSON → Enter. The CLI
+returns to discovery, finds the parts that aren't fully downloaded yet,
+and aria2c resumes the partials with `-c`. If auth keeps failing,
+after `MAX_AUTH_REPROMPTS` (default 5) the CLI exits cleanly so the
+session isn't burned.
+
+### TUI behavior
+
+When the cookie dies, the TUI:
 
 - **Rings the terminal bell** (audible) every 5 seconds.
 - **Flashes the title bar** between the normal title and
@@ -218,7 +324,7 @@ Press `X` (Stop) during a refresh alert to silence it and abandon the run.
 
 ---
 
-## 8. cURL fallback (no extension)
+## 9. cURL fallback (no extension)
 
 If you can't install the extension (Safari, locked-down browser), paste a
 cURL command instead — the TUI auto-detects JSON vs cURL.
@@ -234,7 +340,7 @@ known-good defaults, since pasted cURL often strips them.
 
 ---
 
-## 9. aria2c integration
+## 10. aria2c integration
 
 For maximum throughput, install aria2c:
 
@@ -252,7 +358,7 @@ When `aria2c` is on your PATH, the TUI reports it as available on startup.
 
 ---
 
-## 10. Deduplication
+## 11. Deduplication
 
 After downloading and extracting, `dedupe_takeout.py` finds and collapses
 duplicate files (common across overlapping Takeout exports):
@@ -263,23 +369,47 @@ python dedupe_takeout.py --help
 
 ---
 
-## 11. Configuration reference
+## 12. Configuration reference
 
-The TUI reads a few values from the environment (or a local `.env`, loaded
-automatically if `python-dotenv` is installed). All are optional.
+Both the CLI and the TUI read values from the environment (or a local
+`.env`, loaded automatically if `python-dotenv` is installed). All are
+optional.
+
+### Shared
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `OUTPUT_DIR` | Default output directory | `./downloads` |
-| `PARALLEL_DOWNLOADS` | Default parallel count (1–20) | `1` |
-| `FILE_COUNT` | Default max part count (1–1000) | `100` |
+| `OUTPUT_DIR` | Default output directory | `./downloads` (or JuiceFS path if present) |
+| `PARALLEL_DOWNLOADS` | Concurrent downloads | CLI: `3`, TUI: `1` |
 | `MAX_RETRIES` | Retries per part on transient errors | `6` |
 | `RETRY_BACKOFF` | Exponential backoff base seconds | `2.0` |
 | `RETRY_MAX_WAIT` | Cap on a single backoff sleep (seconds) | `120.0` |
 
+### CLI only
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `MAX_PARTS` | Discovery safety cap | `500` |
+| `MAX_AUTH_REPROMPTS` | Fresh-cookie prompts before giving up | `5` |
+| `TAKEOUT_LOG_FILE` | Log file path | `<output>/takeout_cli.log` |
+| `TAKEOUT_LOG_MAX_BYTES` | Rotate log at this size | `512000` |
+| `TAKEOUT_LOG_BACKUP_COUNT` | Keep N rotated backups | `3` |
+| `NO_COLOR` | Disable ANSI colours | unset |
+
+### TUI only
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `FILE_COUNT` | Default max part count (1–1000) | `100` |
+| `TAKEOUT_SETTINGS` | Path to settings JSON | `~/.takeout_downloader.json` |
+| `TAKEOUT_LOG_FILE` | Mirror log lines to this file | `./takeout.log` |
+| `ALLOWED_DIRS` | Extra allowed output roots (`:`-separated) | unset |
+
+### Retry behaviour (both)
+
 Retries use exponential backoff with **full jitter** (a random wait between 0
 and the capped exponential) so parallel workers don't retry in lockstep and
-hammer Google at the same instant. On HTTP `429`/`503` the TUI honours the
+hammer Google at the same instant. On HTTP `429`/`503` both UIs honour the
 `Retry-After` header when present.
 
 Output directories are restricted to the current working directory, your home
@@ -287,29 +417,58 @@ directory, `/opt/`, `/downloads/`, and `/tmp/` to prevent path traversal.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
+
+**CLI: `python: can't open file '/app/takeout_cli.py': [Errno 2] No such file`**
+The Docker image you're running is stale. The Dockerfile didn't include
+`takeout_cli.py` until recently — rebuild:
+
+```bash
+docker compose build --no-cache takeout-cli   # full rebuild
+# or just:
+docker compose build
+```
+
+**TUI: `docker compose run --rm takeout` exits silently with no output**
+The TUI service is behind the `--profile tui` profile now. Run:
+
+```bash
+docker compose --profile tui run --rm takeout
+```
 
 **Every download saves an HTML file instead of a zip.**
 The cookie was captured pre-redirect (wrong host). Re-capture from a request
 to `takeout-download.usercontent.google.com`. The extension flags this for you.
 
 **Downloads stop after a handful of files.**
-Normal — the session expired. Watch for the bell + title flash, re-capture,
-paste, and Resume.
+Normal — the session expired.
+
+- **CLI**: re-prompts for a fresh JSON. Paste it, Enter, it resumes.
+- **TUI**: watch for the bell + title flash, re-capture, paste, click ▶ Resume.
 
 **"Cookie doesn't contain any known Google session markers."**
 The payload's cookie is missing `__Secure-1PSID` / `SID` etc. You captured the
 wrong request. Click Download again and re-capture.
 
 **"Output directory is outside allowed directories."**
-Choose a path under cwd, home, `/opt/`, `/downloads/`, or `/tmp/`.
+Choose a path under cwd, home, `/opt/`, `/downloads/`, or `/tmp/`. The CLI
+falls back to `./downloads` automatically; the TUI shows an error toast.
 
 **aria2c rejects the download / returns errors with high `-x`.**
-Use `-x 1 -s 1 -c`. Google blocks multi-stream Takeout downloads.
+Use `-x 1 -s 1 -c`. Google blocks multi-stream Takeout downloads. The CLI
+already passes these flags.
 
 **The bell doesn't make a sound.**
 Some terminals map the bell to a silent visual flash. The title-bar flash and
 red alert panel still fire regardless. Check your terminal's bell settings.
+
+**CLI: paste doesn't seem to do anything when I right-click in tmux.**
+SSH + tmux + Docker strips bracketed-paste markers. Workarounds:
+
+1. Use `--output-dir` and pipe a file: `python takeout_cli.py < in.json`
+2. Drop the JSON in the output dir as `in.json` and run the CLI normally —
+   the prompt will read it from disk
+3. Use `PAYLOAD_FILE=./in.json python takeout_cli.py`
 
 **Downloads fail immediately with 403/401 even right after a fresh capture.**
 Two different expiries are at play. The *session cookie* expires fast (minutes
@@ -321,7 +480,7 @@ documented by `tarballz/mass-takeout-downloader`.)
 
 ---
 
-## 13. After the download: processing photo archives
+## 14. After the download: processing photo archives
 
 This tool gets the `.zip`/`.tgz` parts onto disk. If your export is **Google
 Photos**, the extracted archive needs post-processing — Google stores each

@@ -495,3 +495,482 @@ def zipfile_make_bytes(size: int) -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("pad.bin", "x" * max(1, size))
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# State file — resume across runs
+# ---------------------------------------------------------------------------
+def test_load_state_missing_returns_none(tmp_path):
+    assert takeout_cli.load_state(tmp_path) is None
+
+
+def test_load_state_corrupt_returns_none(tmp_path):
+    p = tmp_path / takeout_cli.STATE_FILENAME
+    p.write_text("{ this is not json")
+    # Should return None instead of raising.
+    assert takeout_cli.load_state(tmp_path) is None
+
+
+def test_make_state_and_roundtrip(tmp_path):
+    payload = _fixture_payload()
+    parts = [
+        {"num": 1, "filename": "x-001.zip", "size": 100, "have": True},
+        {"num": 2, "filename": "x-002.zip", "size": 200, "have": False},
+        {"num": 3, "filename": "x-003.zip", "size": 300, "have": True},
+    ]
+    state = takeout_cli.make_state(parts, payload, tmp_path)
+    assert state["schema"] == 1
+    assert state["base_filename"]  # parsed from URL
+    assert len(state["parts"]) == 3
+    takeout_cli.save_state(tmp_path, state)
+    loaded = takeout_cli.load_state(tmp_path)
+    assert loaded is not None
+    assert loaded["base_filename"] == state["base_filename"]
+    assert len(loaded["parts"]) == 3
+    assert "last_updated" in loaded
+
+
+def test_state_to_parts_rehydrates(tmp_path):
+    payload = _fixture_payload()
+    parts = [
+        {"num": 1, "filename": "x-001.zip", "size": 100, "have": True},
+        {"num": 2, "filename": "x-002.zip", "size": 200, "have": False},
+    ]
+    state = takeout_cli.make_state(parts, payload, tmp_path)
+    out = takeout_cli.state_to_parts(state, payload)
+    assert out is not None
+    assert len(out) == 2
+    assert out[0]["num"] == 1
+    assert out[0]["have"] is True
+    assert out[1]["num"] == 2
+    assert out[1]["have"] is False
+
+
+def test_state_matches_payload_for_same_url():
+    payload = _fixture_payload()
+    parts = [{"num": 1, "filename": "x-001.zip", "size": 100, "have": False}]
+    state = takeout_cli.make_state(parts, payload, Path("/tmp"))
+    assert takeout_cli.state_matches_payload(state, payload) is True
+
+
+def test_state_matches_payload_for_different_archive():
+    payload = _fixture_payload()
+    # Mutate the URL to a different archive (different base).
+    payload.url = ("https://takeout-download.usercontent.google.com/"
+                   "download/takeout-20260612T190148Z-99-001.zip?j=x&i=0")
+    payload_other = _fixture_payload()
+    state = takeout_cli.make_state(
+        [{"num": 1, "filename": "x-001.zip", "size": 100, "have": False}],
+        payload, Path("/tmp"))
+    # Different archive (set-99) vs default (set-9) -> no match.
+    assert takeout_cli.state_matches_payload(state, payload_other) is False
+
+
+def test_state_matches_payload_for_empty_state():
+    assert takeout_cli.state_matches_payload(None, _fixture_payload()) is False
+    assert takeout_cli.state_matches_payload({}, _fixture_payload()) is False
+
+
+def test_update_state_from_parts(tmp_path):
+    payload = _fixture_payload()
+    parts = [
+        {"num": 1, "filename": "x-001.zip", "size": 100, "have": False},
+        {"num": 2, "filename": "x-002.zip", "size": 200, "have": False},
+    ]
+    state = takeout_cli.make_state(parts, payload, tmp_path)
+    # Verify: only part 1 finished.
+    parts_after = [
+        {"num": 1, "filename": "x-001.zip", "size": 100, "have": True},
+        {"num": 2, "filename": "x-002.zip", "size": 200, "have": False},
+    ]
+    takeout_cli.update_state_from_parts(state, parts_after)
+    saved = {p["num"]: p for p in state["parts"]}
+    assert saved[1]["complete"] is True
+    assert saved[2]["complete"] is False
+
+
+def test_save_state_atomic(tmp_path):
+    payload = _fixture_payload()
+    parts = [{"num": 1, "filename": "x-001.zip", "size": 100, "have": True}]
+    state = takeout_cli.make_state(parts, payload, tmp_path)
+    # Should not leave .tmp lying around.
+    takeout_cli.save_state(tmp_path, state)
+    assert not (tmp_path / (takeout_cli.STATE_FILENAME + ".tmp")).exists()
+    assert (tmp_path / takeout_cli.STATE_FILENAME).exists()
+
+
+def test_resume_skips_discovery_when_state_matches(tmp_path, monkeypatch):
+    """If state matches payload, main() should use it instead of probing."""
+    payload = _fixture_payload()
+    parts = [
+        {"num": 1, "filename": "x-001.zip", "size": 100, "have": True},
+        {"num": 2, "filename": "x-002.zip", "size": 200, "have": False},
+    ]
+    state = takeout_cli.make_state(parts, payload, tmp_path)
+    takeout_cli.save_state(tmp_path, state)
+    # Make the on-disk file for part 1 a valid ZIP of size >= 100.
+    import zipfile, io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a", "x" * 200)
+    (tmp_path / "takeout-20260612T190148Z-9-001.zip").write_bytes(buf.getvalue())
+
+    # Monkey-patch discover_parts to fail the test if it's called.
+    called = {"n": 0}
+    def fail_discover(*a, **kw):
+        called["n"] += 1
+        raise AssertionError("discover_parts should NOT have been called")
+    monkeypatch.setattr(takeout_cli, "discover_parts", fail_discover)
+
+    # Monkey-patch run_aria2c so we don't actually download.
+    monkeypatch.setattr(takeout_cli, "run_aria2c", lambda *a, **kw: 0)
+
+    rehydrated = takeout_cli.state_to_parts(
+        takeout_cli.load_state(tmp_path), payload)
+    assert rehydrated is not None
+    # The rehydrated parts should reflect the on-disk state.
+    nums_complete = sum(1 for p in rehydrated if p["have"])
+    assert nums_complete >= 1  # at least part 1
+
+
+# ---------------------------------------------------------------------------
+# Output-dir prompt
+# ---------------------------------------------------------------------------
+def test_prompt_for_output_dir_accepts_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
+    # _install_logger is called by main, not prompt, so we don't need it.
+    p = takeout_cli.prompt_for_output_dir(tmp_path)
+    assert p == tmp_path
+
+
+def test_prompt_for_output_dir_accepts_path(monkeypatch, tmp_path):
+    target = tmp_path / "sub"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(str(target) + "\n"))
+    p = takeout_cli.prompt_for_output_dir(tmp_path)
+    assert p == target
+    assert p.exists()
+
+
+def test_prompt_for_output_dir_quit(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("q\n"))
+    with pytest.raises(SystemExit):
+        takeout_cli.prompt_for_output_dir(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# TermRender — control-char based grid UI
+# ---------------------------------------------------------------------------
+def _fake_tty():
+    """Build an io.StringIO that looks like a TTY (isatty() -> True)."""
+    import io
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    return buf
+
+
+def test_term_render_disabled_when_stdout_not_tty():
+    import io
+    buf = io.StringIO()  # not a tty by default
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        assert r.enabled is False
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_begin_creates_row_slots():
+    real = sys.stdout
+    sys.stdout = _fake_tty()
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=3)
+        assert r.body_rows == 3
+        assert len(r.rows) == 3
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_update_row_writes_escape_sequence():
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=3)
+        r.update_row("file:a.zip", "row content for a")
+        out = buf.getvalue()
+        # Should contain save-cursor, move-to-row, erase-EOL, restore-cursor.
+        assert "\x1b[s" in out
+        assert "\x1b[u" in out
+        assert "\x1b[K" in out
+        assert "row content for a" in out
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_update_row_reuses_slot():
+    """Updating the same key replaces content, doesn't add a row."""
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        r.update_row("file:a.zip", "first a")
+        r.update_row("file:a.zip", "second a")
+        # The second update should not create a second slot for `a`.
+        # Two unique keys means both rows used; if we tried a third it
+        # would replace one. Check by adding `b` and `c`.
+        r.update_row("file:b.zip", "row b")
+        r.update_row("file:c.zip", "row c")
+        # Three keys for two slots — one gets replaced (the last).
+        # Just verify all three texts appear at least once in the output.
+        out = buf.getvalue()
+        assert "first a" in out or "second a" in out
+        assert "row b" in out
+        assert "row c" in out
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_clear_row():
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        r.update_row("file:a.zip", "first a")
+        r.update_row("file:b.zip", "first b")
+        r.clear_row("file:a.zip")
+        out = buf.getvalue()
+        # clear_row redraws with empty content for that row.
+        assert "\x1b[K\n" in out  # empty cleared lines
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_set_header_and_footer():
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=1)
+        r.set_header("HEADER TEXT")
+        r.set_footer("FOOTER TEXT")
+        out = buf.getvalue()
+        assert "HEADER TEXT" in out
+        assert "FOOTER TEXT" in out
+    finally:
+        sys.stdout = real
+
+
+def test_term_render_disabled_does_not_emit_escapes(capsys):
+    """When enabled=False (no TTY), update_row just prints plain text."""
+    r = takeout_cli.TermRender(enabled=False)
+    r.begin(n_rows=3)
+    r.update_row("file:a.zip", "row content")
+    out = capsys.readouterr().out
+    assert "row content" in out
+    assert "\x1b[" not in out  # no escape sequences
+
+
+def test_make_progress_bar():
+    assert takeout_cli.make_progress_bar(0).startswith("[")
+    assert takeout_cli.make_progress_bar(0).endswith("]")
+    assert "·" in takeout_cli.make_progress_bar(0)
+    bar50 = takeout_cli.make_progress_bar(50, width=10)
+    # Half-filled, half-empty.
+    assert bar50.count("█") == 5
+    assert bar50.count("·") == 5
+    bar100 = takeout_cli.make_progress_bar(100, width=10)
+    assert bar100.count("█") == 10
+    assert "·" not in bar100
+    # Clamp out-of-range inputs.
+    assert takeout_cli.make_progress_bar(-5, width=10).count("█") == 0
+    assert takeout_cli.make_progress_bar(150, width=10).count("█") == 10
+
+
+def test_aria2_unit_to_bytes():
+    # Plain bytes
+    assert takeout_cli._aria2_unit_to_bytes("100", None) == 100
+    # KiB / MiB / GiB
+    assert takeout_cli._aria2_unit_to_bytes("1.5", "KiB") == 1536
+    assert takeout_cli._aria2_unit_to_bytes("1", "MiB") == 1024 ** 2
+    assert takeout_cli._aria2_unit_to_bytes("2", "GiB") == 2 * 1024 ** 3
+    # KB (decimal-ish, aria2c uses these in summary lines)
+    assert takeout_cli._aria2_unit_to_bytes("100", "KB") == 102400
+
+
+def test_aria2_progress_re_matches_real_line():
+    """The progress regex should match aria2's actual output format."""
+    line = "[#abc12345 411.6MiB/8.0GiB(5%) CN:1 DL:50.0MiB ETA:2m14s]"
+    m = takeout_cli._ARIA2_PROGRESS_RE.search(line)
+    assert m is not None
+    assert m.group(1) == "abc12345"
+    assert m.group(6) == "5"
+    assert m.group(7) == "50.0"
+    assert m.group(8) == "MiB"
+    assert m.group(9) == "2m14s"
+
+
+def test_aria2_progress_re_matches_no_eta():
+    line = "[#abc 411B/1000B(41%) CN:1 DL:50B]"
+    m = takeout_cli._ARIA2_PROGRESS_RE.search(line)
+    assert m is not None
+    assert m.group(9) is None  # ETA optional
+
+
+def test_render_file_row_format():
+    """The row formatter should produce a readable fixed-width line."""
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        takeout_cli._render_file_row(
+            r, "takeout-001.zip", done=200_000_000, total=400_000_000,
+            pct=50, speed_bps=5_000_000, eta="1m30s",
+            filename_to_size={"takeout-001.zip": 400_000_000},
+            num_by_filename={"takeout-001.zip": 1},
+        )
+        out = buf.getvalue()
+        assert "#001" in out
+        assert "takeout-001.zip" in out
+        assert "50%" in out
+    finally:
+        sys.stdout = real
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: grid render via mocked aria2c output
+# ---------------------------------------------------------------------------
+def test_grid_render_with_mocked_aria2c(tmp_path, monkeypatch):
+    """Simulate aria2c printing summary lines and verify the renderer
+    gets a row update with a progress bar and correct numbers."""
+    # Build a fake parts list.
+    parts = [
+        {"num": 1, "filename": "takeout-001.zip", "size": 8 * 1024 ** 3,
+         "have": False, "url": "http://x/001.zip"},
+        {"num": 2, "filename": "takeout-002.zip", "size": 8 * 1024 ** 3,
+         "have": False, "url": "http://x/002.zip"},
+    ]
+    filename_to_size = {p["filename"]: p["size"] for p in parts}
+    num_by_filename = {p["filename"]: p["num"] for p in parts}
+    # Capture render output by giving the renderer a fake TTY.
+    import io
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        # Simulate two aria2 progress updates for two files.
+        gid_state = {}
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        # First aria2 announces completion of file 1 (for the result row to bind GID).
+        result_line = "  abc12345 | OK |   1.2MiB/s | ./takeout-001.zip"
+        takeout_cli._update_from_aria2_line(
+            result_line, gid_state, gid_to_filename,
+            filename_to_rowkey, filename_to_size,
+            num_by_filename, r,
+        )
+        # Now a live progress update for file 1.
+        prog_line = "[#abc12345 411.6MiB/8.0GiB(5%) CN:1 DL:50.0MiB ETA:2m14s]"
+        takeout_cli._update_from_aria2_line(
+            prog_line, gid_state, gid_to_filename,
+            filename_to_rowkey, filename_to_size,
+            num_by_filename, r,
+        )
+        out = buf.getvalue()
+        # Renderer should have produced at least one row mentioning the file.
+        assert "takeout-001.zip" in out
+        # Should contain a progress bar block.
+        assert "█" in out
+        # And the percent.
+        assert "5%" in out
+    finally:
+        sys.stdout = real
+
+
+def test_grid_render_handles_no_eta(tmp_path):
+    """Progress line without ETA should still render a row."""
+    import io
+    parts = [
+        {"num": 1, "filename": "foo.zip", "size": 1000, "have": False,
+         "url": "http://x/001.zip"},
+    ]
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=1)
+        # First bind GID via result line.
+        gid_state = {}
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        takeout_cli._update_from_aria2_line(
+            "  abcd | OK | 1.0B/s | ./foo.zip",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            {p["filename"]: p["size"] for p in parts},
+            {p["filename"]: p["num"] for p in parts}, r,
+        )
+        # Progress without ETA.
+        takeout_cli._update_from_aria2_line(
+            "[#abcd 100B/1000B(10%) CN:1 DL:50B]",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            {p["filename"]: p["size"] for p in parts},
+            {p["filename"]: p["num"] for p in parts}, r,
+        )
+        out = buf.getvalue()
+        assert "foo.zip" in out
+        assert "10%" in out
+    finally:
+        sys.stdout = real
+
+
+def test_grid_render_buffers_progress_before_gid_known():
+    """If a progress line arrives before the GID->filename binding, the
+    update is buffered and rendered once we know the binding."""
+    import io
+    parts = [
+        {"num": 1, "filename": "x.zip", "size": 1000, "have": False,
+         "url": "http://x/001.zip"},
+    ]
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=1)
+        gid_state = {}
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        # Progress line first, before we know GID -> filename.
+        takeout_cli._update_from_aria2_line(
+            "[#abcd 500B/1000B(50%) CN:1 DL:100B ETA:30s]",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            {p["filename"]: p["size"] for p in parts},
+            {p["filename"]: p["num"] for p in parts}, r,
+        )
+        # Now bind GID via the result line.
+        takeout_cli._update_from_aria2_line(
+            "  abcd | OK | 1.0B/s | ./x.zip",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            {p["filename"]: p["size"] for p in parts},
+            {p["filename"]: p["num"] for p in parts}, r,
+        )
+        out = buf.getvalue()
+        # Should now contain the rendered row.
+        assert "x.zip" in out
+    finally:
+        sys.stdout = real

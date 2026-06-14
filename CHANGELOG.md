@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Live grid UI in the CLI.** When stdout is a TTY, the CLI renders a
+  fixed-position grid of every part — progress bar + bytes + speed +
+  ETA + filename — using ANSI escape codes. Re-drawn in place on each
+  1s aria2c summary tick. No flicker (save/restore cursor around the
+  redraw). Falls back to plain line-printing when stdout is piped.
+  Disable with `NO_GRID=1`.
+- **Interactive output-directory prompt.** After parsing the JSON, the
+  CLI asks where to save (default = `OUTPUT_DIR` env). Validates the
+  path against the allowlist, creates it if missing, re-aims the log
+  file at the chosen folder. Skip the prompt with `--output-dir`.
+- **Per-folder resume state.** `takeout_state.json` is written in the
+  output directory after every verify pass. Stores URL pattern, full
+  part list with sizes, and per-part completion. On re-run, the CLI
+  loads state, re-verifies files on disk (a stale state with truncated
+  files won't lie), and resumes only the missing parts. State survives
+  Ctrl-C, Docker `--rm`, and reboots.
+- **98 tests passing** (up from 70). New coverage: TermRender grid,
+  aria2c output parser, prompt-for-output-dir, state save/load roundtrip,
+  resume logic, mocked end-to-end grid render.
+
 ### Fixed
 
 - **CLI service failed at startup with `can't open file

@@ -39,6 +39,7 @@ Environment
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -73,6 +74,7 @@ PROBE_TIMEOUT = (10, 30)
 CONSECUTIVE_404_STOP = 2
 ZIP_EOCD = b"PK\x05\x06"
 ZIP_EOCD_SCAN = 1024  # bytes to scan at end of file for the EOCD record
+STATE_FILENAME = "takeout_state.json"
 
 
 # ===========================================================================
@@ -88,6 +90,136 @@ def _c(code: str, text: str) -> str:
 
 
 log = logging.getLogger("takeout_cli")
+
+
+# ===========================================================================
+# Terminal renderer — control-char based grid UI
+# ===========================================================================
+class TermRender:
+    """Fixed-area terminal display with control-char redraws.
+
+    Owns a region of the screen starting at `start_row`. Every draw() call
+    clears the previous content with \\x1b[K (erase to EOL) on each line and
+    emits the new state. No flicker.
+
+    Header line: live status (downloads active, total done, ETA, throughput).
+    Body: one row per file, with progress bar + bytes + speed + ETA.
+    Footer: cumulative stats.
+
+    Falls back to plain line-printing when stdout is not a TTY (e.g. piped
+    to a file) so tests / logs aren't polluted with escape sequences.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled and sys.stdout.isatty()
+        self.start_row: int = 0
+        self.body_rows: int = 0
+        self.last_drawn_lines: int = 0
+        self.header: str = ""
+        self.rows: list[str] = []
+        self.footer: str = ""
+        # Track which file is on which row so we can keep redrawing.
+        self._row_keys: list[str] = []
+
+    def begin(self, n_rows: int) -> None:
+        """Reserve `n_rows` body rows. Call once after discovery."""
+        if not self.enabled:
+            return
+        self.body_rows = n_rows
+        self.rows = [""] * n_rows
+        self._row_keys = [""] * n_rows
+
+    def set_header(self, text: str) -> None:
+        self.header = text
+        self._redraw()
+
+    def set_footer(self, text: str) -> None:
+        self.footer = text
+        self._redraw()
+
+    def update_row(self, key: str, content: str) -> None:
+        """Update one row by key. Re-uses the same screen line across
+        redraws so the grid doesn't jump around when files change order."""
+        if not self.enabled:
+            # Non-TTY fallback: log to stdout, line by line.
+            print(content, flush=True)
+            return
+        try:
+            idx = self._row_keys.index(key)
+        except ValueError:
+            # Find first empty slot.
+            for i, k in enumerate(self._row_keys):
+                if not k:
+                    self._row_keys[i] = key
+                    idx = i
+                    break
+            else:
+                # All slots used; replace last row.
+                idx = self.body_rows - 1
+                self._row_keys[idx] = key
+        self.rows[idx] = content
+        self._redraw()
+
+    def clear_row(self, key: str) -> None:
+        """Blank out a row but keep its slot."""
+        if not self.enabled:
+            return
+        try:
+            idx = self._row_keys.index(key)
+        except ValueError:
+            return
+        self.rows[idx] = ""
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if not self.enabled:
+            return
+        out = []
+        # Save cursor, move to start_row, clear lines, write new content,
+        # restore cursor.
+        out.append("\x1b[s")                    # save cursor
+        out.append(f"\x1b[{self.start_row + 1};1H")  # move to start
+        out.append(self._format_line(self.header))
+        for row in self.rows:
+            out.append(self._format_line(row))
+        out.append(self._format_line(self.footer))
+        out.append("\x1b[u")                    # restore cursor
+        # Track height so the caller can position their prompt below us.
+        self.last_drawn_lines = 1 + self.body_rows + 1
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    @staticmethod
+    def _format_line(text: str) -> str:
+        # Erase to EOL, write text, then move to next line.
+        if not text:
+            return "\x1b[K\n"
+        return f"\x1b[K{text}\n"
+
+    def reserve_lines_below(self) -> int:
+        """After we're done redrawing, the cursor is somewhere inside our
+        region. Caller needs to scroll past us before printing more text.
+        Returns how many newlines are needed."""
+        if not self.enabled:
+            return 0
+        sys.stdout.write("\n" * (1 + self.body_rows + 1))
+        sys.stdout.flush()
+        return 1 + self.body_rows + 1
+
+    def teardown(self) -> None:
+        """Move the cursor below our region so subsequent logs don't overwrite."""
+        self.reserve_lines_below()
+
+
+def make_progress_bar(pct: float, width: int = 24) -> str:
+    """Build a unicode block progress bar. width is total char count."""
+    if pct < 0:
+        pct = 0
+    if pct > 100:
+        pct = 100
+    filled = int(round(width * pct / 100))
+    empty = width - filled
+    return "[" + "█" * filled + "·" * empty + "]"
 
 
 def info(msg: str) -> None:
@@ -179,6 +311,152 @@ def resolve_output_dir() -> Path:
         d = Path("./downloads").resolve()
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def prompt_for_output_dir(default: Path) -> Path:
+    """Ask the user where to save archives. Empty input keeps the default.
+    Type 'q' to quit. Anything else is treated as a path and validated.
+    """
+    info("")
+    info(_c("1;36", f"Where do you want to save the archives?"))
+    info(_c("36", f"  Default [{default}] (Enter to accept, or type a path):"))
+    info(_c("36", "  Type 'q' to quit."))
+    while True:
+        try:
+            raw = input(f"  save to > ").strip()
+        except EOFError:
+            return default
+        if raw.lower() in ("q", "quit", "exit"):
+            raise SystemExit(0)
+        if not raw:
+            return default
+        # Expand ~ and make absolute relative to cwd.
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        try:
+            validated = validate_output_dir(str(candidate))
+        except ValueError as e:
+            err(f"  {e}")
+            info("  Try again (or Enter for default, 'q' to quit).")
+            continue
+        validated.mkdir(parents=True, exist_ok=True)
+        return validated
+
+
+# ===========================================================================
+# State file — resume across runs
+# ===========================================================================
+def state_path(output_dir: Path) -> Path:
+    return output_dir / STATE_FILENAME
+
+
+def load_state(output_dir: Path) -> dict | None:
+    """Load the per-folder state file. Returns None if missing or corrupt."""
+    p = state_path(output_dir)
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        warn(f"State file {p} unreadable ({e}); ignoring it.")
+        return None
+
+
+def save_state(output_dir: Path, state: dict) -> None:
+    """Persist the state file. Atomic-ish write via a sibling tmp file."""
+    p = state_path(output_dir)
+    state["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          time.gmtime())
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, p)
+        debug(f"state saved -> {p}")
+    except OSError as e:
+        warn(f"Could not save state file {p}: {e}")
+
+
+def state_matches_payload(state: dict, payload: TakeoutPayload) -> bool:
+    """True if the saved state is for the same Takeout archive (same URL
+    pattern + base host). Used to decide whether to resume or start fresh."""
+    if not state:
+        return False
+    base, _, ext, _ = extract_url_parts(payload.url)
+    if not base:
+        return False
+    expected = base.split("/")[-1]
+    saved = state.get("base_filename", "")
+    return bool(saved) and saved == expected
+
+
+def state_to_parts(state: dict, payload: TakeoutPayload) -> list[dict] | None:
+    """Rehydrate `parts` from saved state. Returns None if it can't
+    (e.g. URL pattern mismatch). The caller decides what to do."""
+    base, _, ext, query = extract_url_parts(payload.url)
+    if not base:
+        return None
+    parts: list[dict] = []
+    for entry in state.get("parts", []):
+        n = entry.get("num")
+        size = entry.get("size", 0)
+        if not isinstance(n, int) or n <= 0:
+            continue
+        filename = f"{base.split('/')[-1]}{n:03d}{ext}"
+        url = f"{base}{n:03d}{ext}"
+        if query:
+            url += f"?{query}"
+        # `have` is recomputed at verify time; default to True only if the
+        # saved entry marked it complete AND the size matches what we saved.
+        saved_size = entry.get("size", 0)
+        saved_complete = entry.get("complete", False)
+        parts.append({
+            "num": n,
+            "url": url,
+            "filename": filename,
+            "size": size,
+            "have": saved_complete,
+            "_saved_size": saved_size,
+        })
+    return parts
+
+
+def make_state(parts: list[dict], payload: TakeoutPayload,
+               output_dir: Path) -> dict:
+    """Build a fresh state dict from discovery results."""
+    base, _, ext, _ = extract_url_parts(payload.url)
+    return {
+        "schema": 1,
+        "base_filename": base.split("/")[-1] if base else "",
+        "url_sample": payload.url,
+        "output_dir": str(output_dir),
+        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "parts": [
+            {"num": p["num"], "size": p["size"], "complete": p["have"]}
+            for p in parts
+        ],
+    }
+
+
+def update_state_from_parts(state: dict, parts: list[dict]) -> dict:
+    """Merge verify results into the state dict (mutates state["parts"])."""
+    by_num = {p["num"]: p for p in parts}
+    out_parts: list[dict] = []
+    for entry in state.get("parts", []):
+        n = entry.get("num")
+        if n in by_num:
+            p = by_num[n]
+            out_parts.append({
+                "num": n,
+                "size": p["size"],
+                "complete": p["have"],
+            })
+        else:
+            out_parts.append(entry)
+    state["parts"] = out_parts
+    return state
 
 
 # ===========================================================================
@@ -424,9 +702,15 @@ def build_aria2_input(parts: list[dict], payload: TakeoutPayload,
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def run_aria2c(input_body: str, output_dir: Path, parallel: int) -> int:
-    """Run aria2c against the batch. Returns the aria2c exit code.
-    aria2c's own console output IS the progress display."""
+def run_aria2c(input_body: str, output_dir: Path, parallel: int,
+              render: TermRender | None = None,
+              parts: list[dict] | None = None) -> int:
+    """Run aria2c against the batch, optionally rendering a per-file grid.
+
+    Returns the aria2c exit code. When `render` is provided, we spawn
+    aria2c with --summary-interval=1 and parse the per-file summary lines
+    into grid rows. Without `render`, aria2c streams directly to stdout.
+    """
     if not input_body.strip():
         warn("Nothing to download; aria2c skipped.")
         return 0
@@ -436,6 +720,15 @@ def run_aria2c(input_body: str, output_dir: Path, parallel: int) -> int:
         f.write(input_body)
         input_path = f.name
 
+    # Build a filename -> num map so we can identify rows in aria2c output.
+    num_by_filename: dict[str, int] = {}
+    if parts:
+        for p in parts:
+            num_by_filename[p["filename"]] = p["num"]
+
+    console_log = "info" if render else "warn"
+    summary_interval = 1 if render else 10
+
     cmd = [
         "aria2c",
         "-i", input_path,
@@ -444,22 +737,179 @@ def run_aria2c(input_body: str, output_dir: Path, parallel: int) -> int:
         "-c",                          # resume partials
         "--auto-file-renaming=false",
         "--allow-overwrite=true",      # overwrite stale partial without .1 suffix
-        "--console-log-level=warn",
-        "--summary-interval=10",
+        f"--console-log-level={console_log}",
+        f"--summary-interval={summary_interval}",
         "--download-result=full",
         "--max-tries=5",
         "--retry-wait=10",
         "--timeout=60",
         "--file-allocation=none",
     ]
+
+    if not render:
+        # Plain streaming mode (no grid).
+        try:
+            proc = subprocess.run(cmd)
+            return proc.returncode
+        finally:
+            try:
+                os.unlink(input_path)
+            except OSError:
+                pass
+
+    # Rendered mode: capture aria2c's stdout, parse, dispatch to grid.
     try:
-        proc = subprocess.run(cmd)
-        return proc.returncode
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        if proc.stdout is None:
+            return proc.wait()
+        # Per-file trackers keyed by aria2 GID.
+        gid_state: dict[str, dict] = {}
+        # Map GID -> filename via "added" / "Downloading" lines.
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        filename_to_size: dict[str, int] = {
+            p["filename"]: p["size"] for p in (parts or [])
+        }
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            # aria2c formats progress like:
+            #   [#abc123 50MiB/100MiB(50%) CN:1 DL:50MiB ETA:1m]
+            # We use the summary lines that aria2c emits with
+            # --console-log-level=info.
+            try:
+                _update_from_aria2_line(
+                    line, gid_state, gid_to_filename,
+                    filename_to_rowkey, filename_to_size,
+                    num_by_filename, render,
+                )
+            except Exception as e:
+                debug(f"aria2c line parse error: {e!r} line={line!r}")
+        return proc.wait()
     finally:
         try:
             os.unlink(input_path)
         except OSError:
             pass
+
+
+# Pattern that matches a per-file progress line aria2c emits, e.g.
+#   [#abc12345 411.6MiB/8.0GiB(5%) CN:1 DL:50.0MiB ETA:2m14s]
+# Note: aria2's DL field has no trailing /s — it's `DL:50.0MiB`.
+_ARIA2_PROGRESS_RE = re.compile(
+    r"\[#([0-9a-f]+)\s+"          # GID
+    r"([\d.]+)([KMGT]?i?B)?"       # completed amount (unit may be plain B)
+    r"/"
+    r"([\d.]+)([KMGT]?i?B)?"       # total
+    r"\((\d+)%\)"                  # percent
+    r"\s+CN:\d+\s+DL:([\d.]+)([KMGT]?i?B)"   # speed
+    r"(?:\s+ETA:([^\]\s]+))?"       # eta (stop at ] or whitespace)
+)
+
+
+def _aria2_unit_to_bytes(n_str: str, unit: str | None) -> int:
+    """Convert aria2's `411.6MiB`-style strings to bytes."""
+    try:
+        n = float(n_str)
+    except ValueError:
+        return 0
+    if not unit:
+        return int(n)
+    u = unit.rstrip("iB").rstrip("B")
+    mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}.get(
+        u, 1)
+    return int(n * mult)
+
+
+def _update_from_aria2_line(line: str,
+                            gid_state: dict,
+                            gid_to_filename: dict,
+                            filename_to_rowkey: dict,
+                            filename_to_size: dict,
+                            num_by_filename: dict,
+                            render: TermRender) -> None:
+    """Translate one aria2c stdout line into a grid row update."""
+    # Detect the "Downloading" announcement, which gives us the filename.
+    if line.startswith("Downloading"):
+        # aria2 prints e.g. "[#abc 411.6MiB/8.0GiB(0%) CN:1 DL:0B]" but also
+        # the path on a separate line. We rely on the per-file summary
+        # block that comes later. Skip for now.
+        return
+    if line.startswith("[#"):
+        m = _ARIA2_PROGRESS_RE.search(line)
+        if not m:
+            return
+        gid = m.group(1)
+        done = _aria2_unit_to_bytes(m.group(2), m.group(3))
+        total = _aria2_unit_to_bytes(m.group(4), m.group(5))
+        pct = int(m.group(6))
+        speed_bps = _aria2_unit_to_bytes(m.group(7), m.group(8))
+        eta = m.group(9) or ""
+        # Look up filename for this GID. If unknown, defer the update.
+        filename = gid_to_filename.get(gid)
+        if not filename:
+            # Heuristic: keep state so we can fill in once we know filename.
+            gid_state[gid] = {
+                "done": done, "total": total, "pct": pct,
+                "speed": speed_bps, "eta": eta,
+            }
+            return
+        _render_file_row(render, filename, done, total, pct,
+                         speed_bps, eta, filename_to_size,
+                         num_by_filename)
+        return
+    # aria2c downloads use one-line summaries like:
+    #   [#abc 50MiB/100MiB(50%) CN:1 DL:50MiB ETA:1m]     (live)
+    # When --download-result=full, on completion:
+    #   Download Results:
+    #   gid|stat|avg speed|path
+    #   abc123|OK|  1.2MiB/s|./foo.zip
+    # ...
+    # We grep for the result row to bind GID -> filename once complete.
+    m2 = re.search(
+        r"\b([0-9a-f]{4,16})\s*\|\s*(OK|ERR|WARN)\s*\|.*?\|\s*(.+?\.zip)\s*$",
+        line)
+    if m2:
+        gid, status, filename = m2.group(1), m2.group(2), m2.group(3).strip()
+        # `path` may be a full path; extract basename.
+        basename = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        gid_to_filename[gid] = basename
+        if gid not in filename_to_rowkey:
+            filename_to_rowkey[basename] = f"file:{basename}"
+        if status in ("OK", "ERR", "WARN"):
+            # Final render: 100% for OK, current pct otherwise.
+            size = filename_to_size.get(basename, 0)
+            pct = 100 if status == "OK" else gid_state.get(gid, {}).get("pct", 0)
+            done = size if status == "OK" else gid_state.get(gid, {}).get("done", 0)
+            _render_file_row(render, basename, done, size or total_of(gid_state, gid),
+                             pct, 0, "", filename_to_size, num_by_filename)
+
+
+def total_of(gid_state: dict, gid: str) -> int:
+    return gid_state.get(gid, {}).get("total", 0)
+
+
+def _render_file_row(render: TermRender, filename: str, done: int,
+                     total: int, pct: int, speed_bps: int, eta: str,
+                     filename_to_size: dict, num_by_filename: dict) -> None:
+    if total <= 0:
+        total = filename_to_size.get(filename, 0)
+    bar = make_progress_bar(pct, width=20)
+    parts_str = human_size(done) + "/" + human_size(total) if total else human_size(done)
+    speed_str = human_size(speed_bps) + "/s" if speed_bps else "    -    "
+    eta_str = eta or "-"
+    num = num_by_filename.get(filename, 0)
+    row = (
+        f"  #{num:03d}  {bar} {pct:3d}%  {parts_str:>20}  "
+        f"{speed_str:>10}  ETA {eta_str:>6}  {filename}"
+    )
+    render.update_row(f"file:{filename}", row)
 
 
 # ===========================================================================
@@ -572,29 +1022,67 @@ def main() -> int:
 
     payload = parse_one_payload()
 
+    # Ask for output dir AFTER we know what payload we're downloading.
+    # The user might want different folders for different Takeout exports.
+    # If --output-dir was passed on the command line, skip the prompt.
+    if args.output_dir:
+        chosen_output_dir = output_dir
+    else:
+        chosen_output_dir = prompt_for_output_dir(output_dir)
+        if chosen_output_dir != output_dir:
+            # Re-aim the logger at the chosen folder. Logger handlers are
+            # already installed pointing at the env-derived path; swap them.
+            new_log_path = chosen_output_dir / "takeout_cli.log"
+            _install_logger(new_log_path, max_bytes, backup_count)
+            info(f"Log file: {new_log_path} "
+                 f"(rotating at {max_bytes // 1024}KB, "
+                 f"keeping {backup_count} backups)")
+        output_dir = chosen_output_dir
+
+    # Try to resume from state in the chosen folder.
+    state = load_state(output_dir)
+    parts: list[dict] | None = None
+    if state and state_matches_payload(state, payload):
+        parts = state_to_parts(state, payload)
+        if parts:
+            saved_complete = sum(1 for p in parts if p["have"])
+            ok(f"Resuming from {state_path(output_dir)}: "
+               f"{saved_complete}/{len(parts)} parts marked complete.")
+            info("Re-verifying files on disk before downloading anything.")
+            # Re-verify saved parts against the actual filesystem. The size
+            # on disk could differ from what's in state if files changed.
+            _, incomplete = verify_parts(parts, output_dir)
+            parts = [p for p in parts if p["have"]] + incomplete
+
     # Discover (also validates auth). Re-prompt on auth failure.
-    auth_failures = 0
-    while True:
-        try:
-            parts = discover_parts(payload, output_dir)
-            break
-        except AuthError as e:
-            auth_failures += 1
-            if auth_failures > MAX_AUTH_REPROMPTS:
-                err(f"Auth still failing after {MAX_AUTH_REPROMPTS} attempts. "
-                    "Re-capture in your browser, then re-run this script.")
-                return 1
-            err(f"Auth failed during discovery ({e}).")
-            info("Re-capture in your browser, then paste the new JSON below.")
-            payload = parse_one_payload()
-        except ValueError as e:
-            err(str(e))
-            info("Paste a corrected JSON payload below.")
-            payload = parse_one_payload()
+    if not parts:
+        auth_failures = 0
+        while True:
+            try:
+                parts = discover_parts(payload, output_dir)
+                break
+            except AuthError as e:
+                auth_failures += 1
+                if auth_failures > MAX_AUTH_REPROMPTS:
+                    err(f"Auth still failing after {MAX_AUTH_REPROMPTS} attempts. "
+                        "Re-capture in your browser, then re-run this script.")
+                    return 1
+                err(f"Auth failed during discovery ({e}).")
+                info("Re-capture in your browser, then paste the new JSON below.")
+                payload = parse_one_payload()
+            except ValueError as e:
+                err(str(e))
+                info("Paste a corrected JSON payload below.")
+                payload = parse_one_payload()
 
     if not parts:
         err("No archive parts found. The URL may be wrong or the set is empty.")
         return 1
+
+    # Persist state immediately so a Ctrl-C mid-run doesn't lose progress.
+    if not state or not state_matches_payload(state, payload):
+        state = make_state(parts, payload, output_dir)
+        save_state(output_dir, state)
 
     total = sum(p["size"] for p in parts)
     have = [p for p in parts if p["have"]]
@@ -603,22 +1091,62 @@ def main() -> int:
        f"{len(have)} already complete, {len(need)} to download.")
     if not need:
         ok("Everything is already downloaded. Nothing to do.")
+        # Refresh state with verified results and exit cleanly.
+        state = update_state_from_parts(state, parts)
+        save_state(output_dir, state)
         return 0
 
     # Main download loop
     attempt = 0
+    use_grid = sys.stdout.isatty() and os.environ.get("NO_GRID") is None
+    render = TermRender(enabled=use_grid)
+    if use_grid:
+        render.begin(n_rows=len(parts))
+        info("")  # leave room above the grid for the header banner we just drew
+
+    def header_line() -> str:
+        done = sum(1 for p in parts if p["have"])
+        active = sum(1 for p in parts
+                     if not p["have"]
+                     and (output_dir / p["filename"]).exists()
+                     and (output_dir / p["filename"]).stat().st_size > 0)
+        n_need = sum(1 for p in parts if not p["have"])
+        return (f"  Pass {attempt} | {done}/{len(parts)} done | "
+                f"{active} active | {n_need} pending | "
+                f"output: {output_dir}")
+
+    def footer_line() -> str:
+        return ""
+
     while need:
         attempt += 1
-        header(f"Downloading {len(need)} parts — pass {attempt} "
-               f"(aria2c, {args.parallel} concurrent)")
+        if use_grid:
+            render.set_header(header_line())
+        else:
+            header(f"Downloading {len(need)} parts — pass {attempt} "
+                   f"(aria2c, {args.parallel} concurrent)")
         body = build_aria2_input(parts, payload, output_dir)
-        rc = run_aria2c(body, output_dir, args.parallel)
+        rc = run_aria2c(body, output_dir, args.parallel,
+                        render=render if use_grid else None,
+                        parts=parts)
         if rc != 0:
             warn(f"aria2c exited with code {rc} "
                  f"(some files may have failed).")
 
         complete, incomplete = verify_parts(parts, output_dir)
-        ok(f"Verified: {len(complete)}/{len(parts)} complete.")
+        if use_grid:
+            # Refresh header to reflect newly-completed counts.
+            render.set_header(header_line())
+            # Clear any rows that just finished (so the grid shows progress,
+            # not stale 100% bars for already-done files).
+            for p in complete:
+                render.clear_row(f"file:{p['filename']}")
+            render.teardown()
+        else:
+            ok(f"Verified: {len(complete)}/{len(parts)} complete.")
+        # Persist progress.
+        state = update_state_from_parts(state, parts)
+        save_state(output_dir, state)
         need = incomplete
         if not need:
             break
@@ -657,6 +1185,9 @@ def main() -> int:
     header("Done")
     complete, incomplete = verify_parts(parts, output_dir)
     grand = sum(p["size"] for p in complete)
+    # Final state save: capture verified completion even if we exit non-zero.
+    state = update_state_from_parts(state, parts)
+    save_state(output_dir, state)
     info("")
     if incomplete:
         err(f"{len(incomplete)} parts still missing in {output_dir}:")
@@ -664,9 +1195,12 @@ def main() -> int:
             info(f"   {p['num']:03d}  {p['filename']}")
         if len(incomplete) > 10:
             info(f"   ... and {len(incomplete) - 10} more")
+        info(f"State saved to {state_path(output_dir)} — "
+             f"re-run to resume the missing parts.")
         return 1
     ok(f"All {len(complete)} parts downloaded — "
        f"{human_size(grand)} in {output_dir}")
+    ok(f"State saved to {state_path(output_dir)}")
     return 0
 
 

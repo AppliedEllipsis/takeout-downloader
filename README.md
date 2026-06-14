@@ -336,6 +336,27 @@ Google only permits **single-stream** downloads for Takeout, so the
 right aria2c flags are `-x 1 -s 1 -c` — more connections per file get
 throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 
+## Live grid (CLI)
+
+When you run the CLI on a real terminal (not piped), it draws a
+**fixed-position grid** of every part using ANSI escape codes — one row
+per file with a progress bar, bytes, speed, and ETA. The grid is
+re-rendered in place on every aria2c summary tick (default 1s), so
+there's no scroll-back and no flicker:
+
+```
+  Pass 1 | 0/100 done | 3 active | 100 pending | output: /opt/storage...
+  #001  [████·️️️️️️️️️️️·]  18%   1.4 GB/7.5 GB    50.2 MB/s  ETA  2m14s  takeout-...001.zip
+  #002  [█··️️️️️️️️️️·]   5%   410.3 MB/7.5 GB  12.7 MB/s  ETA  9m38s  takeout-...002.zip
+  #003  [·️️️️️️️️️️·]   0%   0 B/7.5 GB         0 B/s     ETA  --     takeout-...003.zip
+
+  overall: 50 MB/s | eta: 5m
+```
+
+Set `NO_GRID=1` in the environment to force plain streaming output
+(useful when piping to a file or running under `script(1)` for
+recording).
+
 ## Project structure
 
 ```

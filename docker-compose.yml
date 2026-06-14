@@ -172,5 +172,4 @@ services:
         bind:
           propagation: rslave
           recursive: enabled
-    command: ["python", "-u", "takeout_cli.py"]
-    entrypoint: []
+    entrypoint: ["python", "-u", "takeout_cli.py"]

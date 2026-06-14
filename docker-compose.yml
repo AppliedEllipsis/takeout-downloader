@@ -113,3 +113,43 @@ services:
         bind:
           propagation: rslave
           recursive: enabled
+
+  # CLI variant — same image, no terminal UI. Drop in.json into the output dir
+  # (or pipe via stdin) and aria2c takes over with native progress output.
+  # This is the recommended path for SSH->tmux->Docker chains where Textual's
+  # paste / redraw is fragile. The CLI re-prompts on auth failures, so a stale
+  # cookie just means you re-capture and re-run — no UI freeze.
+  #
+  #     docker compose build
+  #     echo '{...}' > downloads/in.json
+  #     docker compose run --rm takeout-cli
+  #
+  # Or pass --payload-file / --output-dir to override.
+  takeout-cli:
+    build: .
+    image: takeout-downloader:latest
+    container_name: takeout-cli
+    stdin_open: true                # required for interactive paste prompts
+    tty: true                       # required for the bash-style readline loop
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OUTPUT_DIR: ${OUTPUT_DIR:-}
+      TERM: ${TERM:-xterm-256color}
+      ALLOWED_DIRS: /opt:/downloads
+      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-3}
+      MAX_PARTS: ${MAX_PARTS:-500}
+      MAX_AUTH_REPROMPTS: ${MAX_AUTH_REPROMPTS:-5}
+    volumes:
+      - ./downloads:/downloads
+      - ./drop:/downloads/drop
+      - .:/work
+      - type: bind
+        source: /opt
+        target: /opt
+        bind:
+          propagation: rslave
+          recursive: enabled
+    command: ["python", "-u", "takeout_cli.py"]
+    entrypoint: []

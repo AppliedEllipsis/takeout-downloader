@@ -69,6 +69,43 @@ Then:
 4. Paste into the TUI's payload box, set the output dir / file count /
    parallelism, and click **▶ Start**.
 
+### CLI variant (no TUI, friendlier over SSH)
+
+A simpler terminal-only path for `SSH → tmux → Docker` chains where
+Textual's paste/redraw is fragile. It uses aria2c directly, prints native
+progress (speed/ETA/total), and re-prompts for a fresh capture if the
+cookie expires mid-run:
+
+```bash
+docker compose build
+echo '<paste your JSON here>' > downloads/in.json
+docker compose run --rm takeout-cli
+```
+
+Or pipe via stdin (the CLI auto-detects JSON completion by brace-balance,
+so you don't need a sentinel):
+
+```bash
+docker compose run --rm takeout-cli < in.json
+```
+
+The CLI searches these payload locations automatically — you can just drop
+the file and run:
+
+- `<output_dir>/in.json`, `payload.json`, or `curl.txt`
+- `/downloads/in.json`, `/downloads/drop/in.json` (mounted)
+- `/work/in.json` (the project folder, mounted)
+- Or `PAYLOAD_FILE=/path/to/in.json docker compose run --rm takeout-cli`
+
+Useful env vars (also `.env`):
+
+| var | default | what |
+|-----|---------|------|
+| `PARALLEL_DOWNLOADS` | `3` | concurrent downloads (`-j` to aria2c) |
+| `MAX_PARTS` | `500` | discovery safety cap |
+| `MAX_AUTH_REPROMPTS` | `5` | how many times to ask for a fresh cookie before giving up |
+| `OUTPUT_DIR` | auto (JuiceFS if present, else `./downloads`) | where archives land |
+
 ### No extension? Paste cURL instead
 
 The TUI auto-detects the input format. If you can't install the

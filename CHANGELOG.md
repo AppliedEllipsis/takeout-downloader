@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **TUI is opt-in via Docker profile.** The TUI service (`takeout`) now
+  declares `profiles: ["tui"]` so it is hidden from
+  `docker compose config --services` by default. The CLI (`takeout-cli`)
+  becomes the default and only visible entrypoint — matches the preferred
+  flow for SSH→tmux→Docker. Launch the TUI explicitly with
+  `docker compose --profile tui run --rm takeout` when you want a UI on a
+  local terminal.
+
 ### Fixed
 
 - **TUI froze after browsing into a large/slow directory** (had to

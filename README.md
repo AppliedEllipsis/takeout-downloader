@@ -46,12 +46,20 @@ python takeout.py
 
 ### Or run it in Docker
 
-The TUI is fully self-contained in a container (Python deps + `aria2c`
-baked in). The TUI is interactive, so use `run` — not `up -d`:
+The CLI is fully self-contained in a container (Python deps + `aria2c`
+baked in). It is interactive, so use `run` — not `up -d`:
 
 ```bash
 docker compose build
-docker compose run --rm takeout
+docker compose run --rm takeout-cli
+```
+
+The TUI is still bundled for users who want a UI on a local terminal —
+it's hidden behind the `tui` profile so it doesn't appear in the default
+service list:
+
+```bash
+docker compose --profile tui run --rm takeout
 ```
 
 Downloads land in `./downloads` on the host (resume state persists there
@@ -201,7 +209,8 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 ├── dedupe_takeout.py         # Deduplicate downloaded archives by hash
 ├── build.py                  # PyInstaller single-binary build
 ├── Dockerfile                # Self-contained TUI image (Python deps + aria2c)
-├── docker-compose.yml        # `docker compose run --rm takeout`
+├── docker-compose.yml        # `docker compose run --rm takeout-cli`
+│                             # (`takeout` is the TUI service, profile `tui`)
 ├── requirements.txt          # Python dependencies
 └── helpers/                  # Browser extension (Chromium MV3)
     ├── manifest.json

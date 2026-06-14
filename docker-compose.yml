@@ -1,10 +1,24 @@
-# Google Takeout Downloader — TUI in a container.
+# Google Takeout Downloader.
 #
-# The TUI is INTERACTIVE: it needs a terminal. You do NOT start it with
-# `up -d`. Use `run` so Docker attaches your terminal to it:
+# TWO SERVICES, ONE PROFILE:
 #
-#     docker compose build
-#     docker compose run --rm takeout
+#   takeout-cli  (default)  terminal-native aria2c CLI — recommended for SSH
+#                          /tmux/Docker chains. Paste a JSON payload when
+#                          prompted; aria2c handles the rest.
+#
+#                          docker compose build
+#                          docker compose run --rm takeout-cli
+#
+#   takeout     (profile: tui)  Textual TUI with progress bars, queue
+#                               preview, directory browser. Fragile over
+#                               SSH+tmux+brackets-paste; kept for users who
+#                               prefer a UI on a local terminal.
+#
+#                          docker compose build
+#                          docker compose --profile tui run --rm takeout
+#
+# Both services are INTERACTIVE: do NOT start with `up -d`. Use `run` so
+# Docker attaches your terminal to them.
 #
 # WHERE FILES LAND
 # ----------------
@@ -59,6 +73,9 @@ services:
     build: .
     image: takeout-downloader:latest
     container_name: takeout-downloader
+    # Hidden behind the `tui` profile. CLI is the default entrypoint; the
+    # TUI is opt-in for users who want a UI on a local terminal.
+    profiles: ["tui"]
 
     # Give the TUI a real terminal. Both are required for Textual to render.
     stdin_open: true   # docker run -i

@@ -68,15 +68,25 @@ python takeout.py
 
 ### Or run it in Docker
 
-The TUI is self-contained in a container — Python dependencies and
-`aria2c` are baked into the image, so the only host requirement is Docker.
+Both the CLI and the TUI are self-contained in a single image — Python
+dependencies and `aria2c` are baked in, so the only host requirement is
+Docker.
 
-The TUI is **interactive** (it needs a real terminal), so you do *not*
-start it as a background daemon. Use `run`, which attaches your terminal:
+Both services are **interactive** (they need a real terminal), so you do
+*not* start them as background daemons. Use `run`, which attaches your
+terminal:
+
+**CLI** (default service, recommended for SSH/tmux/Docker):
 
 ```bash
 docker compose build
-docker compose run --rm takeout
+docker compose run --rm takeout-cli
+```
+
+**TUI** (opt-in via profile, use only on a local terminal):
+
+```bash
+docker compose --profile tui run --rm takeout
 ```
 
 Notes:

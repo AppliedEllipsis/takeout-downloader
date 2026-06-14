@@ -76,6 +76,7 @@
     // -------------------------------------------------------------------------
     const spyCache = {
         urls: new Set(),
+        filenames: [],
         responses: [],
         globals: null
     };
@@ -116,6 +117,16 @@
         }
     }
 
+    function reportFilenames(url, text) {
+        if (!url || !text) return;
+        if (!url.includes('/_/TakeoutUi/data/batchexecute') && !url.includes('rpcids=lFYxZd')) return;
+        const matches = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
+        if (matches && matches.length > 0) {
+            const unique = Array.from(new Set(matches));
+            post('filenames', { filenames: unique, sourceUrl: url, time: Date.now() });
+        }
+    }
+
     // Patch fetch
     const origFetch = window.fetch;
     window.fetch = function(...args) {
@@ -133,12 +144,23 @@
                     reportResponse(url, '', obj);
                 } else if (ctype.includes('html') || ctype.includes('text') || ctype.includes('javascript')) {
                     const text = await clone.text().catch(() => '');
+                    reportFilenames(url, text);
                     reportResponse(url, text, null);
                 }
             } catch (e) {}
             return resp;
         });
     };
+
+    function reportFilenamesFromText(url, text) {
+        if (!url || !text) return;
+        if (!url.includes('/_/TakeoutUi/data/batchexecute') && !url.includes('rpcids=lFYxZd')) return;
+        const matches = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
+        if (matches && matches.length > 0) {
+            const unique = Array.from(new Set(matches));
+            post('filenames', { filenames: unique, sourceUrl: url, time: Date.now() });
+        }
+    }
 
     // Patch XHR
     const origOpen = XMLHttpRequest.prototype.open;
@@ -160,6 +182,7 @@
                         const obj = JSON.parse(self.responseText);
                         reportResponse(url, '', obj);
                     } else {
+                        reportFilenamesFromText(url, self.responseText || '');
                         reportResponse(url, self.responseText || '', null);
                     }
                 } catch (e) {}
@@ -196,6 +219,10 @@
         } else if (event.data.type === 'urls') {
             for (const u of (event.data.data.urls || [])) spyCache.urls.add(u);
             spyCache.responses.push(event.data.data);
+        } else if (event.data.type === 'filenames') {
+            for (const f of (event.data.data.filenames || [])) {
+                if (!spyCache.filenames.includes(f)) spyCache.filenames.push(f);
+            }
         } else if (event.data.type === 'globals') {
             spyCache.globals = event.data.data;
         }
@@ -279,6 +306,20 @@
         const spyUrls = Array.from(spyCache.urls).filter(u => u.includes('takeout-download.usercontent.google.com'));
         if (spyUrls.length > 0) {
             return { ok: true, urls: spyUrls, debug: ['spy cache'], source: 'spy' };
+        }
+
+        // If the spy captured filenames from a batchexecute response but not
+        // full URLs, reconstruct the download URLs from the captured URL template.
+        if (spyCache.filenames.length > 0 && user) {
+            const reconstructed = spyCache.filenames.map(filename => {
+                const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
+                u.searchParams.set('j', archiveId);
+                u.searchParams.set('i', '1');
+                u.searchParams.set('user', user);
+                u.searchParams.set('authuser', authuser);
+                return u.toString();
+            });
+            return { ok: true, urls: reconstructed, debug: ['reconstructed from filenames'], source: 'spy-filenames' };
         }
 
         for (const apiUrl of apiUrls) {

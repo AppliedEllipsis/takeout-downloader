@@ -114,13 +114,18 @@ def test_aria2_input_empty_when_all_have(tmp_path):
 # Auth detection
 # ---------------------------------------------------------------------------
 class _FakeResp:
-    def __init__(self, url, status, headers=None):
+    def __init__(self, url, status, headers=None, text=""):
         self.url = url
         self.status_code = status
         self.headers = headers or {}
+        self.text = text
 
     def close(self):
         pass
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
 
 
 def test_probe_redirects_to_google_login_is_auth_error():
@@ -1057,3 +1062,54 @@ def test_discover_respects_max_parts_cap(tmp_path):
     assert len(parts) == 3
     assert parts[0]["num"] == 1
     assert parts[2]["num"] == 3
+
+
+def test_fetch_manifest_finds_all_urls(tmp_path):
+    """If the manage page contains multiple download URLs, the fetch
+    function should return all of them as separate payloads."""
+    payload = _fixture_payload()
+    fake_html = """
+    <html><body>
+    <a href="https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-11-001.zip?j=x&i=0">Download</a>
+    <a href="https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-14-001.zip?j=x&i=1">Download</a>
+    <a href="https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=x&i=2">Download</a>
+    </body></html>
+    """
+    fake_resp = _FakeResp(
+        "https://takeout.google.com/u/0/manage/archive/x",
+        200, {"content-type": "text/html"}, text=fake_html,
+    )
+    with mock.patch.object(takeout_cli.requests, "get", return_value=fake_resp):
+        payloads = takeout_cli.fetch_takeout_manifest(payload)
+    assert len(payloads) == 3
+    assert any("Z-11-001" in p.url for p in payloads)
+    assert any("Z-14-001" in p.url for p in payloads)
+    assert any("Z-9-001" in p.url for p in payloads)
+    for p in payloads:
+        assert p.cookie == payload.cookie
+        assert p.source == "server-manifest"
+
+
+def test_fetch_manifest_redirect_to_login_returns_empty(tmp_path):
+    """If the cookie is stale and the page redirects to Google signin,
+    return empty list (caller falls back to single-URL payload)."""
+    payload = _fixture_payload()
+    fake_resp = _FakeResp(
+        "https://accounts.google.com/signin",
+        200, {"content-type": "text/html"}, text="<html>Sign in</html>",
+    )
+    with mock.patch.object(takeout_cli.requests, "get", return_value=fake_resp):
+        payloads = takeout_cli.fetch_takeout_manifest(payload)
+    assert payloads == []
+
+
+def test_fetch_manifest_no_archive_id_returns_empty(tmp_path):
+    """If the URL has no j= parameter, we can't build the manage URL."""
+    import takeout_payload as tp
+    payload = tp.TakeoutPayload(
+        url="https://example.com/no-j-param.zip",
+        cookie="SID=test",
+        headers={},
+    )
+    payloads = takeout_cli.fetch_takeout_manifest(payload)
+    assert payloads == []

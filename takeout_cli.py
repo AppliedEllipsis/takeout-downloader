@@ -314,6 +314,135 @@ def resolve_output_dir() -> Path:
     return d
 
 
+def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
+    """Use the captured cookie to fetch the Takeout manage page for this
+    archive and scrape all download URLs from it. This finds all parts
+    without needing the extension to scrape the page.
+
+    Returns an empty list on failure (the caller falls back to the
+    extension-scraped or single-URL payload).
+    """
+    # Extract archive ID from the download URL's `j=` parameter.
+    archive_id = None
+    authuser = "0"
+    m = re.search(r"[?&]j=([a-f0-9-]+)", payload.url)
+    if m:
+        archive_id = m.group(1)
+    m = re.search(r"[?&]authuser=(\d+)", payload.url)
+    if m:
+        authuser = m.group(1)
+    # Also check the cookie for authuser.
+    cm = re.search(r"authuser=(\d+)", payload.cookie)
+    if cm:
+        authuser = cm.group(1)
+    if not archive_id:
+        debug("No archive ID in URL; cannot fetch manifest")
+        return []
+
+    # The manage page is at /u/{authuser}/manage/archive/{archive_id}
+    page_url = (
+        f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}"
+    )
+    headers = dict(payload.headers)
+    headers["Cookie"] = payload.cookie
+    headers.setdefault("Accept", "text/html,application/xhtml+xml")
+    debug(f"Fetching manage page: {page_url}")
+    try:
+        resp = requests.get(page_url, headers=headers,
+                             allow_redirects=True, timeout=15)
+    except requests.RequestException as e:
+        debug(f"Manage page fetch failed: {e}")
+        return []
+
+    if resp.status_code != 200:
+        debug(f"Manage page returned {resp.status_code}")
+        return []
+    final = resp.url
+    if "accounts.google.com" in final:
+        debug("Manage page redirected to Google signin; cookie invalid")
+        return []
+
+    # Try to parse as JSON first (some Takeout API endpoints return JSON).
+    ctype = resp.headers.get("content-type", "")
+    if "json" in ctype:
+        try:
+            return _parse_manifest_json(resp.json(), payload)
+        except Exception as e:
+            debug(f"JSON manifest parse failed: {e}")
+
+    # Fall back to HTML parsing: extract all takeout-download URLs and
+    # the surrounding filename context.
+    html = resp.text
+    urls = re.findall(
+        r'https://takeout-download\.usercontent\.google\.com/'
+        r'download/takeout-[^"\'<>\s]+\.zip(?:\?[^"\'<>\s]*)?',
+        html,
+    )
+    if not urls:
+        debug("No takeout-download URLs found in manage page HTML")
+        return []
+
+    seen = set()
+    payloads = []
+    for url in urls:
+        # Strip the query string to dedupe (the same file may appear twice)
+        base_url = url
+        if base_url in seen:
+            continue
+        seen.add(base_url)
+        new_payload = TakeoutPayload(
+            url=base_url,
+            cookie=payload.cookie,
+            headers=dict(payload.headers),
+            method="GET",
+            captured_at=payload.captured_at,
+            source="server-manifest",
+            schema=payload.schema,
+        )
+        payloads.append(new_payload)
+    return payloads
+
+
+def _parse_manifest_json(data: dict, payload: TakeoutPayload) -> list[TakeoutPayload]:
+    """Parse a JSON Takeout manifest response into TakeoutPayloads."""
+    payloads = []
+    # Common shapes: {"exports": [{"downloadUrl": "..."}]}, or
+    # {"archive": {"parts": [{"url": "..."}]}}
+    candidates = []
+    if isinstance(data, dict):
+        for key in ("exports", "parts", "items", "downloads", "files"):
+            if key in data and isinstance(data[key], list):
+                candidates = data[key]
+                break
+        if not candidates and "archive" in data:
+            archive = data["archive"]
+            if isinstance(archive, dict):
+                for key in ("parts", "downloads", "files"):
+                    if key in archive and isinstance(archive[key], list):
+                        candidates = archive[key]
+                        break
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        url = (item.get("downloadUrl") or item.get("url")
+               or item.get("link") or item.get("href"))
+        if not url:
+            continue
+        if "takeout" not in url.lower():
+            continue
+        new_payload = TakeoutPayload(
+            url=url,
+            cookie=payload.cookie,
+            headers=dict(payload.headers),
+            method="GET",
+            captured_at=payload.captured_at,
+            source="server-manifest",
+            schema=payload.schema,
+        )
+        payloads.append(new_payload)
+    return payloads
+
+
 def prompt_for_output_dir(default: Path) -> Path:
     """Ask the user where to save archives. Empty input keeps the default.
     Type 'q' to quit. Anything else is treated as a path and validated.
@@ -564,6 +693,16 @@ def parse_one_payload() -> TakeoutPayload:
     markers = [m for m in REQUIRED_COOKIE_MARKERS if m in first.cookie]
     ok(f"Cookie OK: {len(first.cookie)} chars "
        f"(markers: {', '.join(markers[:4])})")
+
+    # If we only got one URL, try to fetch the full manifest from the
+    # Takeout manage page using the captured cookie. This finds all parts
+    # automatically without needing the extension to scrape.
+    if len(payloads) == 1:
+        manifest = fetch_takeout_manifest(payloads[0])
+        if manifest and len(manifest) > 1:
+            ok(f"Server-side manifest: found {len(manifest)} archives.")
+            payloads = manifest
+
     if len(payloads) == 1:
         return payloads[0]
     # Multi-export: ask user to pick one
@@ -1062,8 +1201,8 @@ def main() -> int:
                         help=f"concurrent downloads (default {PARALLEL})")
     parser.add_argument("--max-parts", type=int, default=MAX_PARTS,
                         help=f"max parts to discover (default {MAX_PARTS})")
-    parser.add_argument("--output-dir",
-                        help="override output directory")
+    parser.add_argument("--out", "--output-dir", dest="output_dir",
+                        help="output directory for archives (prompted if omitted)")
     args = parser.parse_args()
 
     if args.output_dir:
@@ -1094,11 +1233,8 @@ def main() -> int:
     header("Google Takeout Downloader — paste, go.")
     info("")
 
-    payload = parse_one_payload()
-
-    # Ask for output dir AFTER we know what payload we're downloading.
-    # The user might want different folders for different Takeout exports.
-    # If --output-dir was passed on the command line, skip the prompt.
+    # Ask for output dir FIRST, before the JSON paste. If --out is passed
+    # on the command line, skip the prompt entirely.
     if args.output_dir:
         chosen_output_dir = output_dir
     else:
@@ -1112,6 +1248,8 @@ def main() -> int:
                  f"(rotating at {max_bytes // 1024}KB, "
                  f"keeping {backup_count} backups)")
         output_dir = chosen_output_dir
+
+    payload = parse_one_payload()
 
     # Try to resume from state in the chosen folder.
     state = load_state(output_dir)

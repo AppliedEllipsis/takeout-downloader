@@ -2,9 +2,20 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased] — Docker support for the TUI
+## [Unreleased]
 
-### Added
+### Fixed
+
+- **Extension always reported "No cookie captured".** The MV3
+  `webRequest.onBeforeSendHeaders` listener only requested
+  `['requestHeaders']`, so Chrome (72+) stripped the `Cookie` header from
+  what the service worker could see — the capture's `cookie` field came
+  back empty even on valid requests (while tools like CurlWget, which read
+  at a different layer, worked fine). Added `'extraHeaders'` to the
+  `extraInfoSpec`, which is required to observe `Cookie` / `Referer` /
+  `Authorization`. Extension bumped to 2.0.1.
+
+### Added (Docker support for the TUI)
 
 - **`Dockerfile` + `docker-compose.yml`** — the TUI is now self-contained
   in a container, with `aria2c` and all Python deps baked in. Because the

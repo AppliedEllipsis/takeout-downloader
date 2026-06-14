@@ -84,6 +84,48 @@ constant-table VM. The visible entry is `(x(5997006,{}))(w(E))` where `E` is the
 `ffi` to reach the OS — which is exactly what the bundled `gcc.exe` provides and what a safe
 sandbox denies.
 
+### 1b. Campaign attribution — "FakeGit" / LuaJIT "SmartLoader"
+
+This sample is not a one-off. It matches a documented, actively-tracked GitHub-distribution
+campaign (Vietnamese-speaking operator, running since March 2025; Microsoft `VirTool:Win32/Gelesz.A`,
+BitDefender `Gen:Heur.FakeGit.1`, ESET `Lua/Agent.*`). 600+ malicious ZIPs across 47+ GitHub
+accounts. The fake "Simplify Your Data Retrieval" README with download badges that all point to one
+ZIP is the campaign's AI-generated lure template.
+
+**Precision of the match (not generic):**
+
+| Campaign fingerprint (published) | This sample |
+|----------------------------------|-------------|
+| V2 wave (Feb 2026) ships a `gcc.exe` of **651 KB** (also seen as `luad.exe`) | `gcc.exe` = **651,776 B** — exact |
+| Loader chain = LuaJIT EXE + obfuscated Lua **`ptd.txt`** + `Launch.cmd` (`start <exe> ptd.txt`) | Identical, including the `ptd.txt` filename |
+| VM obfuscator three-pass table shuffle over ranges `{1,1064}`, `{1,658}`, `{659,1064}` | Markers **1064, 658, 659** all present in `ptd.txt` |
+| All strings (URLs/APIs/keys) assembled at runtime from an encrypted ~1,078-entry "P-table" | Confirmed: **no** plaintext base64 alphabet, **no** plaintext Win32 API names in `ptd.txt` |
+
+**What it does when executed on an unprotected Windows host** (from the campaign analysis of this
+exact loader family — corroborated by the FFI/API tokens recovered statically):
+
+1. **Hides** — `GetConsoleWindow` + `ShowWindow(SW_HIDE)`; victim sees nothing after launch.
+2. **Fingerprints** — `GetComputerNameW`, `IsWow64Process`, OS version, token-elevation, screen metrics.
+3. **Resolves C2 via blockchain (EtherHiding)** — reads a getter on a **Polygon Mainnet** smart
+   contract for the current attacker IP, so infrastructure rotates without changing the binary.
+   Documented V2 contract `0x1823A9a0Ec8e0C25dD957D0841e3D41a4474bAdc` (`getData()`), value
+   `http://89.169.12.241` at report time.
+4. **Fetches stage 2** from a GitHub dead-drop; decrypts via hex → XOR → base64url → AES-ECB.
+5. **Capabilities in the FFI CDEF block** — screenshot capture (`BitBlt`, `CreateDIBSection`) and
+   **process injection / PE hollowing** (`VirtualAlloc` `PAGE_EXECUTE_READWRITE`, manual PEB/LDR DLL
+   resolution to bypass the import table).
+6. **Final payload = info-stealer** (StealC / Lumma / Rhadamanthys-class) — browser credentials,
+   cookies, crypto wallets; some variants add a crypto-clipper.
+
+**Decision: no dynamic ("live") run was performed.** Revealing the live C2 string requires real
+LuaJIT **+ FFI** — the exact OS/network bridge that must be denied. The C2 is blockchain-rotated and
+already published by threat intel, so a live run adds ~zero intelligence at real risk. The safe way
+to obtain the *current* C2 is a read-only `eth_call` to the Polygon contract's getter — no malware
+execution.
+
+Threat-intel sources: derp.ca "FakeGit" writeup; intellibron.io "Lua-JIT SmartLoader"; Morphisec
+Lua malware analysis; ESET Gelsemium.
+
 ### 2. How it was analyzed safely (and proof of no exposure)
 
 Three independent containment layers:

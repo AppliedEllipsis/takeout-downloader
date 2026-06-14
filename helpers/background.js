@@ -79,7 +79,11 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
         }
     },
     { urls: ALL_URL_PATTERNS },
-    ['requestHeaders']
+    // 'extraHeaders' is REQUIRED in MV3 (Chrome 72+) to observe the Cookie
+    // header. Without it Chrome strips Cookie/Referer/Authorization from
+    // what onBeforeSendHeaders sees, so `cookie` comes back empty and the
+    // popup reports "No cookie captured" even on a valid request.
+    ['requestHeaders', 'extraHeaders']
 );
 
 function buildCapture(details) {

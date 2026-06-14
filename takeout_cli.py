@@ -339,17 +339,61 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
         debug("No archive ID in URL; cannot fetch manifest")
         return []
 
-    # The manage page is at /u/{authuser}/manage/archive/{archive_id}
-    page_url = (
-        f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}"
-    )
     headers = dict(payload.headers)
     headers["Cookie"] = payload.cookie
     headers.setdefault("Accept", "text/html,application/xhtml+xml")
+
+    # The Takeout manage page loads archive data via an internal API.
+    # Try several known endpoint patterns. The cookie is valid across all
+    # of them since they're all takeout.google.com endpoints.
+    api_endpoints = [
+        # Internal Takeout API
+        f"https://takeout.google.com/_/TakeoutApiUi/data?"
+        f"archiveId={archive_id}&authuser={authuser}",
+        # Old API
+        f"https://takeout.google.com/api/v2/manage/archive?"
+        f"id={archive_id}&authuser={authuser}",
+        # List endpoint (returns all archives for the user)
+        f"https://takeout.google.com/api/v2/manage/archives?"
+        f"authuser={authuser}",
+    ]
+
+    for api_url in api_endpoints:
+        debug(f"Trying API endpoint: {api_url}")
+        try:
+            resp = requests.get(api_url, headers=headers,
+                                allow_redirects=True, timeout=15)
+        except requests.RequestException as e:
+            debug(f"API request failed: {e}")
+            continue
+
+        if resp.status_code != 200:
+            debug(f"API returned {resp.status_code}")
+            continue
+        if "accounts.google.com" in resp.url:
+            debug("API redirected to Google signin; cookie invalid")
+            return []
+
+        ctype = resp.headers.get("content-type", "")
+        if "json" in ctype:
+            try:
+                data = resp.json()
+                # Look for our archive in the response
+                payloads = _parse_manifest_json(data, payload)
+                if payloads:
+                    ok(f"Got {len(payloads)} archives from API.")
+                    return payloads
+            except Exception as e:
+                debug(f"JSON parse failed: {e}")
+
+    # Fall back to fetching the manage page HTML and scraping URLs.
+    page_url = (
+        f"https://takeout.google.com/u/{authuser}/manage/archive/{archive_id}"
+    )
     debug(f"Fetching manage page: {page_url}")
     try:
         resp = requests.get(page_url, headers=headers,
-                             allow_redirects=True, timeout=15)
+                            allow_redirects=True, timeout=15)
     except requests.RequestException as e:
         debug(f"Manage page fetch failed: {e}")
         return []
@@ -357,21 +401,10 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
     if resp.status_code != 200:
         debug(f"Manage page returned {resp.status_code}")
         return []
-    final = resp.url
-    if "accounts.google.com" in final:
+    if "accounts.google.com" in resp.url:
         debug("Manage page redirected to Google signin; cookie invalid")
         return []
 
-    # Try to parse as JSON first (some Takeout API endpoints return JSON).
-    ctype = resp.headers.get("content-type", "")
-    if "json" in ctype:
-        try:
-            return _parse_manifest_json(resp.json(), payload)
-        except Exception as e:
-            debug(f"JSON manifest parse failed: {e}")
-
-    # Fall back to HTML parsing: extract all takeout-download URLs and
-    # the surrounding filename context.
     html = resp.text
     urls = re.findall(
         r'https://takeout-download\.usercontent\.google\.com/'
@@ -385,13 +418,11 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
     seen = set()
     payloads = []
     for url in urls:
-        # Strip the query string to dedupe (the same file may appear twice)
-        base_url = url
-        if base_url in seen:
+        if url in seen:
             continue
-        seen.add(base_url)
+        seen.add(url)
         new_payload = TakeoutPayload(
-            url=base_url,
+            url=url,
             cookie=payload.cookie,
             headers=dict(payload.headers),
             method="GET",
@@ -404,12 +435,19 @@ def fetch_takeout_manifest(payload: TakeoutPayload) -> list[TakeoutPayload]:
 
 
 def _parse_manifest_json(data: dict, payload: TakeoutPayload) -> list[TakeoutPayload]:
-    """Parse a JSON Takeout manifest response into TakeoutPayloads."""
+    """Parse a JSON Takeout manifest response into TakeoutPayloads.
+
+    Handles several shapes:
+    - {"exports": [{"downloadUrl": "..."}]}
+    - {"archive": {"parts": [{"url": "..."}]}}
+    - {"archives": [{"id": "...", "parts": [...]}]} — list of all archives
+    - [{"downloadUrl": "..."}] — plain array
+    """
     payloads = []
-    # Common shapes: {"exports": [{"downloadUrl": "..."}]}, or
-    # {"archive": {"parts": [{"url": "..."}]}}
-    candidates = []
-    if isinstance(data, dict):
+    candidates: list = []
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
         for key in ("exports", "parts", "items", "downloads", "files"):
             if key in data and isinstance(data[key], list):
                 candidates = data[key]
@@ -421,11 +459,22 @@ def _parse_manifest_json(data: dict, payload: TakeoutPayload) -> list[TakeoutPay
                     if key in archive and isinstance(archive[key], list):
                         candidates = archive[key]
                         break
+        # List of all archives for this user
+        if not candidates and "archives" in data:
+            archives = data["archives"]
+            if isinstance(archives, list):
+                for arch in archives:
+                    if not isinstance(arch, dict):
+                        continue
+                    for key in ("parts", "downloads", "files", "exportUrls"):
+                        if key in arch and isinstance(arch[key], list):
+                            candidates.extend(arch[key])
     for item in candidates:
         if not isinstance(item, dict):
             continue
         url = (item.get("downloadUrl") or item.get("url")
-               or item.get("link") or item.get("href"))
+               or item.get("link") or item.get("href")
+               or item.get("download_url"))
         if not url:
             continue
         if "takeout" not in url.lower():
@@ -1203,6 +1252,9 @@ def main() -> int:
                         help=f"max parts to discover (default {MAX_PARTS})")
     parser.add_argument("--out", "--output-dir", dest="output_dir",
                         help="output directory for archives (prompted if omitted)")
+    parser.add_argument("--fresh", "--no-resume", dest="fresh",
+                        action="store_true",
+                        help="ignore saved state, re-discover from scratch")
     args = parser.parse_args()
 
     if args.output_dir:
@@ -1254,17 +1306,29 @@ def main() -> int:
     # Try to resume from state in the chosen folder.
     state = load_state(output_dir)
     parts: list[dict] | None = None
-    if state and state_matches_payload(state, payload):
+    if state and state_matches_payload(state, payload) and not args.fresh:
         parts = state_to_parts(state, payload)
         if parts:
             saved_complete = sum(1 for p in parts if p["have"])
-            ok(f"Resuming from {state_path(output_dir)}: "
-               f"{saved_complete}/{len(parts)} parts marked complete.")
-            info("Re-verifying files on disk before downloading anything.")
-            # Re-verify saved parts against the actual filesystem. The size
-            # on disk could differ from what's in state if files changed.
-            _, incomplete = verify_parts(parts, output_dir)
-            parts = [p for p in parts if p["have"]] + incomplete
+            # Sanity check: a typical Takeout export has 3+ parts. If the
+            # saved state has only 1-2 parts, discovery probably ran with a
+            # stale cookie and missed the rest. Warn and offer to re-run.
+            if len(parts) <= 2:
+                warn(f"State file has only {len(parts)} parts. "
+                     "This may be incomplete from a previous run.")
+                info("Pass --fresh to force re-discovery, or type the actual "
+                     "part count below to extend the list.")
+                # Don't trust the state; fall through to discovery. The
+                # discovery loop will detect existing files via verify.
+            else:
+                ok(f"Resuming from {state_path(output_dir)}: "
+                   f"{saved_complete}/{len(parts)} parts marked complete.")
+                info("Re-verifying files on disk before downloading anything.")
+                # Re-verify saved parts against the actual filesystem. The
+                # size on disk could differ from what's in state if files
+                # changed.
+                _, incomplete = verify_parts(parts, output_dir)
+                parts = [p for p in parts if p["have"]] + incomplete
 
     # Discover (also validates auth). Re-prompt on auth failure.
     if not parts:

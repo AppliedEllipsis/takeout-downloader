@@ -141,7 +141,9 @@ services:
   #     echo '{...}' > downloads/in.json
   #     docker compose run --rm takeout-cli
   #
-  # Or pass --payload-file / --output-dir to override.
+  # Pass flags after the service name. With equals signs use a space:
+  #   docker compose run --rm takeout-cli --out /opt/storage/...
+  # With equals signs Docker Compose may strip them; use space separator.
   takeout-cli:
     build: .
     image: takeout-downloader:latest

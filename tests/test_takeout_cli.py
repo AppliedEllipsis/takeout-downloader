@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from unittest import mock
@@ -35,7 +36,9 @@ from takeout_payload import parse_payload  # noqa: E402
 # ---------------------------------------------------------------------------
 def test_logger_writes_to_file(tmp_path):
     log_path = tmp_path / "test.log"
-    logger = takeout_cli._install_logger(log_path)
+    takeout_cli._install_logger(log_path, max_bytes=1024 * 1024,
+                                backup_count=3)
+    logger = takeout_cli.log
     logger.info("hello world")
     logger.info("with %s", "interpolation")
     # Flush handlers.
@@ -50,7 +53,8 @@ def test_logger_writes_to_file(tmp_path):
 def test_logger_rotates(tmp_path):
     log_path = tmp_path / "rot.log"
     # Tiny rotation budget so we can prove it triggers in a test.
-    logger = takeout_cli._install_logger(log_path)
+    takeout_cli._install_logger(log_path, max_bytes=256, backup_count=3)
+    logger = takeout_cli.log
     # Patch the maxBytes on the RotatingFileHandler for this test only.
     for h in logger.handlers:
         if isinstance(h, logging.handlers.RotatingFileHandler):
@@ -279,3 +283,215 @@ def test_human_size_basic():
     assert takeout_cli.human_size(1024) == "1.0 KB"
     assert takeout_cli.human_size(1024 * 1024) == "1.0 MB"
     assert takeout_cli.human_size(1024 * 1024 * 1024) == "1.0 GB"
+
+
+# ---------------------------------------------------------------------------
+# ZIP validation
+# ---------------------------------------------------------------------------
+def test_is_valid_zip_true(tmp_path):
+    p = tmp_path / "ok.zip"
+    # Build a minimal ZIP with EOCD record. The easiest way is to use zipfile.
+    import zipfile
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("hello.txt", "world")
+    assert takeout_cli.is_valid_zip(p) is True
+
+
+def test_is_valid_zip_false_for_html(tmp_path):
+    p = tmp_path / "fake.zip"
+    p.write_bytes(b"<html><body>Google signin page</body></html>")
+    assert takeout_cli.is_valid_zip(p) is False
+
+
+def test_is_valid_zip_false_for_truncated(tmp_path):
+    p = tmp_path / "small.zip"
+    p.write_bytes(b"PK\x03\x04")  # local file header but no EOCD
+    assert takeout_cli.is_valid_zip(p) is False
+
+
+def test_is_valid_zip_false_for_empty(tmp_path):
+    p = tmp_path / "empty.zip"
+    p.write_bytes(b"")
+    assert takeout_cli.is_valid_zip(p) is False
+
+
+# ---------------------------------------------------------------------------
+# verify_parts — size + ZIP signature combined
+# ---------------------------------------------------------------------------
+def test_verify_parts_marks_bad_zip_incomplete(tmp_path):
+    import zipfile
+    good = tmp_path / "good.zip"
+    bad = tmp_path / "bad.zip"
+    with zipfile.ZipFile(good, "w") as zf:
+        zf.writestr("a.txt", "x")
+    bad.write_bytes(b"not a zip, just text")
+    parts = [
+        {"num": 1, "filename": "good.zip", "size": good.stat().st_size,
+         "have": False},
+        {"num": 2, "filename": "bad.zip", "size": bad.stat().st_size,
+         "have": False},
+    ]
+    complete, incomplete = takeout_cli.verify_parts(parts, tmp_path)
+    assert len(complete) == 1
+    assert complete[0]["filename"] == "good.zip"
+    assert len(incomplete) == 1
+    assert incomplete[0]["filename"] == "bad.zip"
+
+
+def test_verify_parts_marks_short_file_incomplete(tmp_path):
+    import zipfile
+    p = tmp_path / "short.zip"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("a.txt", "x" * 1000)
+    actual = p.stat().st_size
+    parts = [{"num": 1, "filename": "short.zip",
+              "size": actual + 5000,  # claim it's bigger than it is
+              "have": False}]
+    complete, incomplete = takeout_cli.verify_parts(parts, tmp_path)
+    assert len(incomplete) == 1
+
+
+# ---------------------------------------------------------------------------
+# looks_like_auth_failure heuristic
+# ---------------------------------------------------------------------------
+def test_looks_like_auth_failure_triggers_above_80_percent():
+    parts = [{"num": i} for i in range(10)]
+    incomplete = [{"num": i} for i in range(9)]  # 90%
+    assert takeout_cli.looks_like_auth_failure(parts, incomplete) is True
+
+
+def test_looks_like_auth_failure_doesnt_trigger_below_80_percent():
+    parts = [{"num": i} for i in range(10)]
+    incomplete = [{"num": i} for i in range(7)]  # 70% — partial network failure
+    assert takeout_cli.looks_like_auth_failure(parts, incomplete) is False
+
+
+# ---------------------------------------------------------------------------
+# Paste prompt — feed JSON via stdin
+# ---------------------------------------------------------------------------
+def test_prompt_for_paste_reads_complete_json(monkeypatch):
+    payload = '{"hello": "world", "n": 42}'
+    monkeypatch.setattr(sys, "stdin",
+                        io.StringIO(payload + "\n"))
+    # prompt_for_paste uses input() which reads from stdin.
+    got = takeout_cli.prompt_for_paste()
+    assert got == payload
+
+
+def test_prompt_for_paste_handles_multiline(monkeypatch):
+    payload = '{\n  "hello": "world",\n  "n": 42\n}'
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload + "\n"))
+    got = takeout_cli.prompt_for_paste()
+    assert '"hello"' in got
+    assert '"n"' in got
+
+
+# ---------------------------------------------------------------------------
+# Auth-failure detection on first probe
+# ---------------------------------------------------------------------------
+def test_discover_parts_auth_error_on_part_1_raises(tmp_path):
+    """If the very first probe hits Google's login, we raise AuthError so the
+    caller can re-prompt — no download attempt, no cookie burn."""
+    payload = _fixture_payload()
+    fake = _FakeResp("https://accounts.google.com/v3/signin",
+                     200, {"content-type": "text/html"})
+    with mock.patch.object(takeout_cli.requests.Session, "get", return_value=fake):
+        with pytest.raises(takeout_cli.AuthError):
+            takeout_cli.discover_parts(payload, tmp_path)
+
+
+def test_discover_parts_partial_set_before_auth_fail(tmp_path):
+    """If 5 parts succeed then the 6th hits a signin, return what we found
+    (don't raise). The caller decides what to do — usually re-prompt."""
+    payload = _fixture_payload()
+
+    def fake_get(self, url, **kw):
+        m = re.search(r"-(\d{3})\.zip", url)
+        if not m:
+            raise AssertionError(f"unexpected URL: {url}")
+        n = int(m.group(1))
+        if n <= 5:
+            return _FakeResp(url, 206,
+                             {"content-range": f"bytes 0-0/{n * 1000}",
+                              "content-type": "application/octet-stream"})
+        if n == 6:
+            return _FakeResp("https://accounts.google.com/signin",
+                             200, {"content-type": "text/html"})
+        # Shouldn't be called.
+        return _FakeResp(url, 404, {})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path)
+    nums = [p["num"] for p in parts]
+    assert nums == [1, 2, 3, 4, 5]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end happy path with mocks (no real network)
+# ---------------------------------------------------------------------------
+def test_full_flow_with_mocks(tmp_path, monkeypatch):
+    """Walk through: paste -> parse -> discover -> aria2 -> verify.
+
+    aria2c is mocked so we don't actually run a subprocess. The 'download'
+    is simulated by having verify_parts see a real ZIP file of the right size.
+    """
+    import subprocess as sp
+
+    payload_text = (ROOT / "tests" / "fixtures" / "sample_payload.json").read_text()
+
+    # 1) Paste step: feed the JSON via stdin.
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload_text + "\n"))
+    parsed = takeout_cli.parse_one_payload()
+    assert parsed.cookie  # parsed OK
+
+    # 2) Discovery step: each probe returns size 1000.
+    def fake_get(self, url, **kw):
+        m = re.search(r"-(\d{3})\.zip", url)
+        n = int(m.group(1)) if m else 1
+        if n <= 2:
+            return _FakeResp(url, 206,
+                             {"content-range": f"bytes 0-0/1000",
+                              "content-type": "application/octet-stream"})
+        return _FakeResp(url, 404, {})
+
+    # 3) aria2c step: simulate by writing a valid ZIP for each requested part.
+    def fake_run(cmd, **kw):
+        # Parse the -i file and create files for each `out=` line.
+        i_idx = cmd.index("-i")
+        i_path = Path(cmd[i_idx + 1])
+        body = i_path.read_text()
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith("out="):
+                fname = line.split("=", 1)[1]
+                (tmp_path / fname).write_bytes(
+                    zipfile_make_bytes(1000)
+                )
+        # Cleanup the input file
+        try:
+            i_path.unlink()
+        except OSError:
+            pass
+        return sp.CompletedProcess(cmd, 0)
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get), \
+         mock.patch.object(sp, "run", side_effect=fake_run):
+        parts = takeout_cli.discover_parts(parsed, tmp_path)
+        need = [p for p in parts if not p["have"]]
+        assert len(need) == 2
+        body = takeout_cli.build_aria2_input(parts, parsed, tmp_path)
+        rc = takeout_cli.run_aria2c(body, tmp_path, 2)
+        assert rc == 0
+        complete, incomplete = takeout_cli.verify_parts(parts, tmp_path)
+        assert len(complete) == 2
+        assert len(incomplete) == 0
+
+
+def zipfile_make_bytes(size: int) -> bytes:
+    """Build a minimal valid ZIP of at least `size` bytes total."""
+    import io as _io
+    import zipfile
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("pad.bin", "x" * max(1, size))
+    return buf.getvalue()

@@ -72,6 +72,7 @@ MAX_PARTS = int(os.environ.get("MAX_PARTS", "500"))
 MAX_AUTH_REPROMPTS = int(os.environ.get("MAX_AUTH_REPROMPTS", "5"))
 PROBE_TIMEOUT = (10, 30)
 CONSECUTIVE_404_STOP = 2
+SAME_SIZE_STREAK_STOP = 2  # stop if N consecutive parts have identical size
 ZIP_EOCD = b"PK\x05\x06"
 ZIP_EOCD_SCAN = 1024  # bytes to scan at end of file for the EOCD record
 STATE_FILENAME = "takeout_state.json"
@@ -576,12 +577,16 @@ def _probe_part(session: requests.Session, url: str,
                 headers: dict) -> int | None:
     """Probe one part with a 1-byte Range request.
 
-    Returns total size in bytes if the part exists, None if 404.
+    Returns total size in bytes if the part exists, None if missing (404,
+    400 bad-request from a mismatched query string, or any other non-OK
+    response after auth checks).
     Raises AuthError if Google served a signin page or HTML.
 
     Google behavior to disambiguate:
       alive cookie + part OK     -> 206 + Content-Range: bytes 0-0/<size>
       alive cookie + part missing-> 404
+      alive cookie + bad query   -> 400 (query params like `i=` may be
+                                   part-specific; we treat as "missing")
       expired cookie             -> 302 -> accounts.google.com (final url),
                                      then 200 text/html (Google signin page)
       some servers ignore Range  -> 200 + Content-Length = full size
@@ -605,17 +610,26 @@ def _probe_part(session: requests.Session, url: str,
             raise AuthError(f"HTTP {resp.status_code}")
         if resp.status_code == 404:
             return None
+        if resp.status_code == 400:
+            # Mismatched query params (e.g. reusing `i=3` on part 002).
+            # Treat as "this part doesn't exist".
+            debug(f"  <- 400 (bad request); treating as missing part")
+            return None
         if resp.status_code == 416:
             return 0  # part exists with 0 bytes
-        cr = resp.headers.get("content-range", "")
-        m = re.search(r"/(\d+)\s*$", cr)
-        if m:
-            return int(m.group(1))
-        if resp.status_code == 200:
-            cl = resp.headers.get("content-length")
-            if cl and cl.isdigit():
-                return int(cl)
-        return 0  # exists but size unknown
+        if resp.status_code in (200, 206):
+            cr = resp.headers.get("content-range", "")
+            m = re.search(r"/(\d+)\s*$", cr)
+            if m:
+                return int(m.group(1))
+            if resp.status_code == 200:
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit():
+                    return int(cl)
+            return 0  # 200/206 but no size info
+        # Any other response (410 Gone, 500, etc.) → treat as missing.
+        debug(f"  <- {resp.status_code} (unexpected); treating as missing part")
+        return None
     finally:
         resp.close()
 
@@ -632,6 +646,8 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
 
     parts: list[dict] = []
     consecutive_misses = 0
+    same_size_streak = 0
+    last_size: int | None = None
     session = requests.Session()
     base_filename = base.split("/")[-1]
 
@@ -654,7 +670,7 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
             break
 
         if size is None:
-            debug(f"probe #{num:03d} -> 404 (end of set)")
+            debug(f"probe #{num:03d} -> missing (end of set)")
             consecutive_misses += 1
             if consecutive_misses >= CONSECUTIVE_404_STOP:
                 debug(f"  {CONSECUTIVE_404_STOP} consecutive misses; end of set")
@@ -662,6 +678,25 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path) -> list[dict]:
             continue
         consecutive_misses = 0
         debug(f"probe #{num:03d} -> {size} bytes")
+
+        # Heuristic: if N consecutive parts have the exact same size,
+        # Google is serving generic placeholder responses. The real set
+        # is done. This catches single-part archives where Google returns
+        # 206 for every part number with the same token.
+        if num > 1 and size == last_size:
+            same_size_streak += 1
+            if same_size_streak >= SAME_SIZE_STREAK_STOP:
+                debug(f"  {SAME_SIZE_STREAK_STOP} consecutive parts "
+                      f"with identical size ({human_size(size)}); "
+                      f"real set has {len(parts)} parts")
+                info(f"   Stopping: Google returned the same size "
+                     f"({human_size(size)}) for {SAME_SIZE_STREAK_STOP} "
+                     f"consecutive parts — this archive has {len(parts)} "
+                     f"real part(s).")
+                break
+        else:
+            same_size_streak = 0
+        last_size = size
 
         dest = output_dir / filename
         have = dest.exists() and dest.stat().st_size > 0 and (

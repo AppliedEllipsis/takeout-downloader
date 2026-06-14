@@ -974,3 +974,68 @@ def test_grid_render_buffers_progress_before_gid_known():
         assert "x.zip" in out
     finally:
         sys.stdout = real
+
+
+# ---------------------------------------------------------------------------
+# Same-size streak stop — Google returns identical size for all parts
+# ---------------------------------------------------------------------------
+def test_discover_stops_on_same_size_streak(tmp_path):
+    """If Google returns the same size for N consecutive parts after #1,
+    discovery should stop — the real set is done."""
+    payload = _fixture_payload()
+
+    def fake_get(self, url, **kw):
+        # All parts return the exact same size.
+        return _FakeResp(url, 206,
+                         {"content-range": "bytes 0-0/411587",
+                          "content-type": "application/octet-stream"})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path)
+    # Should stop after SAME_SIZE_STREAK_STOP (2) identical sizes after #1.
+    # Part 1 is appended; part 2 is appended (streak=1); part 3 triggers
+    # break BEFORE append (streak=2). So only 2 parts in the list.
+    assert len(parts) == 2
+    assert parts[0]["num"] == 1
+    assert parts[1]["num"] == 2
+
+
+def test_discover_does_not_stop_when_sizes_differ(tmp_path):
+    """If sizes vary, discovery should continue until 404s."""
+    payload = _fixture_payload()
+
+    def fake_get(self, url, **kw):
+        m = re.search(r"-(\d{3})\.zip", url)
+        n = int(m.group(1)) if m else 1
+        size = n * 1000  # each part has a different size
+        return _FakeResp(url, 206,
+                         {"content-range": f"bytes 0-0/{size}",
+                          "content-type": "application/octet-stream"})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path)
+    # Should continue until 404s (which never happen in this mock).
+    # But MAX_PARTS caps it at 500.
+    assert len(parts) == 500
+
+
+def test_probe_treats_400_as_missing():
+    """400 Bad Request (mismatched query params) should return None."""
+    fake = _FakeResp("https://x/1.zip", 400,
+                     {"content-type": "text/plain"})
+    with mock.patch.object(takeout_cli.requests.Session, "get",
+                           return_value=fake):
+        result = takeout_cli._probe_part(takeout_cli.requests.Session(),
+                                          "https://x/1.zip", {})
+    assert result is None
+
+
+def test_probe_treats_unexpected_status_as_missing():
+    """Any non-200/206 after auth checks should return None."""
+    fake = _FakeResp("https://x/1.zip", 410,
+                     {"content-type": "text/plain"})
+    with mock.patch.object(takeout_cli.requests.Session, "get",
+                           return_value=fake):
+        result = takeout_cli._probe_part(takeout_cli.requests.Session(),
+                                          "https://x/1.zip", {})
+    assert result is None

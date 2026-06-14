@@ -50,7 +50,7 @@ Modules:
   sandbox.py          Capability-denied Lua harness + documented procedure for
                       safe dynamic analysis (no ffi/jit/socket, OS calls
                       stubbed). Explains the containment model.
-  fixtures.py         Generates benign-but-structurally-realistic test samples
+  fixture_generator.py Generates benign-but-structurally-realistic test samples
                       (fake loader chain, encoded blobs) at runtime. NOT
                       committed as files — built fresh for tests, scanned, then
                       thrown away.

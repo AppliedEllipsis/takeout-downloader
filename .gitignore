@@ -36,6 +36,11 @@ test_*.txt
 *.test.json
 *.test.log
 
+# Generated malware-analysis fixtures (built fresh at test time, never committed)
+fakegit_demo_*/
+fakegit_fixture_*/
+_malware_scratch/
+
 # =============================================================================
 # Outscorn directory — removed from history; do NOT re-add
 # (See NOTICE.md — these zips contained suspicious payloads.)

@@ -44,6 +44,22 @@ pip install -r requirements.txt
 python takeout.py
 ```
 
+### Or run it in Docker
+
+The TUI is fully self-contained in a container (Python deps + `aria2c`
+baked in). The TUI is interactive, so use `run` — not `up -d`:
+
+```bash
+docker compose build
+docker compose run --rm takeout
+```
+
+Downloads land in `./downloads` on the host (resume state persists there
+too). Set `OUTPUT_DIR` and other defaults in `.env` if you like. There is
+no server, no exposed port, and no daemon. The browser extension still
+runs in your real browser on the host; the clipboard → paste flow is
+identical to running natively.
+
 Then:
 
 1. Go to [takeout.google.com](https://takeout.google.com) → **Manage exports**.
@@ -147,6 +163,8 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 ├── aria2c_integration.py     # Optional aria2c RPC backend
 ├── dedupe_takeout.py         # Deduplicate downloaded archives by hash
 ├── build.py                  # PyInstaller single-binary build
+├── Dockerfile                # Self-contained TUI image (Python deps + aria2c)
+├── docker-compose.yml        # `docker compose run --rm takeout`
 ├── requirements.txt          # Python dependencies
 └── helpers/                  # Browser extension (Chromium MV3)
     ├── manifest.json

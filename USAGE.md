@@ -66,6 +66,32 @@ pip install -r requirements.txt
 python takeout.py
 ```
 
+### Or run it in Docker
+
+The TUI is self-contained in a container — Python dependencies and
+`aria2c` are baked into the image, so the only host requirement is Docker.
+
+The TUI is **interactive** (it needs a real terminal), so you do *not*
+start it as a background daemon. Use `run`, which attaches your terminal:
+
+```bash
+docker compose build
+docker compose run --rm takeout
+```
+
+Notes:
+
+- Downloads land in `./downloads` on the host. Resume state
+  (`.downloading` parts, `.takeout_sizes.json`) persists there too, so a
+  removed container never loses progress. Inside the container the output
+  dir is always `/downloads`.
+- Configure defaults by creating a `.env` (copied from `.env.example`);
+  it is optional and loaded automatically if present.
+- There is no exposed port and no server. The browser extension still
+  runs in your normal browser on the host — you copy the JSON payload and
+  paste it into the containerized TUI exactly as you would natively.
+- `aria2c` is already on the image's PATH, so the TUI auto-detects it.
+
 ---
 
 ## 3. Install the browser extension

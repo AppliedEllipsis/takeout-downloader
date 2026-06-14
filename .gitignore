@@ -16,7 +16,8 @@ auth_*.txt
 # =============================================================================
 # Runtime / downloaded data — never belongs in source control
 # =============================================================================
-downloads/
+downloads/*
+!downloads/.gitkeep
 takeout-*.zip
 *.zip
 *.tgz

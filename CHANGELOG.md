@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased] — Docker support for the TUI
+
+### Added
+
+- **`Dockerfile` + `docker-compose.yml`** — the TUI is now self-contained
+  in a container, with `aria2c` and all Python deps baked in. Because the
+  TUI is interactive, run it with `docker compose run --rm takeout` (not
+  `up -d`); the compose service sets `stdin_open` + `tty` so Textual gets
+  a real terminal. Downloads and resume state persist in `./downloads` on
+  the host. No server, no exposed port — the extension → clipboard → paste
+  flow is unchanged.
+  - Note: these files had been removed in v6.0 (they only served the old
+    web UI); they are reintroduced here purpose-built for the TUI.
+
 ## [6.1.0] — Retry hardening from cross-project research
 
 Research pass over 9 related Takeout tools (see

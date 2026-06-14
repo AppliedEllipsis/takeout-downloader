@@ -1,0 +1,38 @@
+# Google Takeout Downloader — TUI in a container.
+#
+# The TUI is INTERACTIVE: it needs a terminal. You do NOT start it with
+# `up -d`. Use `run` so Docker attaches your terminal to it:
+#
+#     docker compose build
+#     docker compose run --rm takeout
+#
+# Downloads land in ./downloads on the host (change the volume below or set
+# OUTPUT_DIR in .env). Inside the container the output dir is /downloads.
+#
+# There is no web server, no exposed port, and no daemon — payloads come
+# from the browser extension via your clipboard (Copy as JSON → paste).
+
+services:
+  takeout:
+    build: .
+    image: takeout-downloader:latest
+    container_name: takeout-downloader
+
+    # Give the TUI a real terminal. Both are required for Textual to render.
+    stdin_open: true   # docker run -i
+    tty: true          # docker run -t
+
+    # Optional config — all values have sane defaults; the file need not exist.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # Keep the in-container output dir stable regardless of host .env.
+      OUTPUT_DIR: /downloads
+      TERM: ${TERM:-xterm-256color}
+
+    volumes:
+      # Downloaded archives + resume state (.downloading, .takeout_sizes.json)
+      # persist on the host so a removed container never loses progress.
+      - ./downloads:/downloads

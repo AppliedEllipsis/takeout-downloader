@@ -918,15 +918,46 @@ class TakeoutTUI(App):
                 f"active:{len(active)}",
             )
 
+    def _safe_stat(self, path: Path, timeout: float = 2.0) -> Optional[int]:
+        """Stat a path with a timeout. Returns file size, or None on
+        timeout / error / not-found.
+
+        CRITICAL: this exists because JuiceFS / FUSE mounts can hang
+        indefinitely on stat() if the underlying network is stuck. A naive
+        filepath.exists() / filepath.stat() call on such a mount will freeze
+        the UI thread forever, making the TUI unresponsive to Ctrl+C, 'q',
+        or any input.
+        """
+        import threading
+        result: dict = {"size": None, "err": None}
+        def _do():
+            try:
+                st = path.stat()
+                result["size"] = st.st_size
+            except (FileNotFoundError, OSError) as e:
+                result["err"] = e
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            # Thread is still running — FUSE is hung. Give up on this file.
+            return None
+        if result["err"] is not None:
+            return None
+        return result["size"]
+
     def _build_queue_preview(self, file_count: int) -> None:
         """Populate self.queue_preview by inspecting the output directory.
+
+        Runs INSIDE the worker thread (see run_download) so a hung FUSE mount
+        can't freeze the UI thread. Each file is stat'd with a timeout; if
+        the stat hangs, the file is listed as "unknown" rather than blocking.
 
         For each file N in 1..file_count, determine whether:
           - the final file is on disk and complete -> "exists" (skip)
           - a .downloading partial exists         -> "resume"
-          - a .downloading partial exists but     -> "resume" (will restart if
-            server says 416 Range Not Satisfiable   from 0 on validation failure)
           - nothing on disk                        -> "queued"
+          - stat hung or errored                   -> "unknown" (engine retries)
         This is purely a *preview* — the engine's cleanup_bad_files still
         re-validates before downloading.
         """
@@ -938,13 +969,21 @@ class TakeoutTUI(App):
                 filename = self.downloader.get_filename(num)
                 filepath = self.downloader.get_filepath(num)
                 temp = filepath.with_suffix(".downloading")
-                if filepath.exists() and filepath.stat().st_size > 0:
+                size = self._safe_stat(filepath)
+                if size is not None and size > 0:
                     preview.append((filename, "exists"))
-                elif temp.exists() and temp.stat().st_size > 0:
+                    continue
+                temp_size = self._safe_stat(temp)
+                if temp_size is not None and temp_size > 0:
                     preview.append((filename, "resume"))
-                elif filepath.exists():
+                    continue
+                if size == 0:
+                    # File exists but is empty — treat as missing
                     preview.append((filename, "missing"))
                 else:
+                    # size is None: either not found OR stat timed out.
+                    # Default to "queued" so the engine attempts the download;
+                    # if the file really doesn't exist, it'll 404 quickly.
                     preview.append((filename, "queued"))
             except Exception as e:  # invalid filename, etc. — don't crash preview
                 preview.append((f"file #{num}", f"error: {e}"))
@@ -1105,7 +1144,39 @@ class TakeoutTUI(App):
         return None
 
     def start_download(self) -> None:
-        """Parse the pasted payload and start (or resume) downloading."""
+        """Parse the pasted payload and start (or resume) downloading.
+
+        Wrapped in a try/except so ANY unexpected error (a hung FUSE mount
+        raising EIO, a bug in payload parsing, etc.) is logged instead of
+        silently killing the UI thread. This is what previously left the
+        TUI frozen on the JuiceFS path.
+        """
+        try:
+            self._start_download_impl()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log_message("=" * 60, "error")
+            self.log_message(f"START FAILED: {e}", "error")
+            # Log the full traceback to the file (not the widget — too noisy)
+            try:
+                with open(os.environ.get("TAKEOUT_LOG_FILE", "./takeout.log"), "a", encoding="utf-8") as f:
+                    f.write(tb + "\n")
+            except Exception:
+                pass
+            # Make sure buttons aren't stuck
+            try:
+                self.query_one("#start-btn", Button).disabled = False
+                self.query_one("#stop-btn", Button).disabled = True
+                self.query_one("#pause-btn", Button).disabled = True
+                self.query_one("#resume-btn", Button).disabled = True
+                self.is_downloading = False
+            except Exception:
+                pass
+
+    def _start_download_impl(self) -> None:
+        """The actual start_download body. Split out so the outer wrapper
+        can catch exceptions without swallowing the flow control."""
         # Loud diagnostic block so we can always tell from the log file what
         # state the TUI was in when Start was pressed. Without this, "nothing
         # happens" is impossible to debug.
@@ -1184,23 +1255,9 @@ class TakeoutTUI(App):
         self.log_message(f"{verb}: {file_count} files, {parallel} parallel (cookie {cookie_chars} chars)")
         self.log_message(f"Output: {output_dir}")
 
-        # Build the queue preview NOW (after set_curl, before clearing state)
-        # so the user sees what's queued / resumable / already done before
-        # any worker thread fires. This populates the downloads table with
-        # the full expected file list.
-        try:
-            self._build_queue_preview(file_count)
-            queued = sum(1 for _, s in self.queue_preview if s == "queued")
-            resume = sum(1 for _, s in self.queue_preview if s == "resume")
-            existing = sum(1 for _, s in self.queue_preview if s == "exists")
-            self.log_message(
-                f"Queue: {queued} to download, {resume} to resume, "
-                f"{existing} already on disk (will skip)"
-            )
-            self.update_downloads_table()
-        except Exception as e:
-            # Preview is best-effort; downloads still proceed without it.
-            self.log_message(f"⚠ Could not build queue preview: {e}", "warning")
+        # NOTE: queue preview is built in run_download (worker thread) so a
+        # hung FUSE mount on filepath.stat() can't freeze the UI thread. The
+        # preview will appear in the table a beat after we hand off.
 
         # Reset run state. Preserve cumulative stats on resume so the user sees
         # total progress, but reset on a fresh start.
@@ -1231,6 +1288,25 @@ class TakeoutTUI(App):
         self.downloader.should_stop = False
         self.downloader.should_pause = False
         self.downloader.auth_failed = False
+
+        # Build the queue preview HERE (worker thread, not UI thread) so a
+        # hung FUSE/ JuiceFS mount on filepath.stat() can't freeze the UI.
+        # Without this, the TUI deadlocked on the JuiceFS path the user has.
+        try:
+            self._build_queue_preview(file_count)
+            queued = sum(1 for _, s in self.queue_preview if s == "queued")
+            resume = sum(1 for _, s in self.queue_preview if s == "resume")
+            existing = sum(1 for _, s in self.queue_preview if s == "exists")
+            self.call_from_thread(self.log_message,
+                f"Queue: {queued} to download, {resume} to resume, "
+                f"{existing} already on disk (will skip)")
+            self.call_from_thread(self.update_downloads_table)
+        except Exception as e:
+            self.call_from_thread(
+                self.log_message,
+                f"⚠ Could not build queue preview: {e}",
+                "warning",
+            )
 
         while not self.downloader.should_stop:
             # Clean up bad files
@@ -1631,7 +1707,18 @@ class TakeoutTUI(App):
 
 
 def main():
+    import signal
     app = TakeoutTUI()
+    # Ensure Ctrl+C in the terminal actually kills the process even if the
+    # Textual event loop is wedged on a hung syscall (e.g. JuiceFS stat()
+    # deadlock). Without this, a stuck UI thread ignores SIGINT entirely.
+    def _kill(_signum, _frame):
+        import os
+        os._exit(130)  # 128 + SIGINT(2) = conventional Ctrl+C exit code
+    try:
+        signal.signal(signal.SIGINT, _kill)
+    except (ValueError, OSError):
+        pass  # not on main thread, or signal not available
     app.run()
 
 

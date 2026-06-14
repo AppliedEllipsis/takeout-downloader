@@ -762,11 +762,39 @@ def prompt_for_paste() -> str:
 # ===========================================================================
 # Payload parse + validate (single-shot, no loops)
 # ===========================================================================
-def parse_one_payload() -> TakeoutPayload:
+# Module-level payload source. main() sets this to the relay reader when
+# --relay is passed; otherwise it stays None and the terminal reader is used.
+# All re-prompt call sites (stale-cookie resume loop) inherit the same source.
+_PAYLOAD_SOURCE = None
+
+
+def relay_paste_source(use_tunnel: bool, timeout: int):
+    """Build a zero-arg callable that blocks on the ephemeral relay and
+    returns the received payload text. Falls back to terminal paste if the
+    relay times out or fails to start."""
+    def _read() -> str:
+        try:
+            from paste_server import serve_once
+        except Exception as e:  # noqa: BLE001
+            warn(f"Relay unavailable ({e}); falling back to terminal paste.")
+            return prompt_for_paste()
+        text = serve_once(timeout=timeout, use_tunnel=use_tunnel)
+        if not text:
+            warn("Relay returned nothing; falling back to terminal paste.")
+            return prompt_for_paste()
+        return text
+    return _read
+
+
+def parse_one_payload(source=None) -> TakeoutPayload:
     """Read + parse + validate one payload. If the extension scraped the
     whole page and returned multiple exports, show a menu so the user
-    picks which archive to download. Failures are terminal."""
-    raw = prompt_for_paste()
+    picks which archive to download. Failures are terminal.
+
+    `source` is a zero-arg callable returning the raw payload text. Defaults
+    to the module-level `_PAYLOAD_SOURCE` (set by --relay), then the terminal
+    paste reader."""
+    raw = (source or _PAYLOAD_SOURCE or prompt_for_paste)()
     if not raw.strip():
         err("No JSON received.")
         _payload_fix_hint()
@@ -1340,7 +1368,24 @@ def main() -> int:
     parser.add_argument("--reset-config", dest="reset_config",
                         action="store_true",
                         help="clear ~/.takeout-cli.json (forget last folder)")
+    parser.add_argument("--relay", dest="relay", action="store_true",
+                        help="receive the payload via an ephemeral browser "
+                             "relay instead of terminal paste (good for "
+                             "SSH/tmux/Docker where paste is unreliable)")
+    parser.add_argument("--tunnel", dest="tunnel", action="store_true",
+                        help="with --relay, expose the relay publicly via a "
+                             "Cloudflare quick tunnel (no account needed)")
+    parser.add_argument("--relay-timeout", dest="relay_timeout", type=int,
+                        default=int(os.environ.get("PASTE_RELAY_TIMEOUT", "600")),
+                        help="seconds the relay waits before self-destruct "
+                             "(default 600)")
     args = parser.parse_args()
+
+    # Wire up the payload source. With --relay, every paste prompt (including
+    # the stale-cookie re-prompt loop) reads from the ephemeral browser relay.
+    global _PAYLOAD_SOURCE
+    if args.relay:
+        _PAYLOAD_SOURCE = relay_paste_source(args.tunnel, args.relay_timeout)
 
     if args.reset_config:
         p = _config_path()

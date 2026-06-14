@@ -6,6 +6,22 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **Ephemeral paste relay (`--relay`).** "ngrok but zero-config" for
+  getting the JSON payload into the CLI over SSH → tmux → Docker, where
+  terminal paste is unreliable (bracketed-paste markers get stripped,
+  long lines wrap). The CLI starts a tiny single-use HTTP server, prints
+  a URL with a 192-bit random token in the path, and blocks until you
+  open it in the browser that has the extension and paste the payload
+  into a textarea. Hardened three ways because the payload holds a live
+  Google session cookie: (1) unguessable random token, (2) single-use
+  — the first valid POST shuts the server down, (3) short TTL
+  self-destruct (default 600s, `--relay-timeout`). Binds to 127.0.0.1 by
+  default; never logs the cookie value; constant-time token compare.
+  Add `--tunnel` to expose it publicly via a Cloudflare quick tunnel
+  (no account, ephemeral `*.trycloudflare.com` URL, dials outbound so no
+  port mapping needed even in Docker). Stdlib-only — lives in
+  `paste_server.py`, also runnable standalone
+  (`python paste_server.py --tunnel --print`).
 - **Live grid UI in the CLI.** When stdout is a TTY, the CLI renders a
   fixed-position grid of every part — progress bar + bytes + speed +
   ETA + filename — using ANSI escape codes. Re-drawn in place on each

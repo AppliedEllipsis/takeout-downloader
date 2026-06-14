@@ -250,7 +250,11 @@ docker compose run --rm takeout-cli < downloads/in.json
 python takeout_cli.py -p 5              # 5 concurrent downloads
 python takeout_cli.py --max-parts 200   # cap discovery at 200 parts
 python takeout_cli.py --output-dir /srv/storage/google-takeout/me
+python takeout_cli.py --relay           # receive the JSON via a browser relay
+python takeout_cli.py --relay --tunnel  # ...and expose it over a Cloudflare tunnel
 ```
+
+See [section 6b](#6b-paste-relay-ngrok-but-zero-config) for the relay.
 
 ### Useful env vars
 
@@ -277,6 +281,86 @@ python takeout_cli_analyze.py downloads/takeout_cli.log --json
 # Live tail
 python takeout_cli_analyze.py downloads/takeout_cli.log --follow
 ```
+
+---
+
+## 6b. Paste relay ("ngrok but zero-config")
+
+Pasting a big JSON blob through SSH → tmux → a Docker container's stdin is
+fragile: bracketed-paste markers get stripped, long lines wrap, the terminal
+chokes. The `--relay` flag sidesteps the terminal entirely.
+
+Instead of pasting into the terminal, the CLI starts a tiny single-use HTTP
+server, prints a URL, and waits. You open that URL in the **same browser that
+has the extension**, paste the payload into a textarea, click Send — the CLI
+receives it directly.
+
+```bash
+python takeout_cli.py --relay
+```
+```
+  Paste relay is live (single-use, self-destructs).
+    http://127.0.0.1:54123/Hf8x...Qe2
+    Open this in the browser that has the extension,
+    paste the JSON, click Send. The CLI picks it up here.
+    Expires in 600s if unused.
+```
+
+### Reaching it from another machine
+
+The local URL only works if the browser is on the same host. Two options:
+
+**A. SSH port-forward (most secure).** Forward the relay port over your
+existing SSH session, then open the URL on your laptop:
+
+```bash
+# the relay prints its port; forward it
+ssh -L 54123:127.0.0.1:54123 user@server
+# then open http://127.0.0.1:54123/<token> in your local browser
+```
+
+**B. Cloudflare quick tunnel (`--tunnel`).** Zero-config public URL, no
+account. The CLI launches `cloudflared tunnel --url ...`, which dials
+*outbound* (no inbound port to open, works inside Docker), and prints an
+ephemeral `https://<random>.trycloudflare.com/<token>` URL:
+
+```bash
+python takeout_cli.py --relay --tunnel
+```
+
+### Security model
+
+The payload holds a **live Google session cookie**, so the relay is hardened:
+
+| guard | how |
+|-------|-----|
+| Unguessable | 192-bit random token in the URL path; no token → 404 |
+| Single-use | the first valid submission stops the server; replays hit a dead port |
+| Short TTL | self-destructs after `--relay-timeout` seconds (default 600), used or not |
+| Local by default | binds `127.0.0.1`; public exposure is opt-in via `--tunnel` |
+| No cookie in logs | request logging is suppressed; the cookie value is never printed |
+| Constant-time compare | token path matched with `hmac.compare_digest` |
+
+### Standalone
+
+The relay is also a standalone tool (stdlib only, no deps):
+
+```bash
+python paste_server.py --tunnel --timeout 600 --print | jq .
+```
+
+### Relay flags
+
+| flag | default | what |
+|------|---------|------|
+| `--relay` | off | receive the payload via the browser relay |
+| `--tunnel` | off | with `--relay`, expose it via a Cloudflare quick tunnel |
+| `--relay-timeout N` | `600` | seconds before the relay self-destructs |
+| `PASTE_RELAY_TIMEOUT` (env) | `600` | same as `--relay-timeout` |
+| `CLOUDFLARED_BIN` (env) | `cloudflared` | path to the cloudflared binary |
+
+If `cloudflared` isn't installed, `--tunnel` falls back to the local URL with
+a hint. If the relay times out, the CLI falls back to terminal paste.
 
 ---
 

@@ -461,7 +461,7 @@ class TakeoutTUI(App):
         self.log_message(f"Log file: {os.path.abspath(log_file)}")
         self.log_message(f"CWD: {os.getcwd()}")
         self.log_message(f"Default output dir: {DEFAULT_OUTPUT_DIR}")
-        self.log_message(f"Payload search roots: output_dir, cwd, /downloads, /downloads/drop, /drop, $HOME")
+        self.log_message(f"Payload search roots: output_dir, cwd, /downloads, /downloads/drop, /drop, /work, /work/drop, $HOME")
         self.log_message(f"Payload filenames: {', '.join(self.PAYLOAD_FILENAMES)}")
 
         # Restore last-used settings (output dir, file count, parallel).
@@ -596,6 +596,9 @@ class TakeoutTUI(App):
     def log_message(self, message: str, level: str = "info"):
         """Add a message to the log widget AND mirror it to a file.
 
+        ERROR-level messages also ring the bell and flash the title so they
+        can't be missed if the Log widget is scrolled away or hidden.
+
         The on-screen Log widget can scroll past new lines or be hidden when
         the user resizes panes, so every message also goes to a plain-text
         file (default: ./takeout.log, override with TAKEOUT_LOG_FILE). The
@@ -612,6 +615,18 @@ class TakeoutTUI(App):
             log.scroll_end(animate=False)
         except Exception:
             pass
+        # Errors must be unmissable: ring the bell, flash the title. This works
+        # even when the user is looking at another pane in tmux (if `set -g
+        # monitor-bell on` is set).
+        if level == "error":
+            try:
+                self.bell()
+            except Exception:
+                pass
+            try:
+                self._fire_alert(f"⚠ {message.splitlines()[0][:60]}")
+            except Exception:
+                pass
         # Mirror to file (best-effort — never raise from a log call).
         try:
             log_path = os.environ.get("TAKEOUT_LOG_FILE", "./takeout.log")
@@ -949,6 +964,11 @@ class TakeoutTUI(App):
             Path("/downloads"),
             Path("/downloads/drop"),
             Path("/drop"),
+            # /work is the project root mounted by docker-compose (.:/work).
+            # Also look in /work/drop as a convenience if the user put it in
+            # a sibling folder.
+            Path("/work"),
+            Path("/work/drop"),
             Path.home(),
         ]
         # De-dupe while preserving order.
@@ -986,10 +1006,25 @@ class TakeoutTUI(App):
             except OSError:
                 continue
 
-        searched = ", ".join(str(c) for c in candidates[:4])
+        searched = ", ".join(str(c) for c in candidates[:6])
+        remaining = f" (+{len(candidates) - 6} more)" if len(candidates) > 6 else ""
+        # Suggest the exact host-side command that would fix this in one step.
+        host_hint = ""
+        try:
+            host_out = output_dir.replace("/downloads", "./downloads")
+            host_hint = (
+                f"\n  → Quick fix on the HOST: "
+                f"`echo '{{\"schema\":1,...}}' > {host_out}/in.json` "
+                f"then type '.' again."
+            )
+        except Exception:
+            pass
         self.log_message(
-            f"ERROR: No payload file found. Write your JSON to one of "
-            f"{', '.join(self.PAYLOAD_FILENAMES)} (searched: {searched}…)",
+            f"ERROR: No payload file found in any of "
+            f"{len({Path(c).parent for c in candidates})} search roots.\n"
+            f"  Filenames tried: {', '.join(self.PAYLOAD_FILENAMES)}\n"
+            f"  Searched: {searched}{remaining}"
+            f"{host_hint}",
             "error",
         )
         return None

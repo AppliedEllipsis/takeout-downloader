@@ -8,9 +8,10 @@
 #
 # WHERE FILES LAND
 # ----------------
-# Two volumes are mounted:
+# Three volumes are mounted:
 #   1. ./downloads        -> /downloads   (default output + resume state)
 #   2. /opt (host)        -> /opt         (your JuiceFS / encfs storage)
+#   3. . (app folder)     -> /work        (source dir; in.json here is found)
 #
 # Inside the TUI you can set the output directory to anything under /downloads
 # or /opt. To save into e.g.
@@ -18,6 +19,21 @@
 # just type or Browse to that path in the TUI — it's visible because /opt is
 # mounted. A host symlink like ./downloads/opt -> /opt is also followed by the
 # TUI (paths are resolved before the allowed-dir check).
+#
+# WRITING THE PAYLOAD FILE
+# ------------------------
+# The TUI searches these in.json / payload.json / curl.txt locations in order:
+#   - the output dir you set (e.g. /srv/storage/google-takeout/.../in.json)
+#   - the container cwd (/app — usually unmounted, skip)
+#   - /downloads             (mounted from ./downloads on host)
+#   - /downloads/drop        (mounted from ./drop on host)
+#   - /work                  (mounted from . the app folder on host)
+#   - /work/drop             (convenience alias for ./drop if it exists)
+#   - $HOME (rarely useful in a container)
+#
+# Easiest flow: write to the SAME folder you'll download into:
+#     echo '{...}' > /srv/storage/google-takeout/my-takeout/in.json
+# Then type '.' in the TUI.
 #
 # JUICEFS / FUSE SUBMOUNTS
 # ------------------------
@@ -35,7 +51,8 @@
 # the submounts present at start, which is the common case).
 #
 # There is no web server, no exposed port, and no daemon — payloads come from
-# the browser extension via your clipboard (Copy as JSON -> paste).
+# the browser extension via your clipboard (Copy as JSON -> paste), or from
+# in.json in one of the mounted folders (type '.' in the TUI).
 
 services:
   takeout:
@@ -81,6 +98,12 @@ services:
       # SSH->tmux->Docker paste path entirely. The TUI searches /downloads/drop
       # (among others) for in.json / payload.json / curl.txt.
       - ./drop:/downloads/drop
+
+      # App folder mounted at /work so a file written anywhere in the project
+      # (e.g. ./in.json or ./payload.json) is visible inside the container.
+      # Without this, files written to the source directory are invisible to
+      # the TUI because the container's /app is not the same folder.
+      - .:/work
 
       # Host /opt (with its JuiceFS + encfs FUSE submounts) visible in-container.
       # bind-recursive + rslave is what makes the nested FUSE mounts show up.

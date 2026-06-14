@@ -162,6 +162,7 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 - [`docs/EXTENSION.md`](./docs/EXTENSION.md) — installing and using the browser extension.
 - [`USAGE.md`](./USAGE.md) — step-by-step usage guide.
 - [`docs/BEST_PRACTICES.md`](./docs/BEST_PRACTICES.md) — research notes on Takeout downloading.
+- [`docs/RELATED_PROJECTS.md`](./docs/RELATED_PROJECTS.md) — survey of other Takeout tools and what this project borrowed from each.
 - [`CHANGELOG.md`](./CHANGELOG.md) — version history.
 
 ## Security model
@@ -175,6 +176,32 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
   (cwd, home, `/opt/`, `/downloads/`, `/tmp/`) to prevent path-traversal
   writes.
 - Nothing is logged or transmitted off-machine.
+
+## Credits & acknowledgements
+
+This project learned from a number of other Takeout tools. None are
+affiliated, but each shaped a decision here — see
+[`docs/RELATED_PROJECTS.md`](./docs/RELATED_PROJECTS.md) for the full
+breakdown of what was borrowed (and what was deliberately left out).
+
+- **[tarballz/mass-takeout-downloader](https://github.com/tarballz/mass-takeout-downloader)**
+  — jittered/capped backoff, permanent-vs-transient failure split, the
+  HTML-as-success trap, and the signed-URL-expiry vs cookie-expiry
+  distinction. The single biggest influence on the retry engine.
+- **[Croissanthology/takeout-choo-choo](https://github.com/Croissanthology/takeout-choo-choo)**
+  — per-run workspace state and the "~5 parallel is the practical max"
+  rate-cap guidance.
+- **[cschladetsch/PyGoogleTakeoutDownloader](https://github.com/cschladetsch/PyGoogleTakeoutDownloader)**
+  — part-range and inter-file-delay ideas (logged as future features); its
+  stored-credential model was deliberately *not* adopted.
+- **[Max Glenister](https://blog.omgmog.net/post/downloading-google-takeout-to-a-nas/)**
+  & **[CorpIT](https://www.corpit.org/how-to-download-google-takeout-with-aria2/)**
+  — the definitive cookie-redirect write-up and the exact aria2c flags.
+- **[GooglePhotosTakeoutHelper](https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper)**,
+  **[google-photos-exif](https://github.com/mattwilson1024/google-photos-exif)**,
+  **[google-metadata-matcher](https://github.com/Greegko/google-metadata-matcher)**,
+  **[google_takeout_parser](https://github.com/purarue/google_takeout_parser)**
+  — post-download photo/metadata processing, linked for users as the next step.
 
 ## 📜 License & attribution
 

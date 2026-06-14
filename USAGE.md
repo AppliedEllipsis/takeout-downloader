@@ -24,6 +24,7 @@ network between the browser and the TUI.
 10. [Deduplication](#10-deduplication)
 11. [Configuration reference](#11-configuration-reference)
 12. [Troubleshooting](#12-troubleshooting)
+13. [After the download: processing photo archives](#13-after-the-download-processing-photo-archives)
 
 ---
 
@@ -236,8 +237,14 @@ automatically if `python-dotenv` is installed). All are optional.
 | `OUTPUT_DIR` | Default output directory | `./downloads` |
 | `PARALLEL_DOWNLOADS` | Default parallel count (1–20) | `1` |
 | `FILE_COUNT` | Default max part count (1–1000) | `100` |
-| `MAX_RETRIES` | Retries per part on transient errors | `3` |
+| `MAX_RETRIES` | Retries per part on transient errors | `6` |
 | `RETRY_BACKOFF` | Exponential backoff base seconds | `2.0` |
+| `RETRY_MAX_WAIT` | Cap on a single backoff sleep (seconds) | `120.0` |
+
+Retries use exponential backoff with **full jitter** (a random wait between 0
+and the capped exponential) so parallel workers don't retry in lockstep and
+hammer Google at the same instant. On HTTP `429`/`503` the TUI honours the
+`Retry-After` header when present.
 
 Output directories are restricted to the current working directory, your home
 directory, `/opt/`, `/downloads/`, and `/tmp/` to prevent path traversal.
@@ -267,3 +274,44 @@ Use `-x 1 -s 1 -c`. Google blocks multi-stream Takeout downloads.
 **The bell doesn't make a sound.**
 Some terminals map the bell to a silent visual flash. The title-bar flash and
 red alert panel still fire regardless. Check your terminal's bell settings.
+
+**Downloads fail immediately with 403/401 even right after a fresh capture.**
+Two different expiries are at play. The *session cookie* expires fast (minutes
+to a few parts) — re-capture and Resume. The *export itself* (the signed
+download URLs) expires about a **week** after Google generates it; once that
+happens no cookie will help and you must regenerate the export from
+[takeout.google.com/manage](https://takeout.google.com/manage). (Distinction
+documented by `tarballz/mass-takeout-downloader`.)
+
+---
+
+## 13. After the download: processing photo archives
+
+This tool gets the `.zip`/`.tgz` parts onto disk. If your export is **Google
+Photos**, the extracted archive needs post-processing — Google stores each
+photo's real date and GPS in a sidecar `.json` file rather than in the image
+EXIF, so a naive import lands everything with the wrong timestamps. These
+companion tools fix that (none are affiliated with this project):
+
+- **[GooglePhotosTakeoutHelper (`gpth`)](https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper)**
+  — organizes the whole archive into one chronological folder, restores dates,
+  handles albums. Has a no-UI mode for headless/NAS use.
+- **[google-photos-exif](https://github.com/mattwilson1024/google-photos-exif)**
+  — writes the missing `DateTimeOriginal` EXIF from the JSON sidecars.
+- **[purarue/google_takeout_parser](https://github.com/purarue/google_takeout_parser)**
+  — parses the *non-photo* data (Search history, Activity, YouTube, Location)
+  into typed Python objects.
+
+Export tips that make post-processing easier (learned from those projects):
+
+- When the format choice is offered, **export JSON, not HTML** — the HTML
+  parsers downstream are slow and fragile.
+- For Google Photos, **deselect custom (non-date) albums** at export time, or
+  every photo gets duplicated (once under its date album, once under each
+  custom album).
+- If your export spans multiple archives, **merge the `Takeout/` folders**
+  (merge same-named subfolders, don't overwrite) before running any of the
+  photo tools.
+
+See [`docs/RELATED_PROJECTS.md`](./docs/RELATED_PROJECTS.md) for the full
+survey of tools studied and what this project borrowed from each.

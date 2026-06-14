@@ -36,7 +36,7 @@ import requests
 
 from takeout import (
     TakeoutDownloader, DownloadStats,
-    validate_output_dir,
+    validate_output_dir, compute_backoff, _retry_after_seconds,
     VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL,
     MAX_PARALLEL, MAX_FILE_COUNT, MAX_RETRIES
 )
@@ -569,6 +569,19 @@ class TakeoutTUI(App):
                 if 'accounts.google' in response.url:
                     return False, "AUTH_FAILED"
 
+                # 429 / 503 = rate limited. Honour Retry-After, else jittered backoff.
+                if response.status_code in (429, 503):
+                    if attempt < MAX_RETRIES - 1:
+                        import time
+                        wait = _retry_after_seconds(response) or compute_backoff(attempt)
+                        with self._lock:
+                            if filename in self.active_downloads:
+                                self.active_downloads[filename].status = f"Rate limited, waiting {wait:.0f}s"
+                        self.call_from_thread(self.update_downloads_table)
+                        time.sleep(wait)
+                        continue
+                    return False, "RATE_LIMITED"
+
                 # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
                 if response.status_code == 416:
                     if resume_from > 0:
@@ -662,17 +675,17 @@ class TakeoutTUI(App):
             except requests.exceptions.HTTPError as e:
                 if e.response is not None and e.response.status_code == 404:
                     return False, "NOT_FOUND"
-                # Retry on transient errors
+                # Retry transient errors with jittered backoff
                 if attempt < MAX_RETRIES - 1:
                     import time
-                    time.sleep(2 ** attempt)
+                    time.sleep(compute_backoff(attempt))
                     continue
                 return False, str(e)
             except requests.exceptions.RequestException as e:
-                # Retry on transient network errors
+                # Retry transient network errors with jittered backoff
                 if attempt < MAX_RETRIES - 1:
                     import time
-                    time.sleep(2 ** attempt)
+                    time.sleep(compute_backoff(attempt))
                     continue
                 return False, str(e)
 

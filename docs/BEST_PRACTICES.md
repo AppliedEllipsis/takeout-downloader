@@ -5,6 +5,17 @@
 > concrete **Apply to this repo** recommendation so the findings translate
 > into code changes.
 
+> [!NOTE]
+> **Status (v6.0):** This is the original research record. Several
+> recommendations have since been implemented (jittered/capped backoff,
+> explicit 429/503 + `Retry-After` handling, raised retry ceiling). The
+> architecture has also changed: the **Web UI was removed** — the project
+> is now **TUI + browser extension** only, so any "Web UI" recommendations
+> below are historical and no longer apply. See
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) and
+> [`RELATED_PROJECTS.md`](./RELATED_PROJECTS.md) for the current design and
+> the second research round.
+
 ## Sources surveyed
 
 | Source | What it is | Stars/Notes |

@@ -26,7 +26,6 @@ import re
 import sys
 import json
 import time
-import secrets
 import threading
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Callable
@@ -34,7 +33,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Load .env file if present (for standalone use; Docker uses environment vars directly)
+# Load .env file if present (optional — just pre-fills TUI defaults)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -47,7 +46,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = 1
 MAX_PARALLEL = 20
@@ -55,8 +54,44 @@ DEFAULT_FILE_COUNT = 100
 DEFAULT_OUTPUT_DIR = "./downloads"
 SIZE_HISTORY_FILE = ".takeout_sizes.json"
 MAX_FILE_COUNT = 1000
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2.0
+# Retry tuning. Defaults raised from 3→6 based on field reports that
+# Google sessions throw transient 5xx/network errors mid-large-export and
+# usually recover (see tarballz/mass-takeout-downloader notes). Env-overridable.
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
+RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF", "2.0"))
+# Cap a single backoff sleep so parallel workers don't stall for minutes on
+# the last attempt of a high RETRY_BACKOFF_BASE.
+RETRY_MAX_WAIT = float(os.environ.get("RETRY_MAX_WAIT", "120.0"))
+
+
+def compute_backoff(attempt: int) -> float:
+    """Exponential backoff with full jitter, capped at RETRY_MAX_WAIT.
+
+    attempt is 0-indexed. Full jitter (random between 0 and the capped
+    exponential) prevents parallel workers from retrying in lockstep and
+    hammering Google at the same instant — the thundering-herd fix that
+    mass-takeout-downloader documents. Sequence (base=2, cap=120):
+        attempt 0 → up to 2s, 1 → 4s, 2 → 8s, ... 6 → capped 120s.
+    """
+    import random
+    raw = RETRY_BACKOFF_BASE ** (attempt + 1)
+    return random.uniform(0, min(raw, RETRY_MAX_WAIT))
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds form) into a float.
+
+    Google's 429/503 responses sometimes carry Retry-After. We only handle
+    the integer-seconds form (the HTTP-date form is rare here and not worth
+    the parsing surface). Returns None if absent or unparseable, and clamps
+    to RETRY_MAX_WAIT so a hostile header can't stall a worker for hours.
+    """
+    raw = response.headers.get("Retry-After") if response is not None else None
+    if not raw:
+        return None
+    try:
+        return min(float(int(raw.strip())), RETRY_MAX_WAIT)
+    except (ValueError, AttributeError):
+        return None
 
 # Allowed directories for output (resolved paths)
 _ALLOWED_DIRS: Optional[Tuple[Path, ...]] = None
@@ -155,10 +190,6 @@ def validate_output_dir(output_dir: str) -> Path:
         f"{', '.join(str(p) for p in allowed)}"
     )
 
-
-def generate_secret_key() -> str:
-    """Generate a 32-byte hex string suitable for Flask secret_key fallback."""
-    return secrets.token_hex(32)
 
 
 def extract_url_parts(url: str) -> Tuple[Optional[str], Optional[int], Optional[str], str]:
@@ -489,6 +520,18 @@ class TakeoutDownloader:
                 if 'accounts.google' in response.url:
                     return False, "AUTH_FAILED"
 
+                # 429 / 503 = rate limited or temporarily unavailable. Google
+                # throttles per-account, so parallel workers can hit this.
+                # Honour Retry-After when present, else use jittered backoff.
+                # (Lesson from tarballz/mass-takeout-downloader.)
+                if response.status_code in (429, 503):
+                    if attempt < MAX_RETRIES - 1:
+                        wait = _retry_after_seconds(response) or compute_backoff(attempt)
+                        print(f"  [{filepath.name}] Rate limited ({response.status_code}), waiting {wait:.1f}s...")
+                        time.sleep(wait)
+                        continue
+                    return False, "RATE_LIMITED"
+
                 # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
                 if response.status_code == 416:
                     # Try without range header - file might be complete
@@ -507,7 +550,7 @@ class TakeoutDownloader:
                     resume_from = 0
                     temp_path.unlink(missing_ok=True)
                     if attempt > 0:
-                        time.sleep(RETRY_BACKOFF_BASE ** attempt)
+                        time.sleep(compute_backoff(attempt))
                     continue
 
                 response.raise_for_status()
@@ -565,7 +608,7 @@ class TakeoutDownloader:
                 if not self._verify_zip_integrity(temp_path):
                     temp_path.unlink(missing_ok=True)
                     if attempt < MAX_RETRIES - 1:
-                        wait = RETRY_BACKOFF_BASE ** (attempt + 1)
+                        wait = compute_backoff(attempt)
                         print(f"  [{filepath.name}] ZIP integrity check failed, retrying in {wait:.1f}s...")
                         time.sleep(wait)
                         resume_from = 0
@@ -585,7 +628,7 @@ class TakeoutDownloader:
                     return False, "NOT_FOUND"
                 # Transient HTTP error — retry if attempts remain
                 if attempt < MAX_RETRIES - 1:
-                    wait = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    wait = compute_backoff(attempt)
                     print(f"  [{filepath.name}] HTTP error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
                     time.sleep(wait)
                     continue
@@ -593,7 +636,7 @@ class TakeoutDownloader:
             except requests.exceptions.RequestException as e:
                 # Transient network error — retry if attempts remain
                 if attempt < MAX_RETRIES - 1:
-                    wait = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    wait = compute_backoff(attempt)
                     print(f"  [{filepath.name}] Network error (attempt {attempt+1}/{MAX_RETRIES}), retrying in {wait:.1f}s: {e}")
                     time.sleep(wait)
                     continue
@@ -623,7 +666,7 @@ class TakeoutDownloader:
             # Retryable transient error
             outer_attempts += 1
             if outer_attempts < MAX_RETRIES:
-                wait = RETRY_BACKOFF_BASE ** outer_attempts
+                wait = compute_backoff(outer_attempts - 1)
                 print(f"  [{self.get_filename(num)}] Outer retry {outer_attempts}/{MAX_RETRIES} after error '{error}', waiting {wait:.1f}s...")
                 time.sleep(wait)
 

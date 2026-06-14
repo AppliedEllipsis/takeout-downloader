@@ -754,12 +754,43 @@ def parse_one_payload() -> TakeoutPayload:
 
     if len(payloads) == 1:
         return payloads[0]
-    # Multi-export: ask user to pick one
+    # Multi-export: probe sizes so we can show "123 MB" next to each and
+    # sort by smallest first (fastest download first).
     info("")
-    info(_c("1;36", f"Multiple exports detected ({len(payloads)} archives):"))
-    for i, p in enumerate(payloads, 1):
-        hint = p.filename_hint()
-        info(_c("36", f"  [{i}] {hint}"))
+    info("Probing archive sizes via Range requests...")
+    sizes = []
+    for i, p in enumerate(payloads):
+        session = requests.Session()
+        headers = dict(p.headers)
+        headers["Cookie"] = p.cookie
+        try:
+            size = _probe_part(session, p.url, headers)
+            sizes.append((i, size))
+            size_str = human_size(size) if size else "?"
+            info(f"  [{i+1}/{len(payloads)}] {size_str}  "
+                 f"{p.filename_hint()}")
+        except AuthError as e:
+            err(f"  [{i+1}/{len(payloads)}] AUTH FAIL: {e}")
+            sizes.append((i, None))
+        except Exception as e:
+            debug(f"  [{i+1}/{len(payloads)}] probe failed: {e}")
+            sizes.append((i, None))
+        finally:
+            session.close()
+    # Sort payloads by size (smallest first), keeping unknown sizes at the end
+    sorted_indices = sorted(
+        range(len(payloads)),
+        key=lambda i: (sizes[i][1] is None, sizes[i][1] or 0)
+    )
+    sorted_payloads = [payloads[i] for i in sorted_indices]
+    sorted_sizes = [sizes[i] for i in sorted_indices]
+    info("")
+    info(_c("1;36", f"Multiple exports detected ({len(payloads)} archives, "
+                    "sorted smallest first):"))
+    for i, (orig_i, size) in enumerate(sorted_sizes, 1):
+        size_str = human_size(size) if size else "unknown"
+        hint = sorted_payloads[i-1].filename_hint()
+        info(_c("36", f"  [{i}] {size_str:>10}  {hint}"))
     info(_c("36", "  [a] Download ALL archives one after another"))
     info(_c("36", "  Type the number or 'a', then press Enter."))
     while True:
@@ -768,18 +799,19 @@ def parse_one_payload() -> TakeoutPayload:
         except EOFError:
             choice = "1"
         if choice == "a":
-            # Return the first one; caller will need to handle iteration.
-            # For now, we just return the first and the user can re-run.
-            info("Downloading all archives sequentially. "
-                 "The first one starts now; re-run for the rest.")
-            return payloads[0]
+            # Return the smallest one first; caller will need to handle
+            # iteration. For now, just return the first and the user
+            # can re-run for the rest.
+            info("Downloading all archives sequentially (smallest first). "
+                 "Re-run this command for the next archive.")
+            return sorted_payloads[0]
         try:
             idx = int(choice)
-            if 1 <= idx <= len(payloads):
-                return payloads[idx - 1]
+            if 1 <= idx <= len(sorted_payloads):
+                return sorted_payloads[idx - 1]
         except ValueError:
             pass
-        err(f"  Please enter 1-{len(payloads)} or 'a'.")
+        err(f"  Please enter 1-{len(sorted_payloads)} or 'a'.")
 
 
 def _payload_fix_hint() -> None:

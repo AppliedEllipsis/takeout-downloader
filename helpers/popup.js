@@ -127,6 +127,104 @@ function renderCapture(data) {
     els.preview.textContent = JSON.stringify(previewObj, null, 2);
 }
 
+// ---------------------------------------------------------------------------
+// Server-side manifest fetch
+// ---------------------------------------------------------------------------
+const TAKEOUT_URL_RE = /https:\/\/takeout-download\.usercontent\.google\.com\/download\/takeout-[^"'\s<>]+\.zip(?:\?[^"'\s<>]*)?/g;
+
+function extractUrlsFromHtml(html) {
+    if (!html) return [];
+    const matches = html.match(TAKEOUT_URL_RE) || [];
+    return Array.from(new Set(matches));
+}
+
+function extractUrlsFromJson(data) {
+    if (!data) return [];
+    const urls = [];
+    const seen = new Set();
+    function walk(node) {
+        if (!node) return;
+        if (typeof node === 'string') {
+            const m = node.match(TAKEOUT_URL_RE);
+            if (m) {
+                for (const url of m) {
+                    if (!seen.has(url)) {
+                        seen.add(url);
+                        urls.push(url);
+                    }
+                }
+            }
+            return;
+        }
+        if (Array.isArray(node)) {
+            for (const item of node) walk(item);
+            return;
+        }
+        if (typeof node === 'object') {
+            for (const key of Object.keys(node)) walk(node[key]);
+        }
+    }
+    walk(data);
+    return urls;
+}
+
+async function fetchAllExports(capture) {
+    const url = capture.url || '';
+    let archiveId = null;
+    let authuser = '0';
+    const jMatch = url.match(/[?&]j=([a-f0-9-]+)/);
+    if (jMatch) archiveId = jMatch[1];
+    const auMatch = url.match(/[?&]authuser=(\d+)/);
+    if (auMatch) authuser = auMatch[1];
+    const cookieAu = (capture.cookie || '').match(/authuser=(\d+)/);
+    if (cookieAu) authuser = cookieAu[1];
+
+    if (!archiveId) return [];
+
+    const cookieHeader = capture.cookie || '';
+    const userAgent = (capture.headers || {})['User-Agent']
+        || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36';
+
+    const apiUrls = [
+        `https://takeout.google.com/_/TakeoutApiUi/data?archiveId=${archiveId}&authuser=${authuser}`,
+        `https://takeout.google.com/api/v2/manage/archive?id=${archiveId}&authuser=${authuser}`,
+        `https://takeout.google.com/api/v2/manage/archives?authuser=${authuser}`,
+        `https://takeout.google.com/u/${authuser}/manage/archive/${archiveId}?json=1`,
+        `https://takeout.google.com/u/${authuser}/manage/archive/${archiveId}`
+    ];
+
+    const fetchOpts = {
+        credentials: 'include',
+        headers: {
+            'Cookie': cookieHeader,
+            'User-Agent': userAgent,
+            'Accept': 'application/json,text/html'
+        },
+        redirect: 'follow'
+    };
+
+    for (const apiUrl of apiUrls) {
+        try {
+            const resp = await fetch(apiUrl, fetchOpts);
+            if (!resp.ok) continue;
+            if (resp.url.includes('accounts.google.com')) return [];
+            const ctype = resp.headers.get('content-type') || '';
+            let urls = [];
+            if (ctype.includes('json')) {
+                const data = await resp.json();
+                urls = extractUrlsFromJson(data);
+            } else {
+                const html = await resp.text();
+                urls = extractUrlsFromHtml(html);
+            }
+            if (urls.length > 0) return urls;
+        } catch (e) {
+            // try next endpoint
+        }
+    }
+    return [];
+}
+
 async function copyToClipboard(text, kind) {
     try {
         await navigator.clipboard.writeText(text);
@@ -192,61 +290,48 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    els.copyAllBtn.addEventListener('click', () => {
-        chrome.runtime.sendMessage({ action: 'getCapture' }, (response) => {
-            if (!response || !response.capture) {
-                setStatus('No capture to copy. Click a download first.', 'warn');
-                return;
-            }
-            const capture = response.capture;
-            if (!capture.cookie) {
-                setStatus('No cookie in capture. Re-click a download first.', 'warn');
-                return;
-            }
+    els.copyAllBtn.addEventListener('click', async () => {
+        setStatus('Reading capture...', 'dim');
+        const response = await chrome.runtime.sendMessage({ action: 'getCapture' });
+        if (!response || !response.capture) {
+            setStatus('No capture to copy. Click a download first.', 'warn');
+            return;
+        }
+        const capture = response.capture;
+        if (!capture.cookie) {
+            setStatus('No cookie in capture. Re-click a download first.', 'warn');
+            return;
+        }
 
-            setStatus('Fetching all exports from Takeout (using your cookie)...', 'dim');
+        setStatus('Fetching all exports from Takeout (using your cookie)...', 'dim');
 
-            // Ask the background worker to fetch the Takeout manage page
-            // using the captured cookie. This works even when the content
-            // script couldn't scrape the DOM (e.g. JS-rendered URLs).
-            chrome.runtime.sendMessage(
-                { action: 'fetchAllExports', capture: capture },
-                (fetchResp) => {
-                    if (chrome.runtime.lastError) {
-                        setStatus('Extension error: ' + chrome.runtime.lastError.message, 'err');
-                        return;
-                    }
-                    if (!fetchResp || !fetchResp.ok) {
-                        const err = (fetchResp && fetchResp.error) || 'unknown';
-                        setStatus(`✗ Could not fetch exports: ${err}. Try re-capturing.`, 'err');
-                        return;
-                    }
+        // Do the fetch in the popup context. Service workers can be
+        // terminated mid-fetch in MV3, which causes 'message port closed'
+        // errors. The popup stays open while the user is looking at it.
+        const urls = await fetchAllExports(capture);
+        if (!urls || urls.length === 0) {
+            setStatus("✗ Could not fetch export list from Takeout. "
+                      + "Cookie may have expired - try clicking a download again.", 'err');
+            return;
+        }
 
-                    const urls = fetchResp.urls || [];
-                    if (urls.length === 0) {
-                        setStatus('No URLs found in Takeout response.', 'warn');
-                        return;
-                    }
+        // Build a multi-export payload with all detected URLs
+        const exports = urls.map(url => ({
+            url: url,
+            filename: shortFilename(url)
+        }));
 
-                    // Build a multi-export payload with all detected URLs
-                    const exports = urls.map(url => ({
-                        url: url,
-                        filename: shortFilename(url)
-                    }));
-
-                    const payload = {
-                        schema: capture.schema || 1,
-                        captured_at: new Date().toISOString(),
-                        source: 'extension',
-                        multi: true,
-                        exports: exports,
-                        headers: capture.headers || {},
-                        cookie: capture.cookie || ''
-                    };
-                    copyToClipboard(JSON.stringify(payload, null, 2), `ALL exports (${exports.length})`);
-                }
-            );
-        });
+        const payload = {
+            schema: capture.schema || 1,
+            captured_at: new Date().toISOString(),
+            source: 'extension',
+            multi: true,
+            exports: exports,
+            headers: capture.headers || {},
+            cookie: capture.cookie || ''
+        };
+        await copyToClipboard(JSON.stringify(payload, null, 2),
+                              `ALL exports (${exports.length})`);
     });
 
     els.copyCurlBtn.addEventListener('click', () => {

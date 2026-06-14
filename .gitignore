@@ -102,3 +102,7 @@ helpers/build/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Payload drop box (host-written in.json etc.)
+drop/*
+!drop/.gitkeep

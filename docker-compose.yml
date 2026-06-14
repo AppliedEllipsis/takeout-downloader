@@ -53,8 +53,11 @@ services:
         required: false
 
     environment:
-      # Keep the in-container default output dir stable regardless of host .env.
-      OUTPUT_DIR: ${OUTPUT_DIR:-/downloads}
+      # Leave OUTPUT_DIR EMPTY by default so the app auto-detects: it prefers
+      # /srv/storage/google-takeout when that exists, else ./downloads.
+      # Forcing /downloads here would override that detection (the old bug).
+      # Set OUTPUT_DIR in .env or the shell to pin a specific path.
+      OUTPUT_DIR: ${OUTPUT_DIR:-}
       TERM: ${TERM:-xterm-256color}
       # Persist last-used TUI settings on the mounted volume so they survive
       # `--rm`. (Engine reads TAKEOUT_SETTINGS; default would be $HOME, which
@@ -68,6 +71,12 @@ services:
       # Downloaded archives + resume state (.downloading, .takeout_sizes.json)
       # persist on the host so a removed container never loses progress.
       - ./downloads:/downloads
+
+      # Payload drop box. Write your JSON here on the HOST, then type a single
+      # "." in the TUI's payload box to load it — this sidesteps the broken
+      # SSH->tmux->Docker paste path entirely. The TUI searches /downloads/drop
+      # (among others) for in.json / payload.json / curl.txt.
+      - ./drop:/downloads/drop
 
       # Host /opt (with its JuiceFS + encfs FUSE submounts) visible in-container.
       # bind-recursive + rslave is what makes the nested FUSE mounts show up.

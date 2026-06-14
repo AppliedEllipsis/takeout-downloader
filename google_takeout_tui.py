@@ -486,13 +486,44 @@ class TakeoutTUI(App):
         event.stop()
 
     def _restore_settings(self) -> None:
-        """Pre-fill the input fields from the persisted settings file."""
+        """Pre-fill the input fields from the persisted settings file.
+
+        The output dir is only restored if it still exists. A stale saved
+        path (e.g. an old ./downloads from before a JuiceFS mount existed)
+        must NOT shadow the smarter current default — otherwise the TUI keeps
+        defaulting to ./downloads even though /srv/storage/... is now
+        available.
+        """
         s = load_settings()
         if not s:
             return
         out = s.get("output_dir")
         if isinstance(out, str) and out:
-            self.query_one("#output-input", Input).value = out
+            try:
+                exists = Path(out).expanduser().is_dir()
+            except OSError:
+                exists = False
+            # A saved *generic* ./downloads must not shadow a smarter current
+            # default (e.g. the JuiceFS path). Only let the saved value win if
+            # it still exists AND it's a deliberate choice — i.e. not the bare
+            # fallback when a better default is now available.
+            generic = {"./downloads", "downloads", "/downloads"}
+            is_stale_generic = (
+                out.rstrip("/") in {g.rstrip("/") for g in generic}
+                and DEFAULT_OUTPUT_DIR not in generic
+            )
+            if exists and not is_stale_generic:
+                self.query_one("#output-input", Input).value = out
+            elif is_stale_generic:
+                self.log_message(
+                    f"Ignoring stale saved dir '{out}' — using smarter "
+                    f"default {DEFAULT_OUTPUT_DIR}", "info"
+                )
+            else:
+                self.log_message(
+                    f"Saved output dir '{out}' no longer exists — "
+                    f"using default {DEFAULT_OUTPUT_DIR}", "warning"
+                )
         fc = s.get("file_count")
         if isinstance(fc, int):
             self.query_one("#count-input", Input).value = str(fc)
@@ -707,6 +738,25 @@ class TakeoutTUI(App):
         Returns the file contents, or None (after logging) if nothing usable
         was found.
         """
+        # Search roots, in priority order. Includes mounted container paths
+        # (/downloads, /opt drop dirs) so a file written on the host is found
+        # regardless of the container's cwd (/app, which is NOT mounted).
+        search_roots = [
+            Path(output_dir),
+            Path.cwd(),
+            Path("/downloads"),
+            Path("/downloads/drop"),
+            Path("/drop"),
+            Path.home(),
+        ]
+        # De-dupe while preserving order.
+        seen = set()
+        roots = []
+        for r in search_roots:
+            if r not in seen:
+                seen.add(r)
+                roots.append(r)
+
         candidates: list[Path] = []
         if text.startswith("@"):
             raw = text[1:].strip()
@@ -717,12 +767,12 @@ class TakeoutTUI(App):
             if p.is_absolute():
                 candidates.append(p)
             else:
-                candidates.append(Path(output_dir) / p)
-                candidates.append(Path.cwd() / p)
+                for root in roots:
+                    candidates.append(root / p)
         else:  # "."
-            for name in self.PAYLOAD_FILENAMES:
-                candidates.append(Path(output_dir) / name)
-                candidates.append(Path.cwd() / name)
+            for root in roots:
+                for name in self.PAYLOAD_FILENAMES:
+                    candidates.append(root / name)
 
         for cand in candidates:
             try:
@@ -744,7 +794,11 @@ class TakeoutTUI(App):
 
     def start_download(self) -> None:
         """Parse the pasted payload and start (or resume) downloading."""
+        # Always confirm the button/keypress registered — "no feedback" is
+        # worse than an error message.
+        self.log_message("Start pressed…")
         if self.is_downloading:
+            self.log_message("Already downloading — press Stop (x) first.", "warning")
             return
 
         text = self.query_one("#curl-input", TextArea).text.strip()

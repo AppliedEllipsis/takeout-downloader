@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [6.2.0] — Pre-flight full-GET check stops the 1.2 MB HTML loop
+
+### Fixed
+
+- **Pre-flight full-GET check stops the auth-challenge loop.**
+  Before this fix, Range probes (`bytes=0-0`) passed cleanly but full
+  GETs returned 1.2 MB of Google sign-in HTML — the script would then
+  loop asking for a fresh cookie that had the same problem. The new
+  `_preflight_full_download()` function does a single full GET of the
+  smallest part before committing to aria2c; if the response is HTML,
+  it saves the body to `auth_challenge_<timestamp>.html` and exits
+  with a step-by-step re-capture recipe instead of looping.
+
+- **Unified HTML detection (`_looks_like_html_bytes`).** The
+  pre-flight and `verify_parts()` now share the same byte-level HTML
+  detector, which also catches bare `<html>` responses (no doctype)
+  that some Google endpoints return.
+
+- **`_save_auth_challenge()` helper** saves the full HTML body with
+  the probed URL and HTTP status as inline comments so the user can
+  inspect what Google actually returned.
+
+### Added
+
+- 6 new tests: real-ZIP pass, HTML body, accounts.google.com redirect,
+  wrong content-type lying header, short response warning, and
+  byte-buffer edge cases.
+
+- **`--version` flag** and startup banner now read from a single
+  `VERSION` constant (imported from `takeout.py`).
+
 ## [Unreleased]
 
 ### Added

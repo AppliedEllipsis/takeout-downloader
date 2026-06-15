@@ -60,7 +60,7 @@ try:
 except Exception:
     pass
 
-from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR
+from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR, VERSION
 from takeout_payload import parse_payload, parse_multi_payload, parse_multi_payload_meta, TakeoutPayload, MultiPayloadMeta, REQUIRED_COOKIE_MARKERS
 
 
@@ -1550,6 +1550,8 @@ def main() -> int:
                         help=f"concurrent downloads (default {PARALLEL})")
     parser.add_argument("--max-parts", type=int, default=MAX_PARTS,
                         help=f"max parts to discover (default {MAX_PARTS})")
+    parser.add_argument("--version", action="version",
+                        version=f"takeout_cli {VERSION}")
     parser.add_argument("--out", "--output-dir", dest="output_dir",
                         help="output directory for archives (prompted if omitted)")
     parser.add_argument("--fresh", "--no-resume", dest="fresh",
@@ -1604,6 +1606,7 @@ def main() -> int:
     backup_count = int(os.environ.get("TAKEOUT_LOG_BACKUP_COUNT", "3"))
 
     _install_logger(log_path, max_bytes, backup_count)
+    info(f"Version: {VERSION}")
     info(f"Log file: {log_path} "
          f"(rotating at {max_bytes // 1024}KB, "
          f"keeping {backup_count} backups)")
@@ -1615,7 +1618,7 @@ def main() -> int:
         err("aria2c not found on PATH. Install it (apt install aria2) and retry.")
         return 2
 
-    header("Google Takeout Downloader — paste, go.")
+    header(f"Google Takeout Downloader v{VERSION} — paste, go.")
     info("")
 
     # Ask for output dir FIRST, before the JSON paste. If --out is passed

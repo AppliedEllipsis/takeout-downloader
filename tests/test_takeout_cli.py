@@ -1524,3 +1524,41 @@ def test_single_export_still_works_in_v2(monkeypatch):
     assert ctx["mode"] == "single"
     assert ctx["meta"].expectedParts is None
     assert payload.url == blob["url"]
+
+
+# ---------------------------------------------------------------------------
+# Version banner / --version flag
+# ---------------------------------------------------------------------------
+def test_version_is_imported_and_banner_uses_it():
+    """The CLI must import VERSION from takeout and reference it in the
+    startup banner so a user (or logfile reviewer) can confirm which
+    code is actually running. The VERSION constant is the single source
+    of truth shared with takeout.py / the TUI."""
+    from takeout import VERSION as upstream_version
+    # Exported as a module attribute.
+    assert hasattr(takeout_cli, "VERSION")
+    assert takeout_cli.VERSION == upstream_version
+    # The banner string template is built using VERSION, not a literal.
+    import inspect
+    main_src = inspect.getsource(takeout_cli.main)
+    assert "VERSION" in main_src, "main() should reference VERSION"
+    assert "f\"Google Takeout Downloader v{VERSION}" in main_src, (
+        "banner header should be `f\"Google Takeout Downloader v{VERSION} — paste, go.\"`"
+    )
+    # And the early log line uses it too.
+    assert 'f"Version: {VERSION}"' in main_src, (
+        "should log Version: <VERSION> early so the logfile records which build ran"
+    )
+
+
+def test_cli_version_flag(capsys):
+    """`python takeout_cli.py --version` should print the version and exit 0."""
+    from takeout import VERSION
+    with mock.patch("sys.argv", ["takeout_cli.py", "--version"]):
+        with pytest.raises(SystemExit) as exc_info:
+            takeout_cli.main()
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert VERSION in captured.out
+    assert "takeout_cli" in captured.out
+

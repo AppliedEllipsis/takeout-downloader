@@ -128,6 +128,22 @@ class _FakeResp:
         return _json.loads(self.text)
 
 
+def _part_index_from_url(url: str) -> int:
+    """Extract 1-based part index from a Takeout probe URL.
+
+    Handles both modern URLs (?i=N) and legacy URLs (-NNN.zip). The
+    modern-mode URL keeps the filename suffix cosmetic at `-001.zip`,
+    so the only reliable signal is `?i=N`.
+    """
+    m = re.search(r"[?&]i=(\d+)", url)
+    if m:
+        return int(m.group(1)) + 1
+    m = re.search(r"-(\d{3})\.zip", url)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
 def test_probe_redirects_to_google_login_is_auth_error():
     fake = _FakeResp(
         "https://accounts.google.com/v3/signin/identifier?continue=...",
@@ -193,22 +209,15 @@ def test_probe_html_from_takeout_host_is_auth_error():
 def test_discover_parts_stops_at_404(tmp_path):
     """Probe 001 + 002 succeed, 003 + 004 are 404 -> end-of-set."""
     payload = _fixture_payload()
-    responses = {
-        "001": _FakeResp("https://takeout-download.usercontent.google.com/download/x-001.zip",
-                         206, {"content-range": "bytes 0-0/100"}),
-        "002": _FakeResp("https://takeout-download.usercontent.google.com/download/x-002.zip",
-                         206, {"content-range": "bytes 0-0/200"}),
-        "003": _FakeResp("https://takeout-download.usercontent.google.com/download/x-003.zip",
-                         404, {}),
-        "004": _FakeResp("https://takeout-download.usercontent.google.com/download/x-004.zip",
-                         404, {}),
-    }
+    sizes = {1: 100, 2: 200}  # only parts 1 and 2 exist
 
     def fake_get(self, url, **kw):
-        for k, r in responses.items():
-            if k in url:
-                return r
-        raise AssertionError(f"unexpected URL: {url}")
+        n = _part_index_from_url(url)
+        if n in sizes:
+            return _FakeResp(url, 206,
+                             {"content-range": f"bytes 0-0/{sizes[n]}",
+                              "content-type": "application/octet-stream"})
+        return _FakeResp(url, 404, {})
 
     with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
         parts = takeout_cli.discover_parts(payload, tmp_path)
@@ -411,10 +420,7 @@ def test_discover_parts_partial_set_before_auth_fail(tmp_path):
     payload = _fixture_payload()
 
     def fake_get(self, url, **kw):
-        m = re.search(r"-(\d{3})\.zip", url)
-        if not m:
-            raise AssertionError(f"unexpected URL: {url}")
-        n = int(m.group(1))
+        n = _part_index_from_url(url)
         if n <= 5:
             return _FakeResp(url, 206,
                              {"content-range": f"bytes 0-0/{n * 1000}",
@@ -451,8 +457,7 @@ def test_full_flow_with_mocks(tmp_path, monkeypatch):
 
     # 2) Discovery step: each probe returns size 1000.
     def fake_get(self, url, **kw):
-        m = re.search(r"-(\d{3})\.zip", url)
-        n = int(m.group(1)) if m else 1
+        n = _part_index_from_url(url)
         if n <= 2:
             return _FakeResp(url, 206,
                              {"content-range": f"bytes 0-0/1000",
@@ -925,6 +930,49 @@ def test_render_file_row_format():
         sys.stdout = real
 
 
+def test_render_file_row_bar_adapts_to_terminal_width():
+    """The progress bar should shrink on narrow terminals so the
+    filename stays visible. With a 60-col terminal and a 30-char
+    filename, the bar must be smaller than the default 20 chars."""
+    import io
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        # Patch terminal size to simulate a narrow TTY.
+        with mock.patch("shutil.get_terminal_size",
+                        return_value=os.terminal_size((60, 20))):
+            r = takeout_cli.TermRender(enabled=True)
+            r.begin(n_rows=5)
+            takeout_cli._render_file_row(
+                r, "takeout-long-filename-001.zip", done=100, total=200,
+                pct=50, speed_bps=1000, eta="1s",
+                filename_to_size={}, num_by_filename={
+                    "takeout-long-filename-001.zip": 1,
+                },
+            )
+            # Find the row content (strip ANSI).
+            out = buf.getvalue()
+            import re
+            clean = re.sub(r"\x1b\[[^A-Za-z]*[A-Za-z]", "", out)
+            # Bar should be < 20 chars (we shrunk it).
+            bar_match = re.search(r"\[([█·]+)\]", clean)
+            assert bar_match, f"no progress bar in: {clean!r}"
+            bar_chars = len(bar_match.group(1))
+            assert bar_chars < 20, (
+                f"bar should shrink on narrow terminal, got {bar_chars} chars"
+            )
+            assert bar_chars >= 8, (
+                f"bar should not collapse below 8 chars, got {bar_chars}"
+            )
+            # Filename should still be visible (we shrink the bar to
+            # make room).
+            assert "takeout-long-filename-001.zip" in clean
+    finally:
+        sys.stdout = real
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: grid render via mocked aria2c output
 # ---------------------------------------------------------------------------
@@ -1058,19 +1106,22 @@ def test_grid_render_buffers_progress_before_gid_known():
 # ---------------------------------------------------------------------------
 # Same-size streak stop — Google returns identical size for all parts
 # ---------------------------------------------------------------------------
-def test_discover_stops_on_same_size_streak(tmp_path):
-    """If Google returns the same size for N consecutive parts after #1,
-    discovery should stop — the real set is done."""
-    payload = _fixture_payload()
+def test_discover_stops_on_same_size_streak_legacy_mode(tmp_path):
+    """Legacy mode (no `i=` in URL): if Google returns the same size for
+    N consecutive parts after #1, discovery should stop — the real set
+    is done and subsequent suffixes hit a generic placeholder response."""
+    payload = json.loads((ROOT / "tests" / "fixtures" / "sample_payload.json").read_text())
+    # Strip `i=` to put the URL into legacy mode.
+    payload["url"] = payload["url"].split("?")[0]
+    parsed = takeout_cli.parse_payload(json.dumps(payload))
 
     def fake_get(self, url, **kw):
-        # All parts return the exact same size.
         return _FakeResp(url, 206,
                          {"content-range": "bytes 0-0/411587",
                           "content-type": "application/octet-stream"})
 
     with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
-        parts = takeout_cli.discover_parts(payload, tmp_path)
+        parts = takeout_cli.discover_parts(parsed, tmp_path)
     # Should stop after SAME_SIZE_STREAK_STOP (2) identical sizes after #1.
     # Part 1 is appended; part 2 is appended (streak=1); part 3 triggers
     # break BEFORE append (streak=2). So only 2 parts in the list.
@@ -1079,13 +1130,32 @@ def test_discover_stops_on_same_size_streak(tmp_path):
     assert parts[1]["num"] == 2
 
 
+def test_discover_modern_mode_does_not_stop_on_same_size(tmp_path):
+    """Modern mode (?i=): the same-size heuristic is intentionally disabled
+    because part sizes can legitimately repeat (e.g. several <1MB parts
+    round to the same display size) and Google returns clean 404s for
+    missing parts. If everything returns 206 we keep going."""
+    payload = _fixture_payload()
+
+    def fake_get(self, url, **kw):
+        return _FakeResp(url, 206,
+                         {"content-range": "bytes 0-0/411587",
+                          "content-type": "application/octet-stream"})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        # Cap at 5 so the test doesn't try to loop up to MAX_PARTS=500.
+        parts = takeout_cli.discover_parts(payload, tmp_path, max_parts=5)
+    # All 5 probes succeed → 5 parts.
+    assert len(parts) == 5
+    assert [p["num"] for p in parts] == [1, 2, 3, 4, 5]
+
+
 def test_discover_does_not_stop_when_sizes_differ(tmp_path):
     """If sizes vary, discovery should continue until 404s."""
     payload = _fixture_payload()
 
     def fake_get(self, url, **kw):
-        m = re.search(r"-(\d{3})\.zip", url)
-        n = int(m.group(1)) if m else 1
+        n = _part_index_from_url(url)
         size = n * 1000  # each part has a different size
         return _FakeResp(url, 206,
                          {"content-range": f"bytes 0-0/{size}",
@@ -1096,6 +1166,78 @@ def test_discover_does_not_stop_when_sizes_differ(tmp_path):
     # Should continue until 404s (which never happen in this mock).
     # But MAX_PARTS caps it at 500.
     assert len(parts) == 500
+
+
+def test_discover_modern_mode_uses_i_param_for_part_selection(tmp_path):
+    """In modern mode (?i=N), the filename suffix stays `-001.zip` (cosmetic)
+    while `i=` carries the actual part index. The captured URL might point
+    at a middle part (e.g. i=2); discovery must still sweep from i=0 so we
+    don't miss earlier parts. Regression test for the bug where the
+    discovery probed `-001.zip`, `-002.zip`, … all with the captured `i=`
+    and only ever saw one part."""
+    payload = _fixture_payload()  # fixture URL has i=4
+
+    probed_urls: list[str] = []
+
+    def fake_get(self, url, **kw):
+        probed_urls.append(url)
+        # Pretend archive has 5 parts; i=5 onward returns 404.
+        n = _part_index_from_url(url)
+        if n <= 5:
+            return _FakeResp(url, 206,
+                             {"content-range": f"bytes 0-0/{n * 1000}",
+                              "content-type": "application/octet-stream"})
+        return _FakeResp(url, 404, {})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path)
+
+    assert len(parts) == 5
+    assert [p["num"] for p in parts] == [1, 2, 3, 4, 5]
+    # Every probe URL should have `i=N` matching the part number minus 1.
+    for p in parts:
+        m = re.search(r"[?&]i=(\d+)", p["url"])
+        assert m, f"URL missing i= param: {p['url']}"
+        assert int(m.group(1)) == p["num"] - 1, (
+            f"i= value {m.group(1)} does not match part num {p['num']} in {p['url']}"
+        )
+    # The filename suffix should be constant `-001.zip` (cosmetic).
+    suffixes = {p["url"].rsplit("/", 1)[-1].split("?")[0] for p in parts}
+    assert suffixes == {"takeout-20260612T190148Z-9-001.zip"}, suffixes
+    # Discovery swept i=0..4 even though the captured URL had i=4.
+    assert "i=0" in probed_urls[0]
+    assert "i=4" in probed_urls[4]
+
+
+def test_build_probe_url_replaces_i_value():
+    """Unit test for the URL builder helper."""
+    base = "https://x/takeout-20251207T071725Z-3-001.zip"
+    q = "j=abc&user=1&authuser=3&i=4"
+    # i= replaces the existing i=N.
+    assert takeout_cli._build_probe_url(base, q, 0) == \
+        f"{base}?j=abc&user=1&authuser=3&i=0"
+    assert takeout_cli._build_probe_url(base, q, 7) == \
+        f"{base}?j=abc&user=1&authuser=3&i=7"
+    # i= at the start of the query.
+    q2 = "i=4&user=1"
+    assert takeout_cli._build_probe_url(base, q2, 2) == f"{base}?i=2&user=1"
+    # No i= requested: pass query through.
+    assert takeout_cli._build_probe_url(base, q, None) == f"{base}?{q}"
+    # No query at all.
+    assert takeout_cli._build_probe_url(base, None, 0) == base
+
+
+def test_has_i_param():
+    """Unit test for the URL-shape detector."""
+    assert takeout_cli._has_i_param("i=4") is True
+    assert takeout_cli._has_i_param("j=x&i=4") is True
+    assert takeout_cli._has_i_param("j=x&user=1&i=4&authuser=3") is True
+    assert takeout_cli._has_i_param("j=x&user=1") is False
+    assert takeout_cli._has_i_param("") is False
+    assert takeout_cli._has_i_param(None) is False
+    # `i` without a value doesn't count.
+    assert takeout_cli._has_i_param("j=x&i") is False
+    assert takeout_cli._has_i_param("j=x&i=") is False
 
 
 def test_probe_treats_400_as_missing():
@@ -1125,8 +1267,7 @@ def test_discover_respects_max_parts_cap(tmp_path):
     payload = _fixture_payload()
 
     def fake_get(self, url, **kw):
-        m = re.search(r"-(\d{3})\.zip", url)
-        n = int(m.group(1)) if m else 1
+        n = _part_index_from_url(url)
         return _FakeResp(url, 206,
                          {"content-range": f"bytes 0-0/{n * 1000}",
                           "content-type": "application/octet-stream"})

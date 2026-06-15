@@ -67,7 +67,7 @@ from takeout_payload import parse_payload, parse_multi_payload, parse_multi_payl
 # ===========================================================================
 # Tunables
 # ===========================================================================
-PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "3"))
+PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "5"))
 MAX_PARTS = int(os.environ.get("MAX_PARTS", "500"))
 MAX_AUTH_REPROMPTS = int(os.environ.get("MAX_AUTH_REPROMPTS", "5"))
 PROBE_TIMEOUT = (10, 30)
@@ -1085,10 +1085,53 @@ def _probe_part(session: requests.Session, url: str,
         resp.close()
 
 
+def _has_i_param(query: str) -> bool:
+    """True if the query string contains an `i=N` part selector."""
+    return bool(re.search(r'(?:^|[?&])i=\d+', query or ""))
+
+
+def _build_probe_url(base_url: str, query: str | None,
+                     i_value: int | None) -> str:
+    """Build a probe URL.
+
+    If `i_value` is not None, replace (or insert) `i=<i_value>` in the
+    query string and return the full URL with `?…` appended. Otherwise
+    pass the query through unchanged.
+    """
+    if query is None:
+        return base_url
+    if i_value is None:
+        return f"{base_url}?{query}"
+    # Replace `i=N` (or append if absent, though _has_i_param should be True).
+    new_q = re.sub(r'(^|[?&])i=\d+', lambda m: f"{m.group(1)}i={i_value}", query, count=1)
+    if not re.search(r'(?:^|[?&])i=\d+', new_q):
+        new_q = (new_q + ("&" if new_q else "") + f"i={i_value}")
+    return f"{base_url}?{new_q}"
+
+
 def discover_parts(payload: TakeoutPayload, output_dir: Path,
                     max_parts: int | None = None) -> list[dict]:
-    """Probe -001, -002, … until the set ends. Returns list of dicts:
-    {num, url, filename, size, have}. Stops early on AuthError after part 1."""
+    """Probe to discover all parts of an archive. Returns list of dicts:
+    {num, url, filename, size, have}. Stops early on AuthError after part 1.
+
+    Two URL patterns are supported:
+
+    1. Modern Google Takeout (URL has `i=N` query param):
+       - The `-NNN.zip` filename suffix is *cosmetic* — Google ignores it
+         and uses `i=` to select which part of the archive to serve.
+       - We sweep `i=0, 1, 2, …` and rely on HTTP 404/400 to signal
+         end-of-set (the same-size heuristic is disabled because it
+         false-positives on archives whose part sizes happen to repeat).
+       - The original `i=N` in the captured URL is replaced — sweeping
+         always starts from i=0 so we never miss earlier parts just
+         because the captured URL happened to point at a middle part.
+
+    2. Legacy Google Takeout (no `i=` in URL):
+       - The `-NNN.zip` suffix is the actual part selector.
+       - We vary the suffix and use a same-size heuristic to detect
+         end-of-set, since some legacy servers don't return a clean
+         404 for missing parts.
+    """
     base, _, ext, query = extract_url_parts(payload.url)
     if not base:
         raise ValueError(f"Could not parse a Takeout URL pattern from:\n  {payload.url}")
@@ -1103,16 +1146,33 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path,
     session = requests.Session()
     base_filename = base.split("/")[-1]
 
+    modern = _has_i_param(query)
+    # In modern mode the displayed part number is i+1 (1-based to match
+    # what Google's manage page shows: "Part 1, Part 2, …"). In legacy
+    # mode the displayed number is the filename suffix (also 1-based).
     loop_limit = max_parts if max_parts else MAX_PARTS
-    if max_parts:
-        info(f"Discovering {max_parts} part(s) (URL pattern: ...{base_filename}<NNN>{ext})")
+
+    if modern:
+        info(f"Discovering parts (URL pattern: ...{base_filename}001.zip?i=<N>) "
+             f"up to {loop_limit}")
+    elif max_parts:
+        info(f"Discovering {max_parts} part(s) (URL pattern: "
+             f"...{base_filename}<NNN>{ext})")
     else:
-        info(f"Discovering parts (URL pattern: ...{base_filename}<NNN>{ext})")
+        info(f"Discovering parts (URL pattern: "
+             f"...{base_filename}<NNN>{ext})")
+
+    # num is 1-based for display. In modern mode it maps to i=num-1.
     for num in range(1, loop_limit + 1):
-        filename = f"{base_filename}{num:03d}{ext}"
-        url = f"{base}{num:03d}{ext}"
-        if query:
-            url += f"?{query}"
+        if modern:
+            i_value = num - 1
+            filename = f"{base_filename}001{ext}"  # cosmetic; aria2c uses
+            url = _build_probe_url(f"{base}001{ext}", query, i_value)
+        else:
+            filename = f"{base_filename}{num:03d}{ext}"
+            url = f"{base}{num:03d}{ext}"
+            if query:
+                url += f"?{query}"
 
         debug(f"probe #{num:03d} GET {url}")
         try:
@@ -1135,23 +1195,24 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path,
         consecutive_misses = 0
         debug(f"probe #{num:03d} -> {size} bytes")
 
-        # Heuristic: if N consecutive parts have the exact same size,
-        # Google is serving generic placeholder responses. The real set
-        # is done. This catches single-part archives where Google returns
-        # 206 for every part number with the same token.
-        if num > 1 and size == last_size:
-            same_size_streak += 1
-            if same_size_streak >= SAME_SIZE_STREAK_STOP:
-                debug(f"  {SAME_SIZE_STREAK_STOP} consecutive parts "
-                      f"with identical size ({human_size(size)}); "
-                      f"real set has {len(parts)} parts")
-                info(f"   Stopping: Google returned the same size "
-                     f"({human_size(size)}) for {SAME_SIZE_STREAK_STOP} "
-                     f"consecutive parts — this archive has {len(parts)} "
-                     f"real part(s).")
-                break
-        else:
-            same_size_streak = 0
+        # Same-size heuristic is ONLY used in legacy mode. In modern
+        # mode the server gives a clean 404 for missing parts, and the
+        # heuristic false-positives on archives whose part sizes repeat
+        # (e.g. several <1MB parts all rounding to the same display size).
+        if not modern:
+            if num > 1 and size == last_size:
+                same_size_streak += 1
+                if same_size_streak >= SAME_SIZE_STREAK_STOP:
+                    debug(f"  {SAME_SIZE_STREAK_STOP} consecutive parts "
+                          f"with identical size ({human_size(size)}); "
+                          f"real set has {len(parts)} parts")
+                    info(f"   Stopping: Google returned the same size "
+                         f"({human_size(size)}) for {SAME_SIZE_STREAK_STOP} "
+                         f"consecutive parts — this archive has {len(parts)} "
+                         f"real part(s).")
+                    break
+            else:
+                same_size_streak = 0
         last_size = size
 
         dest = output_dir / filename
@@ -1391,7 +1452,17 @@ def _render_file_row(render: TermRender, filename: str, done: int,
                      filename_to_size: dict, num_by_filename: dict) -> None:
     if total <= 0:
         total = filename_to_size.get(filename, 0)
-    bar = make_progress_bar(pct, width=20)
+    # Adapt the progress bar width to the terminal so all five concurrent
+    # rows fit without clipping. Reserve 60 chars for the prefix
+    # (number, bar, percent, done/total, speed, ETA, separators) and
+    # give the rest to the filename. Falls back to 20 for unknown sizes.
+    try:
+        term_width = shutil.get_terminal_size((100, 20)).columns
+    except (OSError, ValueError):
+        term_width = 100
+    fixed_overhead = 60  # the part of the row that isn't the bar or filename
+    bar_width = max(8, min(20, term_width - fixed_overhead - len(filename)))
+    bar = make_progress_bar(pct, width=bar_width)
     parts_str = human_size(done) + "/" + human_size(total) if total else human_size(done)
     speed_str = human_size(speed_bps) + "/s" if speed_bps else "    -    "
     eta_str = eta or "-"

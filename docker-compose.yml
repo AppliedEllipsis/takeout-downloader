@@ -159,7 +159,7 @@ services:
       OUTPUT_DIR: ${OUTPUT_DIR:-}
       TERM: ${TERM:-xterm-256color}
       ALLOWED_DIRS: /opt:/downloads
-      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-3}
+      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-5}
       MAX_PARTS: ${MAX_PARTS:-500}
       MAX_AUTH_REPROMPTS: ${MAX_AUTH_REPROMPTS:-5}
     volumes:

@@ -103,19 +103,46 @@ function buildSinglePayload(capture) {
     };
 }
 
-function buildMultiPayload(capture, urls) {
-    return {
+function buildMultiPayload(capture, urls, meta) {
+    const exports = (urls || []).map((url, i) => {
+        const entry = {
+            url: url,
+            filename: shortFilename(url)
+        };
+        // Attach size from button metadata if available
+        if (meta && meta.buttonData && meta.buttonData[i]) {
+            entry.size = meta.buttonData[i].size;
+        }
+        // Attach download count from page text if available
+        if (meta && meta.dlCounts && meta.dlCounts[entry.filename] !== undefined) {
+            entry.dlCount = meta.dlCounts[entry.filename];
+        }
+        return entry;
+    });
+
+    const payload = {
         schema: capture.schema || 1,
         captured_at: new Date().toISOString(),
         source: 'extension',
         multi: true,
-        exports: (urls || []).map(url => ({
-            url: url,
-            filename: shortFilename(url)
-        })),
+        exports: exports,
         headers: capture.headers || {},
         cookie: capture.cookie || ''
     };
+
+    // Attach metadata if we have it
+    if (meta) {
+        payload._meta = {
+            archiveId: meta.archiveId,
+            user: meta.user,
+            authuser: meta.authuser,
+            filenames: meta.filenames,
+            buttonCount: meta.buttonData ? meta.buttonData.length : 0,
+            dlCounts: meta.dlCounts || {}
+        };
+    }
+
+    return payload;
 }
 
 async function copyToClipboard(text, kind) {
@@ -262,15 +289,13 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        const exports = urls.map(url => ({
-            url: url,
-            filename: shortFilename(url)
-        }));
-
-        const payload = buildMultiPayload(capture, urls);
+        const payload = buildMultiPayload(capture, urls, result.meta);
+        const sizeInfo = result.meta && result.meta.buttonData
+            ? ` (${result.meta.buttonData.filter(b => b.size > 0).length} with sizes)`
+            : '';
         await copyToClipboard(
             JSON.stringify(payload, null, 2),
-            `ALL exports (${exports.length})`
+            `ALL exports (${urls.length}${sizeInfo})`
         );
         setError(null);
     });

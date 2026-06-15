@@ -194,16 +194,52 @@
 
     // Try to read globals the page might expose
     function readGlobals() {
-        const candidates = ['WIZ_global_data', '_takeout', 'takeout', 'googlesite'];
+        const candidates = ['WIZ_global_data', '_takeout', 'takeout', 'googlesite', 'AF_initDataChunkQueue'];
         const out = {};
         for (const k of candidates) {
             if (k in window) {
-                try { out[k] = JSON.parse(JSON.stringify(window[k])); } catch (e) { out[k] = 'unserializable'; }
+                try {
+                    const val = window[k];
+                    if (k === 'AF_initDataChunkQueue' && Array.isArray(val)) {
+                        // Extract filenames from init data chunks
+                        const filenames = [];
+                        for (const chunk of val) {
+                            try {
+                                const s = JSON.stringify(chunk);
+                                const m = s.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
+                                if (m) for (const f of m) filenames.push(f);
+                            } catch (e) {}
+                        }
+                        if (filenames.length > 0) {
+                            post('filenames', { filenames: Array.from(new Set(filenames)), sourceUrl: 'AF_initDataChunkQueue', time: Date.now() });
+                        }
+                        out[k] = 'array[' + val.length + ']';
+                    } else {
+                        out[k] = JSON.parse(JSON.stringify(val));
+                    }
+                } catch (e) { out[k] = 'unserializable'; }
             }
         }
         return out;
     }
+
+    // Also scan script[class^="ds:"] tags for embedded takeout data
+    function scanDsScripts() {
+        const scripts = document.querySelectorAll('script[class^="ds:"]');
+        const filenames = [];
+        for (const s of scripts) {
+            const text = s.textContent || '';
+            const m = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
+            if (m) for (const f of m) filenames.push(f);
+        }
+        if (filenames.length > 0) {
+            post('filenames', { filenames: Array.from(new Set(filenames)), sourceUrl: 'ds-scripts', time: Date.now() });
+        }
+    }
+
     post('globals', { globals: readGlobals(), href: location.href });
+    setTimeout(scanDsScripts, 100);
+    setTimeout(scanDsScripts, 1000);
 })();
         `;
         (document.head || document.documentElement).appendChild(script);
@@ -239,13 +275,13 @@
     }, 1000);
 
     // -------------------------------------------------------------------------
-    // Scrape the visible DOM for download links.
+    // Scrape the visible DOM for download links and filenames.
     // -------------------------------------------------------------------------
     function scrapeExports() {
         const exports = [];
         const seen = new Set();
-        const html = document.documentElement.innerHTML;
 
+        // 1. Scan all <a> tags with takeout-download hrefs
         for (const a of document.querySelectorAll('a[href*="takeout-download.usercontent.google.com"]')) {
             const href = a.getAttribute('href');
             if (href && !seen.has(href)) {
@@ -253,6 +289,8 @@
                 exports.push({ url: href, filename: href.split('?')[0].split('/').pop() || '' });
             }
         }
+
+        // 2. Scan element attributes for takeout-download URLs
         for (const el of document.querySelectorAll('*')) {
             for (const attr of el.attributes || []) {
                 if (attr.value && attr.value.includes('takeout-download.usercontent.google.com') && !seen.has(attr.value)) {
@@ -261,6 +299,9 @@
                 }
             }
         }
+
+        // 3. Regex scan full HTML
+        const html = document.documentElement.innerHTML;
         const matches = html.match(TAKEOUT_URL_RE) || [];
         for (const url of matches) {
             if (!seen.has(url)) {
@@ -268,7 +309,51 @@
                 exports.push({ url: url, filename: url.split('?')[0].split('/').pop() || '' });
             }
         }
+
         return exports;
+    }
+
+    // -------------------------------------------------------------------------
+    // Scrape download buttons for metadata (data-download-uri, data-size)
+    // and extract visible filenames from the page text.
+    // -------------------------------------------------------------------------
+    function scrapePageMetadata(capturedUrl) {
+        const params = parseUrlParams(capturedUrl || location.href);
+        const archiveId = params.archiveId;
+        const user = params.user;
+        const authuser = params.authuser || '0';
+
+        // Extract filenames from page text (summary section, etc.)
+        const pageText = document.body ? document.body.innerText : '';
+        const filenameRe = /takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g;
+        const textFilenames = Array.from(new Set(pageText.match(filenameRe) || []));
+
+        // Extract download counts from summary text
+        // e.g. "takeout-...-001.zip (Number of times already downloaded: 5)"
+        const dlCountRe = /(takeout-\d{8}T\d{6}Z-\d+-\d+\.zip)\s*\(Number of times already downloaded:\s*(\d+)\)/g;
+        const dlCounts = {};
+        let m;
+        while ((m = dlCountRe.exec(pageText)) !== null) {
+            dlCounts[m[1]] = parseInt(m[2], 10);
+        }
+
+        // Extract data-download-uri and data-size from download buttons
+        const downloadButtons = document.querySelectorAll('[data-download-uri]');
+        const buttonData = [];
+        for (const btn of downloadButtons) {
+            const uri = btn.getAttribute('data-download-uri') || '';
+            const size = parseInt(btn.getAttribute('data-size') || '0', 10);
+            buttonData.push({ uri, size });
+        }
+
+        return {
+            filenames: textFilenames,
+            dlCounts,
+            buttonData,
+            archiveId,
+            user,
+            authuser
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -308,6 +393,29 @@
             return { ok: true, urls: spyUrls, debug: ['spy cache'], source: 'spy' };
         }
 
+        // Direct scan: look for <script class="ds:0"> containing filenames.
+        // These are embedded in the page HTML and available immediately.
+        const dsScripts = document.querySelectorAll('script[class^="ds:"]');
+        let dsFilenames = [];
+        for (const s of dsScripts) {
+            const text = s.textContent || '';
+            const m = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
+            if (m) for (const f of m) dsFilenames.push(f);
+        }
+        dsFilenames = Array.from(new Set(dsFilenames));
+        if (dsFilenames.length > 0 && user) {
+            const reconstructed = dsFilenames.map(filename => {
+                const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
+                u.searchParams.set('j', archiveId);
+                u.searchParams.set('i', '1');
+                u.searchParams.set('user', user);
+                u.searchParams.set('authuser', authuser);
+                return u.toString();
+            });
+            debug.push(`ds-scripts: ${dsFilenames.length} filenames`);
+            return { ok: true, urls: reconstructed, debug, source: 'ds-scripts' };
+        }
+
         // If the spy captured filenames from a batchexecute response but not
         // full URLs, reconstruct the download URLs from the captured URL template.
         if (spyCache.filenames.length > 0 && user) {
@@ -319,7 +427,23 @@
                 u.searchParams.set('authuser', authuser);
                 return u.toString();
             });
-            return { ok: true, urls: reconstructed, debug: ['reconstructed from filenames'], source: 'spy-filenames' };
+            return { ok: true, urls: reconstructed, debug: ['reconstructed from spy filenames'], source: 'spy-filenames' };
+        }
+
+        // Try page metadata: filenames from visible text + download button data
+        const meta = scrapePageMetadata(capturedUrl);
+        if (meta.filenames.length > 0 && meta.archiveId && meta.user) {
+            // Match filenames with button sizes if available
+            const exports = meta.filenames.map(filename => {
+                const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
+                u.searchParams.set('j', meta.archiveId);
+                u.searchParams.set('i', '1');
+                u.searchParams.set('user', meta.user);
+                u.searchParams.set('authuser', meta.authuser);
+                return u.toString();
+            });
+            debug.push(`page-text filenames: ${meta.filenames.length}, buttons: ${meta.buttonData.length}`);
+            return { ok: true, urls: exports, debug, source: 'page-text', meta };
         }
 
         for (const apiUrl of apiUrls) {

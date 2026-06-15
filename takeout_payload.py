@@ -254,12 +254,12 @@ class TakeoutPayload:
         try:
             captured = datetime.fromisoformat(self.captured_at.replace("Z", "+00:00"))
             age_minutes = (datetime.now(timezone.utc) - captured).total_seconds() / 60
-            if age_minutes > 60:
+            if age_minutes > 30:
                 return True, (
                     f"⚠ Cookie was captured {int(age_minutes)} minutes ago. "
-                    "Google sessions typically expire after ~1 hour of "
-                    "download activity. Consider re-capturing if downloads "
-                    "fail with auth errors."
+                    "Google sessions expire after ~1 hour, but parallel "
+                    "downloads can trigger challenges sooner. Consider "
+                    "re-capturing if downloads fail."
                 )
         except (ValueError, TypeError):
             pass  # Bad timestamp, don't block on it

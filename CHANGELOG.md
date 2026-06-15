@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented here.
 
+## [6.3.0] — Stream-abort pre-flight, adaptive parallelism, dry-run, cookie warnings
+
+### Fixed
+
+- **Stream-abort pre-flight** (was downloading entire smallest part, now
+  only reads ~4 KB). The pre-flight still exercises the full-GET path
+  (no Range header) but closes the connection after receiving enough
+  bytes to detect HTML vs archive. This makes the pre-flight virtually
+  free regardless of file size.
+
+- **Adaptive parallelism**: If aria2c fails all parts and it looks like
+  an auth failure, the script now automatically retries with `--parallel 1`
+  (sequential) before asking for a new cookie. This fixes the common case
+  where 5 parallel connections trigger Google's anti-bot challenge but a
+  single connection works fine. Previously the script would loop asking
+  for a fresh cookie that has the same problem.
+
+- **Cookie age warning now shown**: The payload validation already
+  computed cookie staleness (>30 min) but the warning was silently
+  ignored. It's now printed at startup so the user knows their cookie
+  may expire soon.
+
+- **Threshold lowered from 60 to 30 minutes**: Parallel downloads
+  can trigger challenges sooner, so we warn earlier.
+
+### Added
+
+- **`--dry-run` flag**: Validates the cookie, discovers parts, prints
+  the download plan (filenames, sizes, URLs), and exits without
+  running aria2c. Useful for verifying everything looks right before
+  committing to a long download.
+
+- 2 new tests: `_drain_response` reads up to max-bytes and closes
+  response; adaptive parallelism reduces `args.parallel` from 5 to 1.
+
 ## [6.2.0] — Pre-flight full-GET check stops the 1.2 MB HTML loop
 
 ### Fixed

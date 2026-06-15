@@ -1929,10 +1929,11 @@ def test_preflight_bails_on_wrong_content_type_even_if_zip_bytes(tmp_path,
     assert exc_info.value.code == 1
 
 
-def test_preflight_warns_but_proceeds_on_short_response(tmp_path, monkeypatch):
-    """A pre-flight that returns fewer bytes than the probed size is
-    treated as a *warning* (network flakiness) not a fatal error —
-    aria2c will retry. SystemExit should NOT be raised."""
+def test_preflight_passes_on_real_archive_bytes(tmp_path, monkeypatch):
+    """A pre-flight that returns real archive bytes (PK signature) with
+    content-type application/octet-stream should NOT raise SystemExit.
+    This is the happy path: the cookie is healthy and we proceed to
+    the real download via aria2c."""
     short_body = b"PK\x03\x04" + b"\x00" * 9  # 11 bytes, claimed size 1000
     resp = _FakeStreamResp(
         "https://x", 200, {"content-type": "application/octet-stream"},
@@ -1958,4 +1959,98 @@ def test_looks_like_html_bytes():
     assert not takeout_cli._looks_like_html_bytes(b"PK\x03\x04...")
     assert not takeout_cli._looks_like_html_bytes(b"")
     assert not takeout_cli._looks_like_html_bytes(b"random binary \x00\x01")
+
+
+def test_drain_response_reads_up_to_max_bytes():
+    """_drain_response should read up to max_bytes from a streaming
+    response and close it, even if the response has more data."""
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self._body = body
+            self._pos = 0
+            self._closed = False
+
+        def iter_content(self, chunk_size=4096):
+            while self._pos < len(self._body):
+                chunk = self._body[self._pos:self._pos + chunk_size]
+                self._pos += chunk_size
+                yield chunk
+
+        def close(self):
+            self._closed = True
+
+    # 10 KB body, but drain only 1 KB. _drain_response reads in
+    # 4 KB chunks so it will read 4 KB on the first iteration.
+    # That's still tiny compared to the full file and more than
+    # enough to detect HTML.
+    big_body = b"x" * 10240
+    resp = FakeResp(big_body)
+    result = takeout_cli._drain_response(resp, max_bytes=1024)
+    assert len(result) == 4096  # first 4 KB chunk
+    assert result == b"x" * 4096
+    assert resp._closed
+
+    # Small body, drain more than available
+    small_body = b"PK\x03\x04" + b"\x00" * 10
+    resp2 = FakeResp(small_body)
+    result2 = takeout_cli._drain_response(resp2, max_bytes=1024)
+    assert result2 == small_body
+    assert resp2._closed
+
+
+def test_adaptive_parallelism_reduces_to_1(monkeypatch, tmp_path):
+    """When all parts fail and parallel > 1, the download loop should
+    automatically reduce parallelism to 1 before asking for a new cookie.
+    This prevents the loop of: 5 parallel → all HTML → re-prompt cookie →
+    same failure."""
+    import argparse
+    payload = _fixture_payload()
+    parts = [
+        {"num": i+1, "url": f"https://x?i={i}",
+         "filename": f"part-{i+1:03d}.zip",
+         "size": 1_228_078, "have": False}
+        for i in range(3)
+    ]
+    # verify_parts returns 0 complete, 3 incomplete (all failed)
+    monkeypatch.setattr(takeout_cli, "verify_parts",
+                        lambda parts, outdir: (
+                            [],
+                            [dict(p, have=False) for p in parts]
+                        ))
+    # parse_one_payload: fresh cookie on re-prompt
+    monkeypatch.setattr(takeout_cli, "parse_one_payload",
+                        lambda: (_fixture_payload(), {
+                            "mode": "single",
+                            "meta": type("M", (), {"expectedParts": None})(),
+                            "all_payloads": [],
+                            "pre_built_parts": None,
+                        }))
+    monkeypatch.setattr(takeout_cli, "_preflight_full_download",
+                        lambda *a: None)
+    monkeypatch.setattr(takeout_cli, "save_state", lambda *a: None)
+    monkeypatch.setattr(takeout_cli, "state_matches_payload", lambda *a: True)
+    monkeypatch.setattr(takeout_cli, "load_state", lambda *a: None)
+    monkeypatch.setattr(takeout_cli, "make_state", lambda *a: {})
+    monkeypatch.setattr(takeout_cli, "update_state_from_parts", lambda *a: {})
+    monkeypatch.setattr(takeout_cli, "build_aria2_input", lambda *a: "")
+    monkeypatch.setattr(takeout_cli, "run_aria2c", lambda *a, **k: 0)
+    monkeypatch.setattr(takeout_cli.sys, "stdout", io.StringIO())
+
+    args = argparse.Namespace(
+        parallel=5, max_parts=500, fresh=False,
+        output_dir=str(tmp_path), verbose=0, version=False,
+    )
+
+    rc = takeout_cli._download_one_batch(
+        payload, tmp_path, args,
+        logging.getLogger("test"),
+        initial_parts=parts,
+        initial_state=None,
+    )
+    # After adaptive parallelism, args.parallel should have been reduced
+    # to 1 (from original 5) on the first auth failure detection.
+    assert args.parallel == 1, (
+        f"Expected parallel to be reduced to 1, got {args.parallel}"
+    )
 

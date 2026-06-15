@@ -873,6 +873,8 @@ def parse_one_payload(source=None) -> tuple[TakeoutPayload, dict]:
             err(f"Payload failed validation: {message}")
             _payload_fix_hint()
             raise SystemExit(2)
+        if message:
+            warn(message)
     # Log summary
     first = payloads[0]
     markers = [m for m in REQUIRED_COOKIE_MARKERS if m in first.cookie]
@@ -1066,6 +1068,54 @@ def _split_url_filename_for_part(payload: TakeoutPayload,
     return url, filename
 
 
+def _drain_response(resp, max_bytes: int = 1024) -> bytes:
+    """Read up to ``max_bytes`` from a streaming response and close it.
+
+    Used by the pre-flight check to peek at the first ~1 KB of a
+    response body without buffering the entire file (which could be
+    500+ MB for a real archive). The response is closed afterward.
+    """
+    body = b""
+    try:
+        for chunk in resp.iter_content(chunk_size=4096):
+            body += chunk
+            if len(body) >= max_bytes:
+                break
+    except requests.RequestException:
+        pass  # best effort — we already have the headers
+    finally:
+        resp.close()
+    return body
+
+
+def _save_auth_challenge_body(body: bytes, part_url: str,
+                                output_dir: Path, *,
+                                ctype: str = "?",
+                                status: int = 0) -> Path:
+    """Save a pre-flight HTML body to a debug file and return the path.
+
+    Unlike :func:`_save_auth_challenge` which takes a live ``Response``,
+    this takes the already-drained ``body`` bytes. Used when the pre-flight
+    has already closed the response and only has the first ~1 KB.
+    """
+    if not body:
+        return Path("<empty response body>")
+    ts = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    debug_dir = output_dir if output_dir.is_dir() else Path.cwd()
+    debug_path = debug_dir / f"auth_challenge_{ts}.html"
+    try:
+        header = (
+            f"<!-- Pre-flight auth challenge for: {part_url} -->\n"
+            f"<!-- Content-Type: {ctype} -->\n"
+            f"<!-- HTTP {status} -->\n"
+        ).encode("utf-8")
+        debug_path.write_bytes(header + body)
+    except OSError as e:
+        debug(f"  could not save auth challenge: {e}")
+        return Path("<unwriteable>")
+    return debug_path
+
+
 def _save_auth_challenge(response, part_url: str, output_dir: Path) -> Path:
     """Save a Google sign-in HTML response to a debug file and return
     the path. Used by the pre-flight check and post-download HTML
@@ -1124,10 +1174,11 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
     silently if the response is a real archive (or a network blip —
     we don't want to over-block on transient errors).
 
-    The selection of the smallest part keeps the test cheap: a
-    43 KB test download is invisible next to a 1.2 GB archive, but
-    catches the same auth challenge that would have eaten 1.2 GB of
-    bandwidth per failed attempt.
+    The check downloads only the first ~1 KB of the smallest part
+    (stream-abort), so even a 500 MB part costs almost nothing.
+    This is enough to distinguish a real ZIP archive (starts with
+    ``PK\x03\x04``) from the Google sign-in HTML page (starts with
+    ``<!doctype html>``), which is the key auth-challenge signal.
     """
     # Pick the smallest incomplete part. Skip if all complete (the
     # caller already checked, but be defensive).
@@ -1141,6 +1192,14 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
     headers["Cookie"] = payload.cookie
     # NOTE: deliberately NO Range header here. The whole point is to
     # exercise the same code path aria2c will hit on the real download.
+    #
+    # We only read the first ~1 KB though: enough to distinguish a
+    # real ZIP (PK\x03\x04) from the Google sign-in HTML page
+    # (<!doctype html>), but cheap enough to run on every attempt.
+    #
+    # If the pre-flight passes, the actual download still starts from
+    # byte 0 — we did NOT consume any of the response body.
+    PREFLIGHT_PEEK = 1024  # bytes to read before aborting
     session = requests.Session()
     try:
         resp = session.get(target["url"], headers=headers, stream=True,
@@ -1154,7 +1213,12 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
         final_host = (resp.url.split("/")[2]
                       if "/" in resp.url else "")
         if final_host.endswith("accounts.google.com"):
-            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            # Drain enough of the body to save for inspection, then abort.
+            body = _drain_response(resp, PREFLIGHT_PEEK)
+            saved = _save_auth_challenge_body(body, target["url"],
+                                              output_dir,
+                                              ctype=ctype,
+                                              status=resp.status_code)
             err(f"Cookie is being challenged: pre-flight GET was "
                 f"redirected to {final_host}.")
             err(f"  Google's sign-in page was saved to: {saved}")
@@ -1169,7 +1233,11 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
             err(f"    4. THEN click the extension icon to capture")
             raise SystemExit(1)
         if "text/html" in ctype:
-            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            body = _drain_response(resp, PREFLIGHT_PEEK)
+            saved = _save_auth_challenge_body(body, target["url"],
+                                              output_dir,
+                                              ctype=ctype,
+                                              status=resp.status_code)
             err(f"Cookie is being challenged: pre-flight GET returned "
                 f"HTML (ct={ctype[:40]}).")
             err(f"  Google's sign-in page was saved to: {saved}")
@@ -1180,23 +1248,19 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
                 f"parallel-download limit.")
             raise SystemExit(1)
         if resp.status_code in (401, 403):
-            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            body = _drain_response(resp, PREFLIGHT_PEEK)
+            saved = _save_auth_challenge_body(body, target["url"],
+                                              output_dir,
+                                              ctype=ctype,
+                                              status=resp.status_code)
             err(f"Cookie is being challenged: pre-flight GET returned "
                 f"HTTP {resp.status_code}.")
             err(f"  Response saved to: {saved}")
             err(f"  Re-capture in your browser and try again.")
             raise SystemExit(1)
-        # OK: real file response. Drain to detect early truncation.
-        body = b""
-        try:
-            for chunk in resp.iter_content(chunk_size=64 * 1024):
-                body += chunk
-                if len(body) >= target["size"]:
-                    break
-        except requests.RequestException as e:
-            warn(f"  Pre-flight download interrupted: {e}. "
-                 f"Proceeding anyway.")
-            return
+        # Read just enough to detect HTML-in-disguise (wrong content-type
+        # but HTML body) and to confirm we got real archive bytes.
+        body = _drain_response(resp, PREFLIGHT_PEEK)
         if _looks_like_html_bytes(body):
             # We received bytes that look like HTML even though the
             # Content-Type was something else. Some misconfigured
@@ -1213,16 +1277,10 @@ def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
             err(f"  Body saved to: {debug_path}")
             err(f"  Re-capture from the *download* request and try again.")
             raise SystemExit(1)
-        if target["size"] and len(body) < target["size"]:
-            # Got fewer bytes than expected. The server cut us off
-            # early — might be a session challenge mid-response, or
-            # just a flaky network. Treat as a warning, not a hard
-            # error: aria2c has retries.
-            warn(f"  Pre-flight got {human_size(len(body))} of "
-                 f"{human_size(target['size'])} expected. "
-                 f"Network may be flaky; aria2c will retry.")
-            return
-        ok(f"  Pre-flight OK: got {human_size(len(body))} of real "
+        # If we got here, the response is a real archive (or at least
+        # not HTML). We only read ~1 KB, so we can't verify the full
+        # file — but the key signal (HTML auth challenge) is gone.
+        ok(f"  Pre-flight OK: got {human_size(len(body))} of "
            f"archive data, cookie is healthy for full downloads.")
     finally:
         resp.close()
@@ -1825,6 +1883,9 @@ def main() -> int:
     parser.add_argument("--fresh", "--no-resume", dest="fresh",
                         action="store_true",
                         help="ignore saved state, re-discover from scratch")
+    parser.add_argument("--dry-run", dest="dry_run",
+                        action="store_true",
+                        help="validate cookie and discover parts without downloading")
     parser.add_argument("--reset-config", dest="reset_config",
                         action="store_true",
                         help="clear ~/.takeout-cli.json (forget last folder)")
@@ -2202,6 +2263,23 @@ def _download_one_batch(payload: TakeoutPayload,
         return 0
 
     # ----------------------------------------------------------------
+    # Dry-run mode: validate cookie + discover parts, then exit.
+    # Useful for verifying everything looks right before committing to
+    # a long download.
+    # ----------------------------------------------------------------
+    if getattr(args, 'dry_run', False):
+        ok(f"Dry-run: {len(parts)} parts, {human_size(total)} total, "
+           f"cookie is valid.")
+        for p in parts:
+            status = _c("32", "✓") if p["have"] else _c("33", "↓")
+            info(f"  {status} {p['filename']:40s} "
+                 f"{human_size(p['size']):>10s}  {p['url'][:80]}")
+        ok(f"Dry-run complete. Run without --dry-run to download.")
+        state = update_state_from_parts(state, parts)
+        save_state(output_dir, state)
+        return 0
+
+    # ----------------------------------------------------------------
     # Pre-flight check: prove the cookie works for *full-file* GETs
     # (not just 1-byte Range probes) BEFORE we kick off aria2c.
     #
@@ -2286,7 +2364,22 @@ def _download_one_batch(payload: TakeoutPayload,
                 break
             continue
 
-        # Looks like cookie expired mid-run.
+        # Looks like cookie expired mid-run, OR the parallel
+        # download triggered Google's anti-bot challenge. Before
+        # asking for a new cookie, try reducing parallelism to 1
+        # (sequential downloads). This fixes the common case where
+        # 5 parallel connections trigger the challenge but a single
+        # connection works fine.
+        if args.parallel > 1 and auth_failures == 0:
+            warn(f"{len(incomplete)} parts still incomplete after "
+                 f"parallel download with --parallel {args.parallel}.")
+            info(f"  Retrying with --parallel 1 (sequential) to avoid "
+                 f"Google's anti-bot challenge.")
+            args.parallel = 1
+            attempt = 0
+            continue
+
+        # Cookie likely expired, or sequential download also failed.
         warn(f"{len(incomplete)} parts still incomplete; "
              "cookie likely expired mid-run.")
         for p in incomplete[:10]:

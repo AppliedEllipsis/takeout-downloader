@@ -66,7 +66,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
                     captureTimestamps: stamps,
                     lastError: null
                 });
-                updateBadge();
+                updateBadgeAndIcon();
+                const filename = extractFilename(capture.url);
+                notifyCapture(filename);
             });
         } catch (err) {
             chrome.storage.local.set({ lastError: err.message || String(err) });
@@ -126,20 +128,56 @@ function buildCapture(details) {
 }
 
 // ---------------------------------------------------------------------------
-// Badge: pulse when a new capture arrives
+// Badge + icon: shows capture freshness at a glance
 // ---------------------------------------------------------------------------
-function updateBadge() {
+const FRESH_CUTOFF = 300;   // 5 minutes — green badge
+const STALE_CUTOFF = 600;   // 10 minutes — orange badge (Google cookies ~10 min)
+
+function updateBadgeAndIcon() {
     chrome.storage.local.get(['hasCapture', 'lastCapture'], (data) => {
-        if (data.hasCapture && data.lastCapture) {
-            const filename = extractFilename(data.lastCapture.url);
-            const short = filename.length > 8 ? filename.slice(-6) : filename;
-            chrome.action.setBadgeText({ text: short });
-            chrome.action.setBadgeBackgroundColor({ color: '#7c3aed' });
-        } else {
+        if (!data.hasCapture || !data.lastCapture || !data.lastCapture.captured_at) {
             chrome.action.setBadgeText({ text: '' });
+            return;
+        }
+        const age = (Date.now() - Date.parse(data.lastCapture.captured_at)) / 1000;
+        if (age < FRESH_CUTOFF) {
+            chrome.action.setBadgeText({ text: '✓' });
+            chrome.action.setBadgeBackgroundColor({ color: '#22c55e' });
+        } else if (age < STALE_CUTOFF) {
+            chrome.action.setBadgeText({ text: '!' });
+            chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
+        } else {
+            chrome.action.setBadgeText({ text: '✗' });
+            chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
         }
     });
 }
+
+// Notification ding when a fresh cookie is captured
+function notifyCapture(filename) {
+    try {
+        chrome.notifications.create('takeout-' + Date.now(), {
+            type: 'basic',
+            iconUrl: 'icon48.png',
+            title: 'Cookie captured!',
+            message: filename
+                ? `Click the extension → Copy ALL exports to save ${filename}`
+                : 'Click the extension → Copy ALL exports',
+            priority: 1,
+            silent: false
+        });
+    } catch (e) {
+        // notifications may fail in some contexts; non-critical
+    }
+}
+
+// Staleness timer: update badge every 30s so the indicator reflects age
+let staleTimer = null;
+function startStaleTimer() {
+    if (staleTimer) return;
+    staleTimer = setInterval(updateBadgeAndIcon, 30000);
+}
+startStaleTimer();
 
 function extractFilename(url) {
     try {
@@ -210,7 +248,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             lastError: null,
             pageScrape: null
         }, () => {
-            updateBadge();
+            updateBadgeAndIcon();
             sendResponse({ ok: true });
         });
         return true;

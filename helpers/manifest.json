@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Takeout Downloader Helper",
-    "version": "3.0.4",
+    "version": "3.0.5",
     "description": "Captures Google Takeout download URLs and copies them as JSON for the Takeout Downloader TUI",
 
     "minimum_chrome_version": "102",

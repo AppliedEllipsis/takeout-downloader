@@ -6,6 +6,22 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **Schema v2 multi-payload with auto-detected part count.** The
+  browser extension now scrapes the visible `[data-download-uri]`
+  buttons on the Takeout manage page (filtered by `j=` so URLs from
+  other Takeouts on the same account never leak in) and emits a v2
+  multi-payload carrying `archiveId`, `expectedParts`, and per-part
+  `partIndex` + `size`. The CLI uses these to skip its "How many parts
+  are in this export?" prompt entirely — the page already told us N,
+  so we just download them all. Schema v1 multi-payloads (no
+  metadata) are rejected with a clear "re-capture" message; schema v1
+  single-export captures still work everywhere.
+- **`[a] Download ALL` now actually iterates.** Previously the
+  multi-export menu's `[a]` option just downloaded the smallest
+  archive and told the user to re-run for the rest. Now it loops
+  through every archive in smallest-first order, asking for a fresh
+  cookie when one expires and resuming partials on the next pass.
+
 - **Ephemeral paste relay (`--relay`).** "ngrok but zero-config" for
   getting the JSON payload into the CLI over SSH → tmux → Docker, where
   terminal paste is unreliable (bracketed-paste markers get stripped,
@@ -63,6 +79,15 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Accidental JSON paste into the output-dir prompt was silently
+  accepted as a folder name.** The path prompt now sniffs input that
+  starts with `{` or `[` and rejects it with a clear "wrong prompt"
+  hint, instead of letting `Path(...)` create a folder literally named
+  `{...}` or crashing on a multi-KB blob. Long-path / invalid-char
+  errors from `mkdir` are now caught and re-prompted instead of
+  crashing with an unhandled `OSError`. Ctrl-C at this prompt exits
+  cleanly with code 130 and no misleading "resuming partial downloads"
+  message (there are no partials yet).
 - **TUI froze after browsing into a large/slow directory** (had to
   `docker kill`). Textual's `DirectoryTree` stats every entry and recurses
   on the UI thread, which locks the whole app on a big JuiceFS/encfs FUSE

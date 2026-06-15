@@ -357,6 +357,101 @@
     }
 
     // -------------------------------------------------------------------------
+    // Scrape [data-download-uri] buttons directly from the manage page.
+    //
+    // Most reliable source: the page renders one button per part with
+    // `aria-label="Download again part X of N"`, the part URL pattern
+    // (`data-download-uri`), and the part size (`data-size`). We only
+    // return buttons that match the captured URL's `j=` (archive ID)
+    // so URLs from OTHER Takeouts the user has on their account don't
+    // leak into the multi-payload.
+    //
+    // The download URL itself is built by varying `i=` from 0..N-1 on
+    // the captured URL template — per the takeout_dl.py contract, the
+    // filename component is cosmetic and the server returns the right
+    // file based on `i`.
+    // -------------------------------------------------------------------------
+    function scrapePartsFromButtons(capturedUrl) {
+        const params = parseUrlParams(capturedUrl);
+        const targetArchiveId = params.archiveId;
+        if (!targetArchiveId) return null;
+
+        // Re-query each call (cheap, ~10 nodes). The manage page rerenders
+        // the <ul> on every nav so we can't cache the NodeList.
+        const buttons = Array.from(document.querySelectorAll('[data-download-uri]'));
+        if (buttons.length === 0) return null;
+
+        // Filter to buttons that belong to the captured archive. Buttons
+        // from other Takeouts (if Google ever shows multiple on one page)
+        // are dropped here.
+        const myButtons = buttons.filter(btn => {
+            const uri = btn.getAttribute('data-download-uri') || '';
+            // data-download-uri is HTML-attribute-encoded (e.g. "&amp;").
+            const decoded = decodeURIComponent(uri.replace(/&amp;/g, '&'));
+            const jm = decoded.match(/[?&]j=([a-f0-9-]+)/i);
+            return jm && jm[1] === targetArchiveId;
+        });
+        if (myButtons.length === 0) return null;
+
+        // Extract the part count from the first aria-label that matches
+        // "part X of N". Falls back to the button count if no aria-label
+        // is found (older UI or stripped markup).
+        let expectedParts = myButtons.length;
+        for (const btn of myButtons) {
+            const al = btn.getAttribute('aria-label') || '';
+            const m = al.match(/part\s+(\d+)\s+of\s+(\d+)/i);
+            if (m) {
+                expectedParts = parseInt(m[2], 10);
+                break;
+            }
+        }
+
+        // Per-part sizes keyed by `i=`. The CLI uses these to show
+        // "155.3 MB" before downloading and to skip Range probes when
+        // the extension already knows the size.
+        const sizesByI = {};
+        for (const btn of myButtons) {
+            const uri = btn.getAttribute('data-download-uri') || '';
+            const decoded = decodeURIComponent(uri.replace(/&amp;/g, '&'));
+            const im = decoded.match(/[?&]i=(\d+)/);
+            if (!im) continue;
+            const i = parseInt(im[1], 10);
+            const sizeStr = btn.getAttribute('data-size') || '';
+            const size = parseInt(sizeStr, 10);
+            if (!isNaN(size) && size > 0) sizesByI[i] = size;
+        }
+
+        // Build N URLs by varying `i=` on the captured URL template.
+        // The captured URL has the right host, cookie, j=, user, rapt,
+        // authuser. The filename in the path is irrelevant.
+        let baseUrl;
+        try {
+            const u = new URL(capturedUrl);
+            u.searchParams.delete('i');
+            baseUrl = u;
+        } catch (e) {
+            return null;
+        }
+
+        const urls = [];
+        const sizes = [];
+        for (let i = 0; i < expectedParts; i++) {
+            const u = new URL(baseUrl.toString());
+            u.searchParams.set('i', String(i));
+            urls.push(u.toString());
+            sizes.push(sizesByI[i] || 0);
+        }
+
+        return {
+            urls,
+            sizes,
+            archiveId: targetArchiveId,
+            expectedParts,
+            source: 'buttons'
+        };
+    }
+
+    // -------------------------------------------------------------------------
     // Try to fetch the export list from Takeout's internal API.
     // -------------------------------------------------------------------------
     async function fetchExportList(capturedUrl) {
@@ -387,10 +482,45 @@
 
         const debug = [];
 
-        // First, check if the spy has already seen the URLs.
-        const spyUrls = Array.from(spyCache.urls).filter(u => u.includes('takeout-download.usercontent.google.com'));
+        // Strategy 1: scrape the visible [data-download-uri] buttons.
+        // The page tells us "Part X of N" up front and each button's
+        // data-size lets the CLI skip the Range probe entirely.
+        // Filter by archive ID so we never leak URLs from other
+        // Takeouts the user has on their account.
+        const buttonParts = scrapePartsFromButtons(capturedUrl);
+        if (buttonParts && buttonParts.urls.length > 0) {
+            debug.push(`buttons: ${buttonParts.urls.length} parts for archive ${buttonParts.archiveId}`);
+            return {
+                ok: true,
+                urls: buttonParts.urls,
+                debug,
+                source: buttonParts.source,
+                meta: {
+                    archiveId: buttonParts.archiveId,
+                    expectedParts: buttonParts.expectedParts,
+                    sizes: buttonParts.sizes
+                }
+            };
+        }
+
+        // Strategy 2: check the spy cache for URLs, BUT only those
+        // matching the captured archive ID. Unfiltered, the spy cache
+        // picks up URLs from other Takeouts (the manage page makes
+        // calls to /api/v2/manage/archives which returns every archive)
+        // and we used to return all of them — that's how the CLI ended
+        // up showing 10 archives when the user was looking at one
+        // Takeout with 5 parts.
+        const spyUrls = Array.from(spyCache.urls).filter(u => {
+            if (!u.includes('takeout-download.usercontent.google.com')) return false;
+            try {
+                const u2 = new URL(u);
+                return u2.searchParams.get('j') === archiveId;
+            } catch (e) {
+                return false;
+            }
+        });
         if (spyUrls.length > 0) {
-            return { ok: true, urls: spyUrls, debug: ['spy cache'], source: 'spy' };
+            return { ok: true, urls: spyUrls, debug: ['spy cache (filtered)'], source: 'spy' };
         }
 
         // Direct scan: look for <script class="ds:0"> containing filenames.

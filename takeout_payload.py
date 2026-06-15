@@ -58,7 +58,20 @@ from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 
-SCHEMA_VERSION = 1
+# Schema v2 (2026-06-14) added multi-export part metadata:
+#   - top-level `archiveId` and `expectedParts`
+#   - per-export `partIndex` (0-based) and `size` (bytes)
+# These let the CLI auto-detect the part count from the payload instead
+# of asking the user, and skip Range probes when sizes are already known.
+#
+# Compatibility policy:
+#   - Schema 1 single-export captures: still accepted everywhere.
+#   - Schema 1 multi-payloads: rejected by parse_multi_payload with a
+#     clear "re-capture" message — they don't carry the new metadata
+#     so the CLI can't safely auto-download them.
+#   - Schema 2 single + multi: full new features.
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 # Headers that the download server actually validates against.
 # Anything else is captured but ignored, to keep the clipboard payload small.
@@ -136,10 +149,11 @@ class TakeoutPayload:
             raise ValueError("Payload must be a JSON object")
 
         schema = data.get("schema", 1)
-        if schema != SCHEMA_VERSION:
+        if schema not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(
                 f"Schema version {schema} not supported "
-                f"(this TUI expects version {SCHEMA_VERSION})"
+                f"(this TUI expects version {SCHEMA_VERSION}, "
+                f"also accepts {SUPPORTED_SCHEMA_VERSIONS[0]} for single-export)"
             )
 
         url = data.get("url")
@@ -314,6 +328,11 @@ def parse_multi_payload(text: str) -> list[TakeoutPayload]:
     Returns a list of TakeoutPayload objects, one per export.
     If the payload is not multi, returns a single-element list
     with the regular payload.
+
+    Schema v2 multi-payloads carry top-level ``archiveId`` and
+    ``expectedParts`` so the CLI can skip its "How many parts?" prompt.
+    Schema v1 multi-payloads are rejected — re-capture with the current
+    extension version.
     """
     text = (text or "").strip()
     if not text:
@@ -321,17 +340,34 @@ def parse_multi_payload(text: str) -> list[TakeoutPayload]:
     if not text.startswith("{"):
         return [TakeoutPayload.from_curl(text)]
 
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}") from e
+
     if not isinstance(data, dict):
         raise ValueError("Payload must be a JSON object")
 
-    # Not a multi payload → regular single-export
+    # Not a multi payload → regular single-export (any supported schema)
     if not data.get("multi"):
         return [TakeoutPayload.from_json(text)]
 
+    # Multi payload: enforce schema v2. v1 multi-payloads lack the
+    # archiveId / expectedParts metadata that lets the CLI safely
+    # auto-download, so we refuse rather than silently degrading.
+    schema = data.get("schema", 1)
+    if schema < 2:
+        raise ValueError(
+            f"Multi payload is schema v{schema}, but v2 is required for "
+            "auto-download (carries archiveId and expectedParts). "
+            "Re-capture with the current Takeout Downloader Helper "
+            "extension — the page should show \"Part X of N\" buttons "
+            "and the extension will emit a v2 multi-payload."
+        )
+
     # Multi payload: extract shared fields and clone per-export
     base = {
-        "schema": data.get("schema", 1),
+        "schema": schema,
         "captured_at": data.get("captured_at")
         or datetime.now(timezone.utc).isoformat(),
         "source": data.get("source", "extension"),
@@ -363,3 +399,59 @@ def parse_multi_payload(text: str) -> list[TakeoutPayload]:
         raise ValueError("Multi payload has no valid export URLs")
 
     return payloads
+
+
+@dataclass
+class MultiPayloadMeta:
+    """Top-level metadata extracted from a v2 multi-payload.
+
+    The CLI uses ``expectedParts`` to skip its "How many parts?" prompt
+    when the extension has already detected the count from the page.
+    ``archiveId`` lets the CLI filter manifest-fetch results so it never
+    pulls in URLs from other Takeouts the user has on their account.
+    ``sizes`` is keyed by part index (0-based) so the CLI can show
+    "155.3 MB" up front and skip Range probes when known.
+    """
+    archiveId: Optional[str] = None
+    expectedParts: Optional[int] = None
+    sizes: dict = field(default_factory=dict)
+
+    @property
+    def has_full_metadata(self) -> bool:
+        return bool(self.archiveId) and bool(self.expectedParts)
+
+
+def parse_multi_payload_meta(text: str) -> tuple[list[TakeoutPayload], MultiPayloadMeta]:
+    """Like :func:`parse_multi_payload`, but also returns the top-level
+    v2 metadata (``archiveId``, ``expectedParts``, per-part ``sizes``).
+
+    For non-multi or schema-v1 payloads the meta is empty.
+    """
+    payloads = parse_multi_payload(text)
+    meta = MultiPayloadMeta()
+
+    text = (text or "").strip()
+    if not text.startswith("{"):
+        return payloads, meta
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return payloads, meta
+
+    if not isinstance(data, dict) or not data.get("multi"):
+        return payloads, meta
+
+    meta.archiveId = data.get("archiveId") or None
+    ep = data.get("expectedParts")
+    if isinstance(ep, int) and ep > 0:
+        meta.expectedParts = ep
+
+    for i, exp in enumerate(data.get("exports", []) or []):
+        if not isinstance(exp, dict):
+            continue
+        size = exp.get("size")
+        if isinstance(size, int) and size > 0:
+            meta.sizes[i] = size
+
+    return payloads, meta

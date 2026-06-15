@@ -255,3 +255,122 @@ def test_filename_hint_unknown_for_weird_url():
 def test_required_cookie_markers_present_in_good_cookie():
     # Sanity: our test cookie actually exercises the marker check.
     assert any(m in GOOD_COOKIE for m in REQUIRED_COOKIE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Schema v2 — multi-payload with archiveId + expectedParts
+# ---------------------------------------------------------------------------
+
+def _make_v2_multi(expected_parts=5, sizes=None):
+    """Build a v2 multi-payload shaped like the new extension emits."""
+    sizes = sizes or [162871683, 545181980, 1257224630, 411587, 44082]
+    return {
+        "schema": 2,
+        "captured_at": _now_iso(),
+        "source": "extension",
+        "multi": True,
+        "archiveId": "ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20",
+        "expectedParts": expected_parts,
+        "exports": [
+            {
+                "url": (
+                    "https://takeout-download.usercontent.google.com/"
+                    f"download/takeout-20260612T190148Z-15-{i+1:03d}.zip"
+                    f"?j=ccb0dc6c&i={i}&user=1&authuser=3"
+                ),
+                "partIndex": i,
+                "size": s,
+            }
+            for i, s in enumerate(sizes[:expected_parts])
+        ],
+        "cookie": GOOD_COOKIE,
+        "headers": {"User-Agent": "Mozilla/5.0 Chrome/120"},
+    }
+
+
+def test_v2_multi_parses_all_exports_with_sizes():
+    from takeout_payload import parse_multi_payload_meta
+    text = json.dumps(_make_v2_multi())
+    payloads, meta = parse_multi_payload_meta(text)
+    assert len(payloads) == 5
+    assert meta.archiveId == "ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20"
+    assert meta.expectedParts == 5
+    assert meta.has_full_metadata is True
+    # Sizes keyed by 0-based part index.
+    assert meta.sizes[0] == 162871683
+    assert meta.sizes[4] == 44082
+    # Each payload has its own i= so the URLs are distinct.
+    assert payloads[0].url.endswith("i=0&user=1&authuser=3")
+    assert payloads[4].url.endswith("i=4&user=1&authuser=3")
+    # Cookie + headers are shared.
+    for p in payloads:
+        assert p.cookie == GOOD_COOKIE
+        assert p.headers["User-Agent"] == "Mozilla/5.0 Chrome/120"
+
+
+def test_v1_multi_payload_is_rejected_with_clear_error():
+    """v1 multi-payloads lack archiveId/expectedParts so we refuse them
+    rather than silently degrade to a parts-unaware download."""
+    v1 = _make_v2_multi()
+    v1["schema"] = 1
+    del v1["archiveId"]
+    del v1["expectedParts"]
+    for e in v1["exports"]:
+        e.pop("partIndex", None)
+        e.pop("size", None)
+    from takeout_payload import parse_multi_payload
+    with pytest.raises(ValueError, match=r"v2 is required"):
+        parse_multi_payload(json.dumps(v1))
+
+
+def test_v1_single_export_still_works():
+    """v1 single-export captures are still accepted everywhere."""
+    blob = make_extension_json(schema=1)
+    p = TakeoutPayload.from_json(blob)
+    assert p.url == GOOD_URL
+
+
+def test_v2_single_export_works():
+    """v2 single-export captures (without multi) also work."""
+    blob = make_extension_json(schema=2)
+    p = TakeoutPayload.from_json(blob)
+    assert p.url == GOOD_URL
+
+
+def test_unknown_schema_is_rejected():
+    blob = make_extension_json(schema=99)
+    with pytest.raises(ValueError, match="Schema version 99"):
+        TakeoutPayload.from_json(blob)
+
+
+def test_meta_empty_for_non_multi_payload():
+    """Legacy single-export payloads return empty meta — callers can
+    safely check `meta.has_full_metadata`."""
+    from takeout_payload import parse_multi_payload_meta
+    text = make_extension_json()
+    payloads, meta = parse_multi_payload_meta(text)
+    assert len(payloads) == 1
+    assert meta.archiveId is None
+    assert meta.expectedParts is None
+    assert meta.sizes == {}
+    assert meta.has_full_metadata is False
+
+
+def test_meta_partial_when_sizes_missing():
+    """archiveId+expectedParts without per-part sizes is still valid
+    metadata; the CLI just probes to fill in sizes."""
+    from takeout_payload import parse_multi_payload_meta
+    payload = _make_v2_multi(expected_parts=3, sizes=[0, 0, 0])
+    text = json.dumps(payload)
+    payloads, meta = parse_multi_payload_meta(text)
+    assert meta.has_full_metadata is True
+    assert meta.sizes == {}  # all zero, so empty
+
+
+def test_v2_multi_falls_back_to_single_when_multi_false():
+    """If a v2 payload omits `multi`, treat as single (same as v1)."""
+    from takeout_payload import parse_multi_payload
+    text = make_extension_json(schema=2)
+    payloads = parse_multi_payload(text)
+    assert len(payloads) == 1
+    assert payloads[0].url == GOOD_URL

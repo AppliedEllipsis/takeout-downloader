@@ -61,7 +61,7 @@ except Exception:
     pass
 
 from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR
-from takeout_payload import parse_payload, parse_multi_payload, TakeoutPayload, REQUIRED_COOKIE_MARKERS
+from takeout_payload import parse_payload, parse_multi_payload, parse_multi_payload_meta, TakeoutPayload, MultiPayloadMeta, REQUIRED_COOKIE_MARKERS
 
 
 # ===========================================================================
@@ -542,23 +542,53 @@ def _parse_manifest_json(data: dict, payload: TakeoutPayload) -> list[TakeoutPay
     return payloads
 
 
+def _looks_like_json(text: str) -> bool:
+    """Heuristic sniff for accidental JSON paste into a non-JSON prompt.
+
+    Cheap — we only look at the first non-whitespace character. Avoids
+    catching real paths (which never start with { or [) while still
+    flagging both compact and pretty-printed payloads.
+    """
+    s = text.lstrip()
+    return bool(s) and s[0] in "{["
+
+
 def prompt_for_output_dir(default: Path) -> Path:
     """Ask the user where to save archives. Empty input keeps the default.
     Type 'q' to quit. Anything else is treated as a path and validated.
+
+    Defensive against an accidental paste of the JSON payload here:
+      - JSON-shaped input (starts with { or [) is rejected up front with
+        a clear "wrong prompt" hint instead of being treated as a path.
+      - OSError from a too-long / malformed path is caught and re-prompted
+        instead of crashing with a traceback.
+      - KeyboardInterrupt exits cleanly (SystemExit 130) instead of
+        bubbling to the outer handler that warns about resuming partial
+        downloads — there are no partials yet at this prompt.
     """
     info("")
     info(_c("1;36", f"Where do you want to save the archives?"))
     info(_c("36", f"  Default [{default}] (Enter to accept, or type a path):"))
-    info(_c("36", "  Type 'q' to quit."))
+    info(_c("36", "  Type 'q' to quit, or Ctrl-C to abort."))
     while True:
         try:
             raw = input(f"  save to > ").strip()
         except EOFError:
             return default
+        except KeyboardInterrupt:
+            info("")
+            raise SystemExit(130)
         if raw.lower() in ("q", "quit", "exit"):
             raise SystemExit(0)
         if not raw:
             return default
+        # Accidental JSON paste — reject before it becomes a folder name.
+        if _looks_like_json(raw):
+            err("  That input looks like a JSON payload, not a directory path.")
+            err("  This prompt expects a folder path. The JSON goes at the")
+            err("  'Paste the JSON' prompt further up — re-run and paste it there.")
+            err("  Try again (Enter for default, 'q' to quit, Ctrl-C to abort).")
+            continue
         # Expand ~ and make absolute relative to cwd.
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
@@ -569,7 +599,18 @@ def prompt_for_output_dir(default: Path) -> Path:
             err(f"  {e}")
             info("  Try again (or Enter for default, 'q' to quit).")
             continue
-        validated.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Common after an accidental paste of a long blob: Windows
+            # raises [WinError 206] "filename or extension is too long".
+            err(f"  Path is not usable ({e}).")
+            info("  Try again (or Enter for default, 'q' to quit).")
+            continue
+        try:
+            validated.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            err(f"  Could not create {validated} ({e}).")
+            info("  Try again (or Enter for default, 'q' to quit).")
+            continue
         return validated
 
 
@@ -786,21 +827,37 @@ def relay_paste_source(use_tunnel: bool, timeout: int):
     return _read
 
 
-def parse_one_payload(source=None) -> TakeoutPayload:
+def parse_one_payload(source=None) -> tuple[TakeoutPayload, dict]:
     """Read + parse + validate one payload. If the extension scraped the
     whole page and returned multiple exports, show a menu so the user
     picks which archive to download. Failures are terminal.
 
-    `source` is a zero-arg callable returning the raw payload text. Defaults
-    to the module-level `_PAYLOAD_SOURCE` (set by --relay), then the terminal
-    paste reader."""
+    Returns ``(payload, ctx)`` where ``ctx`` carries multi-payload
+    metadata the caller needs:
+
+      - ``mode``: ``"single"`` | ``"parts"`` | ``"batches"``
+      - ``meta``: MultiPayloadMeta (archiveId, expectedParts, sizes)
+      - ``pre_built_parts``: list of part dicts ready for download, set
+        in ``"parts"`` mode so the caller can skip discovery entirely.
+      - ``all_payloads``: full multi-payload list (for state, re-prompt)
+
+    Mode semantics:
+      - ``"single"``: one URL, one export. Caller does discovery.
+      - ``"parts"``: multi-payload v2 with expectedParts. Each URL is a
+        part of ONE batch; caller downloads all parts without a menu.
+      - ``"batches"``: legacy multi-payload (or v2 without expectedParts).
+        URLs are separate batches; caller shows the pick menu.
+
+    `source` is a zero-arg callable returning the raw payload text.
+    Defaults to the module-level `_PAYLOAD_SOURCE` (set by --relay),
+    then the terminal paste reader."""
     raw = (source or _PAYLOAD_SOURCE or prompt_for_paste)()
     if not raw.strip():
         err("No JSON received.")
         _payload_fix_hint()
         raise SystemExit(1)
     try:
-        payloads = parse_multi_payload(raw)
+        payloads, meta = parse_multi_payload_meta(raw)
     except ValueError as e:
         err(f"Could not parse JSON: {e}")
         _payload_fix_hint()
@@ -821,6 +878,13 @@ def parse_one_payload(source=None) -> TakeoutPayload:
     ok(f"Cookie OK: {len(first.cookie)} chars "
        f"(markers: {', '.join(markers[:4])})")
 
+    ctx: dict = {
+        "mode": "single",
+        "meta": meta,
+        "pre_built_parts": None,
+        "all_payloads": payloads,
+    }
+
     # If we only got one URL, try to fetch the full manifest from the
     # Takeout manage page using the captured cookie. This finds all parts
     # automatically without needing the extension to scrape.
@@ -829,9 +893,21 @@ def parse_one_payload(source=None) -> TakeoutPayload:
         if manifest and len(manifest) > 1:
             ok(f"Server-side manifest: found {len(manifest)} archives.")
             payloads = manifest
+            ctx["all_payloads"] = payloads
+            # Manifest result is always "batches" mode (no expectedParts).
+            ctx["mode"] = "batches"
 
+    # Decide mode based on what we have now.
     if len(payloads) == 1:
-        return payloads[0]
+        ctx["mode"] = "single"
+        return payloads[0], ctx
+
+    # Multi-payload: parts mode if v2 metadata says so, else batches.
+    if meta.has_full_metadata and meta.expectedParts == len(payloads):
+        ctx["mode"] = "parts"
+        ok(f"Multi-payload has expectedParts={meta.expectedParts}: "
+           f"treating {len(payloads)} URLs as parts of one batch.")
+        return payloads[0], ctx
     # Multi-export: probe sizes so we can show "123 MB" next to each and
     # sort by smallest first (fastest download first).
     info("")
@@ -877,16 +953,22 @@ def parse_one_payload(source=None) -> TakeoutPayload:
         except EOFError:
             choice = "1"
         if choice == "a":
-            # Return the smallest one first; caller will need to handle
-            # iteration. For now, just return the first and the user
-            # can re-run for the rest.
-            info("Downloading all archives sequentially (smallest first). "
-                 "Re-run this command for the next archive.")
-            return sorted_payloads[0]
+            # "Download ALL" used to just return the smallest and tell
+            # the user to re-run. That's frustrating when the user has
+            # 10 archives and wants them all. Now we hand back the
+            # *sorted* list so the caller can iterate.
+            info("Downloading ALL archives sequentially (smallest first). "
+                 "This may take a while; Ctrl-C to stop after the current one.")
+            # Reuse the (already sorted, smallest-first) list via a
+            # sentinel in ctx. The caller checks ctx.get("all_sorted")
+            # and loops over it instead of doing single-batch discovery.
+            ctx["mode"] = "batches_all"
+            ctx["all_sorted"] = sorted_payloads
+            return sorted_payloads[0], ctx
         try:
             idx = int(choice)
             if 1 <= idx <= len(sorted_payloads):
-                return sorted_payloads[idx - 1]
+                return sorted_payloads[idx - 1], ctx
         except ValueError:
             pass
         err(f"  Please enter 1-{len(sorted_payloads)} or 'a'.")
@@ -900,6 +982,43 @@ def _payload_fix_hint() -> None:
          "icon -> Copy as JSON")
     info("  2. Right-click in the terminal to paste, then press Enter.")
     info(f"  (Or save to {out}/in.json and re-run.)")
+
+
+def _build_parts_from_payloads(payloads: list[TakeoutPayload],
+                                meta: MultiPayloadMeta,
+                                output_dir: Path) -> list[dict]:
+    """Build the internal ``parts`` list directly from a v2 multi-payload
+    whose URLs are the parts of one batch (i.e. ``parts`` mode from
+    :func:`parse_one_payload`).
+
+    Each entry is shaped exactly like ``discover_parts`` produces:
+        ``{"num", "url", "filename", "size", "have"}``
+
+    Sizes come from ``meta.sizes`` when the extension knew them (it scraped
+    ``data-size`` off the page). Unknown sizes stay at 0 and ``aria2c``
+    falls back to whatever the server returns. ``have`` is computed from
+    the filesystem so already-downloaded parts are skipped on resume.
+    """
+    parts: list[dict] = []
+    for i, p in enumerate(payloads):
+        # Filename from URL tail; fall back to a synthetic name if the
+        # URL doesn't end in a recognizable extension (rare).
+        filename = p.filename_hint()
+        if filename == "unknown":
+            filename = f"part-{i + 1:03d}.zip"
+        dest = output_dir / filename
+        size = meta.sizes.get(i, 0) or 0
+        have = dest.exists() and dest.stat().st_size > 0 and (
+            size == 0 or dest.stat().st_size >= size
+        )
+        parts.append({
+            "num": i + 1,
+            "url": p.url,
+            "filename": filename,
+            "size": size,
+            "have": have,
+        })
+    return parts
 
 
 # ===========================================================================
@@ -1449,7 +1568,11 @@ def main() -> int:
         save_config(cfg)
         debug(f"Saved output_dir to {_config_path()}")
 
-    payload = parse_one_payload()
+    payload, payload_ctx = parse_one_payload()
+    payload_mode = payload_ctx["mode"]
+    payload_meta = payload_ctx["meta"]
+    payload_all = payload_ctx["all_payloads"]
+    payload_pre_built = payload_ctx.get("pre_built_parts")
 
     # Try to resume from state in the chosen folder.
     state = load_state(output_dir)
@@ -1478,9 +1601,56 @@ def main() -> int:
                 _, incomplete = verify_parts(parts, output_dir)
                 parts = [p for p in parts if p["have"]] + incomplete
 
+    # Parts mode: the multi-payload's URLs ARE the parts of one batch.
+    # Skip discovery entirely — we already know N, sizes, and have the
+    # exact URLs the extension built from the page's [data-download-uri]
+    # buttons. No probe, no "how many parts?" prompt, no menu.
+    if not parts and payload_mode == "parts":
+        info("")
+        info(_c("1;36", f"Detected {payload_meta.expectedParts} part(s) "
+                        f"from the multi-payload (extension scraped them "
+                        f"from the page)."))
+        parts = _build_parts_from_payloads(
+            payload_all, payload_meta, output_dir
+        )
+        payload_pre_built = parts
+
     # Discover (also validates auth). Re-prompt on auth failure.
     if not parts:
-        info("")
+        # If we already have a multi-payload that lists all parts, skip
+        # the prompt and let discover_parts auto-stop at the end-of-set
+        # rather than asking the user for a part count.
+        if payload_mode == "single" and payload_meta.expectedParts:
+            user_part_count = payload_meta.expectedParts
+            info("")
+            info(_c("1;36", f"Multi-payload says this export has "
+                            f"{user_part_count} part(s); skipping prompt."))
+        else:
+            info("")
+            info(_c("1;36", "How many parts are in this export?"))
+            info(_c("36", "  (Check your Google Takeout page — it shows "
+                          "the part count."))
+            info(_c("36", "  Press Enter to auto-detect via probes, or "
+                          "type a number.)"))
+            while True:
+                try:
+                    raw = input("  parts > ").strip()
+                except EOFError:
+                    raw = ""
+                if not raw:
+                    user_part_count = None
+                    break
+                if raw.lower() in ("q", "quit", "exit"):
+                    raise SystemExit(0)
+                try:
+                    user_part_count = int(raw)
+                    if user_part_count <= 0:
+                        err("  Part count must be a positive number.")
+                        continue
+                    break
+                except ValueError:
+                    err("  Please enter a number, or press Enter for "
+                        "auto-detect.")
         info(_c("1;36", "How many parts are in this export?"))
         info(_c("36", "  (Check your Google Takeout page — it shows the part count."))
         info(_c("36", "  Press Enter to auto-detect via probes, or type a number.)"))
@@ -1517,11 +1687,150 @@ def main() -> int:
                     return 1
                 err(f"Auth failed during discovery ({e}).")
                 info("Re-capture in your browser, then paste the new JSON below.")
-                payload = parse_one_payload()
+                payload, payload_ctx = parse_one_payload()
+                payload_mode = payload_ctx["mode"]
+                payload_meta = payload_ctx["meta"]
+                payload_all = payload_ctx["all_payloads"]
+                payload_pre_built = payload_ctx.get("pre_built_parts")
             except ValueError as e:
                 err(str(e))
                 info("Paste a corrected JSON payload below.")
-                payload = parse_one_payload()
+                payload, payload_ctx = parse_one_payload()
+                payload_mode = payload_ctx["mode"]
+                payload_meta = payload_ctx["meta"]
+                payload_all = payload_ctx["all_payloads"]
+                payload_pre_built = payload_ctx.get("pre_built_parts")
+
+    if not parts:
+        err("No archive parts found. The URL may be wrong or the set is empty.")
+        return 1
+
+    # Iterate over each batch. The single-batch case is just a 1-element
+    # list. The batches_all mode (user picked 'a' in the multi-export
+    # menu) sets up all_sorted so we loop through every archive
+    # smallest-first, asking for a fresh cookie when one expires and
+    # resuming partials on the next pass.
+    batches = payload_ctx.get("all_sorted") or [payload]
+    batches_total = len(batches)
+    batches_failed = 0
+
+    for batch_idx, batch_payload in enumerate(batches, 1):
+        if batches_total > 1:
+            header(f"Batch {batch_idx}/{batches_total}: "
+                   f"{batch_payload.filename_hint()}")
+
+        rc = _download_one_batch(
+            batch_payload, output_dir, args, log,
+            initial_parts=parts if batch_idx == 1 else None,
+            initial_state=state if batch_idx == 1 else None,
+        )
+        if rc != 0:
+            batches_failed += 1
+
+    if batches_total > 1:
+        if batches_failed == 0:
+            ok(f"All {batches_total} batches downloaded to {output_dir}")
+            return 0
+        err(f"{batches_failed}/{batches_total} batches had failures; "
+            "see log for details.")
+        return 1
+    return 0
+
+
+def _download_one_batch(payload: TakeoutPayload,
+                          output_dir: Path,
+                          args,
+                          log,
+                          initial_parts: list[dict] | None = None,
+                          initial_state: dict | None = None) -> int:
+    """Download one Takeout batch: discover parts, run aria2c, verify.
+
+    Extracted from main() so that ``batches_all`` mode (user picks ``[a]``
+    in the multi-export menu) can call it once per archive in the
+    smallest-first list. Returns 0 on full success, 1 on any incomplete
+    part. The caller decides whether the overall exit code reflects
+    a partial failure across multiple batches.
+
+    ``initial_parts`` / ``initial_state`` let the caller reuse work from
+    the first call (typically only set for batch 1).
+    """
+    # Try to resume from state in the chosen folder.
+    state = initial_state if initial_state is not None else load_state(output_dir)
+    parts: list[dict] | None = initial_parts
+    if parts is None and state and state_matches_payload(state, payload) and not args.fresh:
+        parts = state_to_parts(state, payload)
+        if parts:
+            saved_complete = sum(1 for p in parts if p["have"])
+            if len(parts) <= 2:
+                warn(f"State file has only {len(parts)} parts. "
+                     "This may be incomplete from a previous run.")
+                info("Pass --fresh to force re-discovery, or type the actual "
+                     "part count below to extend the list.")
+            else:
+                ok(f"Resuming from {state_path(output_dir)}: "
+                   f"{saved_complete}/{len(parts)} parts marked complete.")
+                info("Re-verifying files on disk before downloading anything.")
+                _, incomplete = verify_parts(parts, output_dir)
+                parts = [p for p in parts if p["have"]] + incomplete
+
+    if not parts:
+        # Last-resort probe-based discovery for the single-batch case.
+        # In multi-batch mode the manifest fetch already pre-resolved
+        # everything so this should always be a no-op for batch > 1.
+        info("")
+        info(_c("1;36", "How many parts are in this export?"))
+        info(_c("36", "  (Check your Google Takeout page — it shows "
+                      "the part count."))
+        info(_c("36", "  Press Enter to auto-detect via probes, or "
+                      "type a number.)"))
+        user_part_count: int | None = None
+        while True:
+            try:
+                raw = input("  parts > ").strip()
+            except EOFError:
+                raw = ""
+            if not raw:
+                break
+            if raw.lower() in ("q", "quit", "exit"):
+                raise SystemExit(0)
+            try:
+                user_part_count = int(raw)
+                if user_part_count <= 0:
+                    err("  Part count must be a positive number.")
+                    continue
+                break
+            except ValueError:
+                err("  Please enter a number, or press Enter for "
+                    "auto-detect.")
+
+        auth_failures = 0
+        while True:
+            try:
+                parts = discover_parts(payload, output_dir,
+                                        max_parts=user_part_count)
+                break
+            except AuthError as e:
+                auth_failures += 1
+                if auth_failures > MAX_AUTH_REPROMPTS:
+                    err(f"Auth still failing after {MAX_AUTH_REPROMPTS} "
+                        "attempts. Re-capture in your browser, then re-run "
+                        "this script.")
+                    return 1
+                err(f"Auth failed during discovery ({e}).")
+                info("Re-capture in your browser, then paste the new JSON below.")
+                payload, payload_ctx = parse_one_payload()
+                payload_mode = payload_ctx["mode"]
+                payload_meta = payload_ctx["meta"]
+                payload_all = payload_ctx["all_payloads"]
+                payload_pre_built = payload_ctx.get("pre_built_parts")
+            except ValueError as e:
+                err(str(e))
+                info("Paste a corrected JSON payload below.")
+                payload, payload_ctx = parse_one_payload()
+                payload_mode = payload_ctx["mode"]
+                payload_meta = payload_ctx["meta"]
+                payload_all = payload_ctx["all_payloads"]
+                payload_pre_built = payload_ctx.get("pre_built_parts")
 
     if not parts:
         err("No archive parts found. The URL may be wrong or the set is empty.")
@@ -1539,7 +1848,6 @@ def main() -> int:
        f"{len(have)} already complete, {len(need)} to download.")
     if not need:
         ok("Everything is already downloaded. Nothing to do.")
-        # Refresh state with verified results and exit cleanly.
         state = update_state_from_parts(state, parts)
         save_state(output_dir, state)
         return 0
@@ -1583,16 +1891,12 @@ def main() -> int:
 
         complete, incomplete = verify_parts(parts, output_dir)
         if use_grid:
-            # Refresh header to reflect newly-completed counts.
             render.set_header(header_line())
-            # Clear any rows that just finished (so the grid shows progress,
-            # not stale 100% bars for already-done files).
             for p in complete:
                 render.clear_row(f"file:{p['filename']}")
             render.teardown()
         else:
             ok(f"Verified: {len(complete)}/{len(parts)} complete.")
-        # Persist progress.
         state = update_state_from_parts(state, parts)
         save_state(output_dir, state)
         need = incomplete
@@ -1600,7 +1904,6 @@ def main() -> int:
             break
 
         if not looks_like_auth_failure(parts, incomplete):
-            # Partial network failure — re-run aria2c to let -c resume.
             warn(f"{len(incomplete)} parts still incomplete; "
                  f"retrying in place (aria2c -c resumes).")
             if attempt >= 5:
@@ -1626,14 +1929,16 @@ def main() -> int:
             err(f"Auth still failing after {MAX_AUTH_REPROMPTS} attempts. "
                 "Re-capture and re-run.")
             return 1
-        payload = parse_one_payload()
-        # Reset attempt counter after a fresh payload.
+        payload, payload_ctx = parse_one_payload()
+        payload_mode = payload_ctx["mode"]
+        payload_meta = payload_ctx["meta"]
+        payload_all = payload_ctx["all_payloads"]
+        payload_pre_built = payload_ctx.get("pre_built_parts")
         attempt = 0
 
     header("Done")
     complete, incomplete = verify_parts(parts, output_dir)
     grand = sum(p["size"] for p in complete)
-    # Final state save: capture verified completion even if we exit non-zero.
     state = update_state_from_parts(state, parts)
     save_state(output_dir, state)
     info("")

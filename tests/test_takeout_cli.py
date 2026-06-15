@@ -446,7 +446,7 @@ def test_full_flow_with_mocks(tmp_path, monkeypatch):
 
     # 1) Paste step: feed the JSON via stdin.
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload_text + "\n"))
-    parsed = takeout_cli.parse_one_payload()
+    parsed, parsed_ctx = takeout_cli.parse_one_payload()
     assert parsed.cookie  # parsed OK
 
     # 2) Discovery step: each probe returns size 1000.
@@ -660,6 +660,80 @@ def test_prompt_for_output_dir_quit(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "stdin", io.StringIO("q\n"))
     with pytest.raises(SystemExit):
         takeout_cli.prompt_for_output_dir(tmp_path)
+
+
+def _reset_cli_logger(monkeypatch):
+    """Other tests call takeout_cli._install_logger(), which (a) sets
+    propagate=False on the module logger and (b) installs a StreamHandler
+    that captured sys.stdout at install time. Both leak into later tests.
+    Reset before each prompt test so caplog works again."""
+    monkeypatch.setattr(takeout_cli.log, "propagate", True)
+    for h in list(takeout_cli.log.handlers):
+        takeout_cli.log.removeHandler(h)
+
+
+def test_prompt_for_output_dir_rejects_json_paste(monkeypatch, tmp_path, caplog):
+    """Accidental JSON paste into the path prompt must NOT be treated as
+    a folder name. The user is re-prompted, then enters a real path."""
+    _reset_cli_logger(monkeypatch)
+    payload = '{"a": 1, "nested": {"x": "y"}, "arr": [1,2,3]}'
+    # First input: JSON. Second input: a real (relative) path that resolves
+    # inside tmp_path so validate_output_dir accepts it.
+    real = tmp_path / "real"
+    monkeypatch.setattr(sys, "stdin",
+                        io.StringIO(payload + "\n" + str(real) + "\n"))
+    with caplog.at_level(logging.ERROR, logger="takeout_cli"):
+        p = takeout_cli.prompt_for_output_dir(tmp_path)
+    assert p == real
+    assert any("looks like a JSON payload" in r.message
+               for r in caplog.records)
+
+
+def test_prompt_for_output_dir_rejects_pretty_json_first_line(monkeypatch, tmp_path, caplog):
+    """A multi-line pretty-printed JSON paste: the FIRST line (a bare `{`)
+    must be caught by the JSON sniff so the user gets an immediate
+    'wrong prompt' hint instead of seeing subsequent lines processed as
+    path-shaped garbage."""
+    _reset_cli_logger(monkeypatch)
+    payload = '{\n  "batchexecute": [\n    {"key": "val"}\n  ]\n}'
+    real = tmp_path / "ok"
+    monkeypatch.setattr(sys, "stdin",
+                        io.StringIO(payload + str(real) + "\n"))
+    with caplog.at_level(logging.ERROR, logger="takeout_cli"):
+        takeout_cli.prompt_for_output_dir(tmp_path)
+    assert any("looks like a JSON payload" in r.message
+               for r in caplog.records)
+
+
+def test_prompt_for_output_dir_keyboard_interrupt_exits_clean(monkeypatch, tmp_path, caplog):
+    """Ctrl-C at the path prompt must exit with code 130, not bubble up
+    as an unhandled KeyboardInterrupt and not show the misleading
+    'resuming partial downloads' message from the outer handler."""
+    _reset_cli_logger(monkeypatch)
+    class _RaisingStdin:
+        def readline(self):
+            raise KeyboardInterrupt()
+    monkeypatch.setattr(sys, "stdin", _RaisingStdin())
+    with pytest.raises(SystemExit) as exc:
+        takeout_cli.prompt_for_output_dir(tmp_path)
+    assert exc.value.code == 130
+    assert not any("Partially-downloaded" in r.message
+                   for r in caplog.records)
+
+
+def test_prompt_for_output_dir_handles_path_too_long(monkeypatch, tmp_path, caplog):
+    """A path that Windows rejects as too long must re-prompt cleanly,
+    not crash with an unhandled OSError traceback."""
+    _reset_cli_logger(monkeypatch)
+    too_long = "x" * 5000  # way past Win32 MAX_PATH
+    real = tmp_path / "real"
+    monkeypatch.setattr(sys, "stdin",
+                        io.StringIO(too_long + "\n" + str(real) + "\n"))
+    with caplog.at_level(logging.ERROR, logger="takeout_cli"):
+        p = takeout_cli.prompt_for_output_dir(tmp_path)
+    assert p == real
+    assert any("Path is not usable" in r.message or "Could not create" in r.message
+               for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1192,3 +1266,120 @@ def test_resolve_output_dir_env_overrides_config(tmp_path, monkeypatch):
     monkeypatch.setenv("OUTPUT_DIR", str(env_target))
     result = takeout_cli.resolve_output_dir()
     assert result == env_target
+
+
+# ---------------------------------------------------------------------------
+# Schema v2 — parts mode auto-detection
+# ---------------------------------------------------------------------------
+
+def _make_v2_multi_payload(expected_parts=5, sizes=None):
+    """Build a v2 multi-payload shaped like the new extension emits."""
+    sizes = sizes or [100, 200, 300, 400, 500]
+    return {
+        "schema": 2,
+        "captured_at": "2026-06-15T02:00:00.000Z",
+        "source": "extension",
+        "multi": True,
+        "archiveId": "ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20",
+        "expectedParts": expected_parts,
+        "exports": [
+            {
+                "url": (
+                    "https://takeout-download.usercontent.google.com/"
+                    f"download/takeout-20260612T190148Z-15-{i+1:03d}.zip"
+                    f"?j=ccb0dc6c&i={i}&user=1&authuser=3"
+                ),
+                "partIndex": i,
+                "size": s,
+            }
+            for i, s in enumerate(sizes[:expected_parts])
+        ],
+        "cookie": (
+            "__Secure-1PSID=x; SID=y; HSID=z; SSID=a; APISID=b; SAPISID=c"
+        ),
+        "headers": {
+            "User-Agent": "Mozilla/5.0 Chrome/120",
+            "Accept": "*/*",
+            "Referer": "https://takeout.google.com/",
+        },
+    }
+
+
+def test_v2_multi_payload_yields_parts_mode(monkeypatch):
+    """A v2 multi-payload with expectedParts switches the CLI into
+    'parts' mode — no pick menu, all URLs are parts of one batch."""
+    text = json.dumps(_make_v2_multi_payload())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(text + "\n"))
+    payload, ctx = takeout_cli.parse_one_payload()
+    assert ctx["mode"] == "parts"
+    assert ctx["meta"].expectedParts == 5
+    assert len(ctx["all_payloads"]) == 5
+    # The returned payload is the first one; the parts list lives in ctx.
+    assert payload.url.endswith("i=0&user=1&authuser=3")
+
+
+def test_build_parts_from_payloads_uses_extension_sizes(tmp_path):
+    """_build_parts_from_payloads should hand back parts whose `size`
+    matches what the extension scraped off the page, and whose `have`
+    is False when the file isn't on disk yet."""
+    from takeout_payload import parse_multi_payload_meta
+
+    text = json.dumps(_make_v2_multi_payload(
+        expected_parts=3, sizes=[100, 200, 300]
+    ))
+    payloads, meta = parse_multi_payload_meta(text)
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    assert len(parts) == 3
+    assert [p["num"] for p in parts] == [1, 2, 3]
+    assert [p["size"] for p in parts] == [100, 200, 300]
+    # None are on disk yet, so all have=False.
+    assert all(p["have"] is False for p in parts)
+    # Each URL preserves the i=0/1/2 query parameter.
+    assert "i=0" in parts[0]["url"]
+    assert "i=1" in parts[1]["url"]
+    assert "i=2" in parts[2]["url"]
+
+
+def test_build_parts_from_payloads_marks_existing_files_have(tmp_path):
+    """If a part is already on disk with the right size, mark it have=True."""
+    from takeout_payload import parse_multi_payload_meta
+
+    text = json.dumps(_make_v2_multi_payload(
+        expected_parts=2, sizes=[100, 200]
+    ))
+    payloads, meta = parse_multi_payload_meta(text)
+    # Pre-create one of the files on disk.
+    existing = tmp_path / "takeout-20260612T190148Z-15-002.zip"
+    existing.write_bytes(b"\x00" * 200)
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    have_flags = {p["filename"]: p["have"] for p in parts}
+    assert have_flags["takeout-20260612T190148Z-15-001.zip"] is False
+    assert have_flags["takeout-20260612T190148Z-15-002.zip"] is True
+
+
+def test_legacy_v1_multi_payload_is_rejected(monkeypatch):
+    """v1 multi-payloads lack archiveId/expectedParts so the CLI exits
+    with a clear "re-capture" message rather than degrading silently."""
+    blob = _make_v2_multi_payload()
+    blob["schema"] = 1
+    del blob["archiveId"]
+    del blob["expectedParts"]
+    for e in blob["exports"]:
+        e.pop("partIndex", None)
+        e.pop("size", None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(blob) + "\n"))
+    with pytest.raises(SystemExit) as exc_info:
+        takeout_cli.parse_one_payload()
+    assert exc_info.value.code == 2
+
+
+def test_single_export_still_works_in_v2(monkeypatch):
+    """v2 single-export captures without `multi` go through the normal
+    discovery path (mode='single')."""
+    blob = json.loads((ROOT / "tests" / "fixtures" / "sample_payload.json").read_text())
+    blob["schema"] = 2
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(blob) + "\n"))
+    payload, ctx = takeout_cli.parse_one_payload()
+    assert ctx["mode"] == "single"
+    assert ctx["meta"].expectedParts is None
+    assert payload.url == blob["url"]

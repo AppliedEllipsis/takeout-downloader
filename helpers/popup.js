@@ -53,6 +53,7 @@ function renderCapture(data) {
 
     // Enable "Copy ALL" if we have a capture with a cookie.
     els.copyAllBtn.disabled = !capture || !capture.cookie;
+    els.copyCaptureBtn.disabled = !capture || !capture.cookie;
 
     if (!capture) {
         setStatus('No capture yet. Start a download on takeout.google.com to capture.', 'dim');
@@ -109,8 +110,15 @@ function buildMultiPayload(capture, urls, meta) {
             url: url,
             filename: shortFilename(url)
         };
-        // Attach size from button metadata if available
-        if (meta && meta.buttonData && meta.buttonData[i]) {
+        // Part index 0-based. Lets the CLI reconstruct the i= param
+        // without parsing the URL, and lets it match sizes to parts
+        // even if URL ordering changes.
+        if (i > 0 || urls.length > 1) entry.partIndex = i;
+        // Attach size from button metadata if available. The CLI uses
+        // these to skip Range probes and to show "155.3 MB" up front.
+        if (meta && meta.sizes && meta.sizes[i]) {
+            entry.size = meta.sizes[i];
+        } else if (meta && meta.buttonData && meta.buttonData[i]) {
             entry.size = meta.buttonData[i].size;
         }
         // Attach download count from page text if available
@@ -120,8 +128,14 @@ function buildMultiPayload(capture, urls, meta) {
         return entry;
     });
 
+    // Bump schema to 2 when we have full part metadata (archiveId +
+    // expectedParts). Schema 1 multi-payloads are still accepted by the
+    // CLI as a legacy fallback but skip the new auto-download features.
+    const hasPartMetadata = meta && meta.archiveId && meta.expectedParts;
+    const schema = hasPartMetadata ? 2 : (capture.schema || 1);
+
     const payload = {
-        schema: capture.schema || 1,
+        schema: schema,
         captured_at: new Date().toISOString(),
         source: 'extension',
         multi: true,
@@ -130,7 +144,15 @@ function buildMultiPayload(capture, urls, meta) {
         cookie: capture.cookie || ''
     };
 
-    // Attach metadata if we have it
+    // v2 fields: archiveId + expectedParts let the CLI auto-detect the
+    // part count from the payload instead of asking the user.
+    if (hasPartMetadata) {
+        payload.archiveId = meta.archiveId;
+        payload.expectedParts = meta.expectedParts;
+    }
+
+    // Legacy _meta blob for back-compat with older CLIs (they read it
+    // but ignore the new top-level fields).
     if (meta) {
         payload._meta = {
             archiveId: meta.archiveId,
@@ -138,6 +160,7 @@ function buildMultiPayload(capture, urls, meta) {
             authuser: meta.authuser,
             filenames: meta.filenames,
             buttonCount: meta.buttonData ? meta.buttonData.length : 0,
+            expectedParts: meta.expectedParts,
             dlCounts: meta.dlCounts || {}
         };
     }
@@ -273,10 +296,14 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!result || !result.ok) {
             const err = (result && result.error) || 'unknown';
             console.log('Takeout Downloader debug:', result && result.debug);
-            setStatus('Fetch failed: ' + err, 'err');
-            setError('Could not fetch exports from Takeout. ' +
-                     'Open the browser console (right-click popup > Inspect) for details. ' +
-                     'Try clicking a download on the Takeout page again to refresh the cookie.');
+            // Fallback: the full-export fetch often fails because the manage-page
+            // cookie is different from the download-host cookie. The single capture
+            // is enough for the CLI to discover the rest, so copy it instead of
+            // leaving the clipboard empty.
+            setStatus('Full export list unavailable (' + err + '). Falling back to single capture.', 'warn');
+            const singlePayload = buildSinglePayload(capture);
+            await copyToClipboard(JSON.stringify(singlePayload, null, 2), 'this capture');
+            setError('Copied the single captured export. The CLI will discover the rest.');
             return;
         }
 
@@ -290,12 +317,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const payload = buildMultiPayload(capture, urls, result.meta);
-        const sizeInfo = result.meta && result.meta.buttonData
-            ? ` (${result.meta.buttonData.filter(b => b.size > 0).length} with sizes)`
+        // Status hint shows the detected part count when we got it from
+        // the page (so the user sees "Detected 5 parts" before pasting).
+        const sizesArr = result.meta && result.meta.sizes;
+        const knownSizes = sizesArr ? sizesArr.filter(s => s > 0).length : 0;
+        const sizeInfo = knownSizes > 0
+            ? ` (${knownSizes} with sizes)`
+            : (result.meta && result.meta.buttonData
+                ? ` (${result.meta.buttonData.filter(b => b.size > 0).length} with sizes)`
+                : '');
+        const partInfo = result.meta && result.meta.expectedParts
+            ? ` [detected ${result.meta.expectedParts} part(s)]`
             : '';
         await copyToClipboard(
             JSON.stringify(payload, null, 2),
-            `ALL exports (${urls.length}${sizeInfo})`
+            `ALL exports (${urls.length}${sizeInfo})${partInfo}`
         );
         setError(null);
     });

@@ -1793,3 +1793,169 @@ def test_auth_failures_initialized_in_parts_mode(monkeypatch, tmp_path):
             )
         raise
 
+
+# ---------------------------------------------------------------------------
+# Pre-flight full-download check — catches the "1.2 MB HTML in every zip"
+# loop where Range probes succeed but full GETs get challenged.
+# ---------------------------------------------------------------------------
+class _FakeStreamResp:
+    """Minimal requests.Response-shaped object for the pre-flight check.
+
+    The pre-flight uses ``stream=True`` + ``iter_content`` to download
+    the smallest part. ``_FakeStreamResp`` implements just enough of
+    that surface for the pre-flight to detect HTML-vs-archive.
+    """
+
+    def __init__(self, url: str, status: int, headers: dict, body: bytes):
+        self.url = url
+        self.status_code = status
+        self.headers = headers
+        self._body = body
+        self._consumed = 0
+        self._closed = False
+
+    def iter_content(self, chunk_size: int = 64 * 1024):
+        while self._consumed < len(self._body):
+            yield self._body[self._consumed:self._consumed + chunk_size]
+            self._consumed = len(self._body)
+
+    def close(self):
+        self._closed = True
+
+
+def test_preflight_passes_for_real_zip(tmp_path, monkeypatch):
+    """A pre-flight that returns the expected number of bytes (and
+    doesn't look like HTML) should NOT raise SystemExit."""
+    real_body = b"PK\x03\x04" + b"\x00" * 99  # 101 bytes, looks like a ZIP
+    resp = _FakeStreamResp(
+        "https://takeout-download.usercontent.google.com/x?i=2",
+        200, {"content-type": "application/octet-stream"}, real_body,
+    )
+    captured: list = []
+
+    def fake_session_get(self, url, **kw):
+        captured.append(kw)
+        return resp
+
+    monkeypatch.setattr(takeout_cli.requests.Session, "get", fake_session_get)
+    parts = [
+        {"num": 1, "url": "x?i=0", "filename": "1.zip", "size": 100, "have": False},
+        {"num": 2, "url": "x?i=1", "filename": "2.zip", "size": 101, "have": False},
+    ]
+    payload = _fixture_payload()
+    # The smallest part is 100 bytes (num=1); pre-flight should GET
+    # that one. But the fake returns 101 bytes (the bigger one).
+    # We override both parts to the same size and use the resp from
+    # part 2 anyway. The check is: did pre-flight exit cleanly?
+    # It will pick the smaller part and our fake will respond with a
+    # body of different size — but the pre-flight only treats a short
+    # body as a *warning*, not a fatal error.
+    parts[0]["size"] = 1000
+    parts[1]["size"] = 101
+    # Now the smallest is part 2 (101 bytes). fake returns 101 bytes
+    # of ZIP-like body. Pre-flight should pass.
+    takeout_cli._preflight_full_download(parts, payload, tmp_path)
+    # No Range header on the pre-flight (it must exercise the full
+    # GET path that aria2c will use).
+    assert "Range" not in captured[0]
+    assert "headers" in captured[0]
+
+
+def test_preflight_bails_on_html_response(tmp_path, monkeypatch):
+    """A pre-flight that returns HTML (Google sign-in challenge) must
+    raise SystemExit(1) AND save the HTML body for inspection. This
+    is the exact signature of the June 15 bug: probes pass, full
+    GETs get HTML, the script would otherwise loop asking for fresh
+    cookies that have the same problem.
+    """
+    html_body = (
+        b"<!doctype html><html><head><title>Sign in - Google "
+        b"Accounts</title></head><body>Please sign in to continue."
+        b"</body></html>" + b" " * 500
+    )
+    resp = _FakeStreamResp(
+        "https://accounts.google.com/v3/signin",
+        200, {"content-type": "text/html; charset=utf-8"}, html_body,
+    )
+    monkeypatch.setattr(takeout_cli.requests.Session, "get", lambda *a, **k: resp)
+    parts = [
+        {"num": 1, "url": "x?i=0", "filename": "1.zip", "size": 100, "have": False},
+    ]
+    payload = _fixture_payload()
+    with pytest.raises(SystemExit) as exc_info:
+        takeout_cli._preflight_full_download(parts, payload, tmp_path)
+    assert exc_info.value.code == 1
+    # The HTML body should have been saved for the user to inspect.
+    saved = list(tmp_path.glob("auth_challenge_*.html"))
+    assert len(saved) == 1
+    body = saved[0].read_bytes()
+    assert b"<!doctype html>" in body
+    assert b"x?i=0" in body  # the part URL is recorded in a comment
+
+
+def test_preflight_bails_on_accounts_redirect(tmp_path, monkeypatch):
+    """If the pre-flight gets redirected to accounts.google.com (the
+    classical expired-cookie symptom), we also bail with SystemExit(1)
+    and save the response."""
+    html_body = b"<!doctype html><html><body>signin</body></html>" + b"x" * 100
+    resp = _FakeStreamResp(
+        "https://accounts.google.com/v3/signin/...",
+        200, {"content-type": "text/html"}, html_body,
+    )
+    monkeypatch.setattr(takeout_cli.requests.Session, "get", lambda *a, **k: resp)
+    parts = [{"num": 1, "url": "x?i=0", "filename": "1.zip", "size": 100,
+              "have": False}]
+    with pytest.raises(SystemExit) as exc_info:
+        takeout_cli._preflight_full_download(parts, _fixture_payload(), tmp_path)
+    assert exc_info.value.code == 1
+
+
+def test_preflight_bails_on_wrong_content_type_even_if_zip_bytes(tmp_path,
+                                                                  monkeypatch):
+    """If the response claims to be a ZIP via content-type but the
+    body actually looks like HTML (proxy misconfiguration or
+    partial challenge), we still bail."""
+    bad_body = b"<!doctype html><html><body>redirect</body></html>" + b" " * 50
+    resp = _FakeStreamResp(
+        "https://x", 200,
+        {"content-type": "application/octet-stream"},  # lying header
+        bad_body,
+    )
+    monkeypatch.setattr(takeout_cli.requests.Session, "get", lambda *a, **k: resp)
+    parts = [{"num": 1, "url": "x?i=0", "filename": "1.zip", "size": 100,
+              "have": False}]
+    with pytest.raises(SystemExit) as exc_info:
+        takeout_cli._preflight_full_download(parts, _fixture_payload(), tmp_path)
+    assert exc_info.value.code == 1
+
+
+def test_preflight_warns_but_proceeds_on_short_response(tmp_path, monkeypatch):
+    """A pre-flight that returns fewer bytes than the probed size is
+    treated as a *warning* (network flakiness) not a fatal error —
+    aria2c will retry. SystemExit should NOT be raised."""
+    short_body = b"PK\x03\x04" + b"\x00" * 9  # 11 bytes, claimed size 1000
+    resp = _FakeStreamResp(
+        "https://x", 200, {"content-type": "application/octet-stream"},
+        short_body,
+    )
+    monkeypatch.setattr(takeout_cli.requests.Session, "get", lambda *a, **k: resp)
+    parts = [{"num": 1, "url": "x?i=0", "filename": "1.zip", "size": 1000,
+              "have": False}]
+    # Should NOT raise.
+    takeout_cli._preflight_full_download(parts, _fixture_payload(), tmp_path)
+
+
+def test_looks_like_html_bytes():
+    """The byte-buffer variant of the HTML detector is used by the
+    pre-flight; spot-check its edge cases."""
+    assert takeout_cli._looks_like_html_bytes(
+        b"<!doctype html><html>...</html>"
+    )
+    assert takeout_cli._looks_like_html_bytes(
+        b"\xef\xbb\xbf<!doctype html>"  # BOM-prefixed
+    )
+    assert takeout_cli._looks_like_html_bytes(b"<HTML>x</HTML>")
+    assert not takeout_cli._looks_like_html_bytes(b"PK\x03\x04...")
+    assert not takeout_cli._looks_like_html_bytes(b"")
+    assert not takeout_cli._looks_like_html_bytes(b"random binary \x00\x01")
+

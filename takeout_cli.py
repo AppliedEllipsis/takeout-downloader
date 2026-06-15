@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -1065,6 +1066,189 @@ def _split_url_filename_for_part(payload: TakeoutPayload,
     return url, filename
 
 
+def _save_auth_challenge(response, part_url: str, output_dir: Path) -> Path:
+    """Save a Google sign-in HTML response to a debug file and return
+    the path. Used by the pre-flight check and post-download HTML
+    detection so the user can inspect what Google actually returned.
+    """
+    body = b""
+    try:
+        # Prefer .content if available (real requests.Response has it).
+        if hasattr(response, "content") and response.content:
+            body = response.content
+        # Fall back to draining iter_content() if the response was
+        # opened with stream=True (which the pre-flight does to avoid
+        # buffering a 1.2 GB archive in memory).
+        if not body and hasattr(response, "iter_content"):
+            try:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    body += chunk
+                    # Cap at a reasonable size for inspection — the
+                    # first 64 KB is plenty to identify the challenge
+                    # page and we don't want to write 1.2 MB of HTML.
+                    if len(body) >= 64 * 1024:
+                        break
+            except Exception:
+                pass
+    except Exception:
+        body = b""
+    if not body:
+        return Path("<unable to read response body>")
+    # Save next to the takeout_state.json so the user can find it
+    # without having to dig through the output dir tree.
+    ts = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    debug_dir = output_dir if output_dir.is_dir() else Path.cwd()
+    debug_path = debug_dir / f"auth_challenge_{ts}.html"
+    try:
+        # Include the URL in a comment so the user can match it to the
+        # part that was being requested.
+        header = (
+            f"<!-- Pre-flight auth challenge for: {part_url} -->\n"
+            f"<!-- Content-Type: {response.headers.get('content-type', '?')} -->\n"
+            f"<!-- HTTP {response.status_code} -->\n"
+        ).encode("utf-8")
+        debug_path.write_bytes(header + body)
+    except OSError as e:
+        debug(f"  could not save auth challenge: {e}")
+        return Path("<unwriteable>")
+    return debug_path
+
+
+def _preflight_full_download(parts: list[dict], payload: TakeoutPayload,
+                              output_dir: Path) -> None:
+    """Do a *full* GET of the smallest part to confirm the cookie
+    works for the actual download path (not just Range probes).
+
+    Raises ``SystemExit(1)`` with a clear error and a saved HTML
+    blob if the response is the Google sign-in challenge. Returns
+    silently if the response is a real archive (or a network blip —
+    we don't want to over-block on transient errors).
+
+    The selection of the smallest part keeps the test cheap: a
+    43 KB test download is invisible next to a 1.2 GB archive, but
+    catches the same auth challenge that would have eaten 1.2 GB of
+    bandwidth per failed attempt.
+    """
+    # Pick the smallest incomplete part. Skip if all complete (the
+    # caller already checked, but be defensive).
+    candidates = [p for p in parts if not p["have"] and p.get("size", 0) > 0]
+    if not candidates:
+        return
+    target = min(candidates, key=lambda p: p["size"])
+    info(_c("36", f"  Pre-flight: verifying cookie with a full GET of "
+                  f"{target['filename']} ({human_size(target['size'])})..."))
+    headers = dict(payload.headers)
+    headers["Cookie"] = payload.cookie
+    # NOTE: deliberately NO Range header here. The whole point is to
+    # exercise the same code path aria2c will hit on the real download.
+    session = requests.Session()
+    try:
+        resp = session.get(target["url"], headers=headers, stream=True,
+                           timeout=PROBE_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        warn(f"  Pre-flight request failed: {e}. Proceeding anyway "
+             f"(aria2c may succeed).")
+        return
+    try:
+        ctype = resp.headers.get("content-type", "")
+        final_host = (resp.url.split("/")[2]
+                      if "/" in resp.url else "")
+        if final_host.endswith("accounts.google.com"):
+            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            err(f"Cookie is being challenged: pre-flight GET was "
+                f"redirected to {final_host}.")
+            err(f"  Google's sign-in page was saved to: {saved}")
+            err(f"  This is the *probe-path vs download-path* mismatch: "
+                f"Range probes succeed but full GETs get the sign-in page.")
+            err(f"  Re-capture the cookie from a *download* request, not "
+                f"the manage page:")
+            err(f"    1. Open takeout.google.com/settings")
+            err(f"    2. Click 'Download' on your export")
+            err(f"    3. Wait for the browser to issue the actual file "
+                f"request to takeout-download.usercontent.google.com")
+            err(f"    4. THEN click the extension icon to capture")
+            raise SystemExit(1)
+        if "text/html" in ctype:
+            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            err(f"Cookie is being challenged: pre-flight GET returned "
+                f"HTML (ct={ctype[:40]}).")
+            err(f"  Google's sign-in page was saved to: {saved}")
+            err(f"  See the top of that file for the URL that was "
+                f"challenged and the full HTTP status.")
+            err(f"  Re-capture from the *download* request as shown above, "
+                f"or pass --parallel 1 to bypass Google's per-session "
+                f"parallel-download limit.")
+            raise SystemExit(1)
+        if resp.status_code in (401, 403):
+            saved = _save_auth_challenge(resp, target["url"], output_dir)
+            err(f"Cookie is being challenged: pre-flight GET returned "
+                f"HTTP {resp.status_code}.")
+            err(f"  Response saved to: {saved}")
+            err(f"  Re-capture in your browser and try again.")
+            raise SystemExit(1)
+        # OK: real file response. Drain to detect early truncation.
+        body = b""
+        try:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                body += chunk
+                if len(body) >= target["size"]:
+                    break
+        except requests.RequestException as e:
+            warn(f"  Pre-flight download interrupted: {e}. "
+                 f"Proceeding anyway.")
+            return
+        if _looks_like_html_bytes(body):
+            # We received bytes that look like HTML even though the
+            # Content-Type was something else. Some misconfigured
+            # proxies return the wrong header but the right body.
+            debug_path = output_dir / (
+                f"auth_challenge_preflight_{datetime.now().strftime('%Y%m%dT%H%M%SZ')}.bin"
+            )
+            try:
+                debug_path.write_bytes(body)
+            except OSError:
+                pass
+            err(f"Cookie is being challenged: pre-flight body looks "
+                f"like HTML even though Content-Type was {ctype!r}.")
+            err(f"  Body saved to: {debug_path}")
+            err(f"  Re-capture from the *download* request and try again.")
+            raise SystemExit(1)
+        if target["size"] and len(body) < target["size"]:
+            # Got fewer bytes than expected. The server cut us off
+            # early — might be a session challenge mid-response, or
+            # just a flaky network. Treat as a warning, not a hard
+            # error: aria2c has retries.
+            warn(f"  Pre-flight got {human_size(len(body))} of "
+                 f"{human_size(target['size'])} expected. "
+                 f"Network may be flaky; aria2c will retry.")
+            return
+        ok(f"  Pre-flight OK: got {human_size(len(body))} of real "
+           f"archive data, cookie is healthy for full downloads.")
+    finally:
+        resp.close()
+        session.close()
+
+
+def _looks_like_html_bytes(body: bytes) -> bool:
+    """Like :func:`_looks_like_html` but on a raw byte buffer instead
+    of a Path. The first 64 bytes are enough — Google sign-in pages
+    start with ``<!doctype html>``, ``<html ...>``, or (rarely)
+    ``<!-- comment --><html ...>``.
+    """
+    if not body:
+        return False
+    head = body[:64].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not head:
+        return False
+    # Match ``<!doctype html>`` / ``<!DOCTYPE HTML>``.
+    if head.startswith(b"<!"):
+        return b"html" in head[:32].lower() or b"doctype" in head[:32].lower()
+    # Match ``<html ...>`` (no doctype, just bare HTML).
+    if head.lower().startswith(b"<html"):
+        return True
+    return False
+
+
 # ===========================================================================
 # Discovery — Range probes that validate auth and record sizes
 # ===========================================================================
@@ -1562,13 +1746,7 @@ def _looks_like_html(path: Path) -> bool:
             head = f.read(64)
     except OSError:
         return False
-    if not head:
-        return False
-    # Strip leading whitespace and BOMs.
-    head = head.lstrip(b"\xef\xbb\xbf \t\r\n")
-    return head.startswith(b"<!") and (
-        b"html" in head[:32].lower() or b"doctype" in head[:32].lower()
-    )
+    return _looks_like_html_bytes(head)
 
 def verify_parts(parts: list[dict], output_dir: Path) -> tuple[list[dict], list[dict]]:
     """Re-check the output dir. Returns (complete, incomplete).
@@ -2022,6 +2200,28 @@ def _download_one_batch(payload: TakeoutPayload,
         state = update_state_from_parts(state, parts)
         save_state(output_dir, state)
         return 0
+
+    # ----------------------------------------------------------------
+    # Pre-flight check: prove the cookie works for *full-file* GETs
+    # (not just 1-byte Range probes) BEFORE we kick off aria2c.
+    #
+    # Why this matters: Google's auth-challenge response (a 1.2 MB
+    # HTML sign-in page) is triggered by full GETs from a challenged
+    # session, but a Range: bytes=0-0 probe passes through cleanly.
+    # So the user can see "Found 5 parts, 1.8 GB total" (probes
+    # succeeded) and then watch every download come back as 1.2 MB
+    # of HTML (full GETs challenged). The script would then loop
+    # asking for a new cookie — but the *new* cookie has the same
+    # problem, because the issue isn't staleness, it's per-session
+    # full-download rate limiting.
+    #
+    # We do a single full GET of the *smallest* part (the user can
+    # have 5 parts totalling 2 GB but a 43 KB part to test with) to
+    # confirm the session is healthy for the actual download path.
+    # If the response is HTML, we save it for inspection and bail
+    # out immediately — no more 5x failing-then-re-prompting loops.
+    # ----------------------------------------------------------------
+    _preflight_full_download(parts, payload, output_dir)
 
     # Main download loop
     attempt = 0

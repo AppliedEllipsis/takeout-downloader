@@ -1562,3 +1562,234 @@ def test_cli_version_flag(capsys):
     assert VERSION in captured.out
     assert "takeout_cli" in captured.out
 
+
+# ---------------------------------------------------------------------------
+# _build_parts_from_payloads — modern i= mode (same URL path, different i=N)
+# ---------------------------------------------------------------------------
+def _make_i_mode_multi_payload(n: int = 5) -> dict:
+    """Build a v2 multi-payload that uses the *modern* i= pattern: every
+    URL has the same filename (e.g. ``-001.zip``) and the part
+    disambiguator is the ``i=N`` query param.
+
+    This mirrors the user-reported failure (June 15) where all 5
+    parts shared ``takeout-20260615T055126Z-9-001.zip`` in the path
+    and only ``?i=0,1,2,3,4`` distinguished them.
+    """
+    return {
+        "schema": 2,
+        "captured_at": "2026-06-15T05:51:00.000Z",
+        "source": "extension",
+        "multi": True,
+        "archiveId": "8062f4c8-7a2c-4d95-b889-a0e88e07d1d6",
+        "expectedParts": n,
+        "exports": [
+            {
+                "url": (
+                    "https://takeout-download.usercontent.google.com/"
+                    f"download/takeout-20260615T055126Z-9-001.zip"
+                    f"?j=8062f4c8&i={i}&user=1&authuser=3"
+                ),
+                "partIndex": i,
+                "size": (10_000 * (i + 1)),
+            }
+            for i in range(n)
+        ],
+        "cookie": (
+            "__Secure-1PSID=x; SID=y; HSID=z; SSID=a; APISID=b; SAPISID=c"
+        ),
+        "headers": {
+            "User-Agent": "Mozilla/5.0 Chrome/120",
+            "Accept": "*/*",
+            "Referer": "https://takeout.google.com/",
+        },
+    }
+
+
+def test_build_parts_i_mode_gives_unique_filenames(tmp_path):
+    """When all 5 URLs share the same path (modern ``i=`` mode), the
+    CLI must give each part a *unique* filename based on the ``i=N``
+    value, otherwise ``aria2c -j 5`` races 5 writers on the same file
+    and silently drops 4 of 5 downloads (the original 1.2 MB HTML
+    bug from June 15)."""
+    from takeout_payload import parse_multi_payload_meta
+    text = json.dumps(_make_i_mode_multi_payload(5))
+    payloads, meta = parse_multi_payload_meta(text)
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    filenames = [p["filename"] for p in parts]
+    # All five must be unique (no two writers can share one file).
+    assert len(filenames) == len(set(filenames)), (
+        f"Duplicate filenames: {filenames}"
+    )
+    # The expected pattern: same base, ascending 3-digit part numbers.
+    expected = [f"takeout-20260615T055126Z-9-{i+1:03d}.zip" for i in range(5)]
+    assert filenames == expected
+    # URLs stay untouched (i=N still encodes the part index).
+    for i, p in enumerate(parts):
+        assert f"i={i}" in p["url"]
+        assert p["num"] == i + 1
+
+
+def test_build_parts_i_mode_marks_correct_file_have(tmp_path):
+    """In i= mode, a pre-existing ``-002.zip`` on disk should be
+    detected as have=True when its URL is the one with ``?i=1``."""
+    from takeout_payload import parse_multi_payload_meta
+    text = json.dumps(_make_i_mode_multi_payload(3))
+    payloads, meta = parse_multi_payload_meta(text)
+    # Pre-create the part-2 file (which is ``?i=1`` -> part num 2).
+    existing = tmp_path / "takeout-20260615T055126Z-9-002.zip"
+    existing.write_bytes(b"\x00" * 20_000)
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    have_flags = {p["filename"]: p["have"] for p in parts}
+    assert have_flags["takeout-20260615T055126Z-9-001.zip"] is False
+    assert have_flags["takeout-20260615T055126Z-9-002.zip"] is True
+    assert have_flags["takeout-20260615T055126Z-9-003.zip"] is False
+
+
+def test_discover_parts_i_mode_gives_unique_filenames(tmp_path):
+    """``discover_parts`` (the legacy single-payload path) must also
+    produce unique filenames in modern i= mode, matching the
+    ``_build_parts_from_payloads`` behavior."""
+    payload = _fixture_payload()
+    sizes = {1: 100, 2: 200, 3: 300}
+
+    def fake_get(self, url, **kw):
+        m = re.search(r'[?&]i=(\d+)', url)
+        n = int(m.group(1)) + 1 if m else 1
+        if n in sizes:
+            return _FakeResp(url, 206,
+                             {"content-range": f"bytes 0-0/{sizes[n]}",
+                              "content-type": "application/octet-stream"})
+        return _FakeResp(url, 404, {})
+
+    with mock.patch.object(takeout_cli.requests.Session, "get", fake_get):
+        parts = takeout_cli.discover_parts(payload, tmp_path)
+
+    filenames = [p["filename"] for p in parts]
+    assert len(filenames) == len(set(filenames)), (
+        f"Duplicate filenames: {filenames}"
+    )
+    # i=N URL: each part should get its own ascending 3-digit suffix.
+    assert filenames == [
+        "takeout-20260612T190148Z-9-001.zip",
+        "takeout-20260612T190148Z-9-002.zip",
+        "takeout-20260612T190148Z-9-003.zip",
+    ]
+    # And the URL itself still carries the i= selector.
+    for i, p in enumerate(parts):
+        assert f"i={i}" in p["url"]
+
+
+# ---------------------------------------------------------------------------
+# verify_parts — HTML-corrupted partials get unlinked so aria2c -c
+# doesn't try to "resume" from a 1.2 MB Google sign-in page.
+# ---------------------------------------------------------------------------
+def test_verify_parts_unlinks_html_partial(tmp_path):
+    """A file that starts with ``<!doctype html>`` is a Google sign-in
+    challenge page, not a real ZIP — even if its size happens to match
+    the probed size. The CLI must unlink it so aria2c re-downloads
+    from scratch instead of trying to resume from offset N MB on
+    retry (which would just return another sign-in page)."""
+    p = {"num": 1, "url": "x", "filename": "bad.zip", "size": 1_200_000,
+         "have": False}
+    dest = tmp_path / "bad.zip"
+    # Use exactly the size we declared in `p["size"]` so the
+    # size-mismatch check doesn't fire first.
+    html = b"<!doctype html><html><body>Google sign-in</body></html>"
+    html = html + b" " * (1_200_000 - len(html))
+    dest.write_bytes(html)
+
+    complete, incomplete = takeout_cli.verify_parts([p], tmp_path)
+    assert complete == []
+    assert len(incomplete) == 1
+    # The file should be gone now so aria2c -c starts at byte 0.
+    assert not dest.exists()
+
+
+def test_verify_parts_keeps_short_zip_partial(tmp_path):
+    """A genuine in-progress ZIP (e.g. 50% downloaded) won't have an
+    EOCD signature, but it also won't look like HTML. We must NOT
+    unlink those — they're legit partials that aria2c -c should resume."""
+    p = {"num": 1, "url": "x", "filename": "legit.zip", "size": 100_000_000,
+         "have": False}
+    dest = tmp_path / "legit.zip"
+    # A real ZIP file starts with PK\x03\x04 (local file header).
+    partial = b"PK\x03\x04" + b"\x00" * 1024
+    dest.write_bytes(partial)
+
+    complete, incomplete = takeout_cli.verify_parts([p], tmp_path)
+    assert complete == []
+    assert len(incomplete) == 1
+    # File must still be on disk — aria2c -c will resume from here.
+    assert dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# _download_one_batch — auth_failures is initialized for parts-mode entry
+# (regression for UnboundLocalError on June 15).
+# ---------------------------------------------------------------------------
+def test_auth_failures_initialized_in_parts_mode(monkeypatch, tmp_path):
+    """The download loop increments ``auth_failures`` when the cookie
+    expires mid-run, but the variable was only initialized inside the
+    discovery branch — so when parts came from the pre-built
+    multi-payload path, the first cookie-expiry triggered an
+    UnboundLocalError instead of re-prompting. This test ensures the
+    counter exists regardless of how parts were obtained."""
+    from takeout_cli import _download_one_batch
+    # Build a minimal pre-built parts list so the discovery branch
+    # is skipped entirely.
+    parts = [
+        {"num": 1, "url": "http://x/1", "filename": "1.zip",
+         "size": 1, "have": False},
+    ]
+    # Stub out everything that touches the network or filesystem.
+    monkeypatch.setattr(takeout_cli, "load_state", lambda *a, **k: None)
+    monkeypatch.setattr(takeout_cli, "state_matches_payload",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(takeout_cli, "save_state", lambda *a, **k: None)
+    # Make verify_parts mark all parts incomplete so the while-loop runs.
+    monkeypatch.setattr(takeout_cli, "verify_parts",
+                        lambda parts, out: ([], parts))
+    # Simulate aria2c returning 13 (the actual symptom from June 15).
+    monkeypatch.setattr(takeout_cli, "run_aria2c",
+                        lambda *a, **k: 13)
+    # Disable terminal grid so we don't draw to a closed TTY.
+    monkeypatch.setattr(takeout_cli.sys, "stdout",
+                        io.StringIO())
+    # Force args.fresh / args.parallel to sane values.
+    import argparse
+    args = argparse.Namespace(fresh=False, parallel=1, max_parts=10,
+                               reset_config=False, output_dir=str(tmp_path),
+                               relay=False, tunnel=False,
+                               relay_timeout=600)
+    monkeypatch.setattr(takeout_cli, "args", args, raising=False)
+    # The first iteration should NOT raise UnboundLocalError; it
+    # should at least reach the ``looks_like_auth_failure`` branch
+    # and try to re-prompt (we abort on EOFError to stop the test).
+    payload = _fixture_payload()
+    # A do-nothing log so the function can call log.warn/info/etc.
+    fake_log = mock.MagicMock()
+    # Force the re-prompt source to raise EOFError immediately so the
+    # test exits cleanly. We also replace argparse to skip the
+    # arg-parsing inside the function.
+    def _eof_source():
+        raise EOFError
+    monkeypatch.setattr(takeout_cli, "_PAYLOAD_SOURCE", _eof_source)
+    # The terminal input is empty, so the re-prompt loop exits via
+    # EOFError; both are acceptable signals that auth_failures was
+    # initialized correctly (no UnboundLocalError on line 2001).
+    try:
+        _download_one_batch(payload, output_dir=tmp_path, args=args,
+                            log=fake_log,
+                            initial_parts=parts, initial_state=None)
+    except (SystemExit, EOFError, OSError):
+        # Expected: the auth-failure re-prompt has no input to read
+        # (we raise EOFError from the stubbed source).
+        pass
+    except UnboundLocalError as e:  # pragma: no cover
+        if "auth_failures" in str(e):
+            pytest.fail(
+                "UnboundLocalError on auth_failures: the fix didn't "
+                "initialize the counter at function scope"
+            )
+        raise
+

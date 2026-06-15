@@ -998,14 +998,22 @@ def _build_parts_from_payloads(payloads: list[TakeoutPayload],
     ``data-size`` off the page). Unknown sizes stay at 0 and ``aria2c``
     falls back to whatever the server returns. ``have`` is computed from
     the filesystem so already-downloaded parts are skipped on resume.
+
+    Filenames are made unique by replacing the trailing ``-NNN.ext`` (or
+    inserting one if the URL doesn't carry a numeric suffix) with the
+    1-based part number from the URL's ``i=N`` query (or the list index
+    when ``i=`` is absent). The reason: in modern Google Takeout, the
+    same ``-001.zip`` path can address all parts of an archive — the
+    disambiguator is the ``i=N`` query param, not the path. Letting
+    ``aria2c -j 5`` race five writers on the same filename silently
+    drops 4 of the 5 downloads and overwrites the one that finishes
+    last (this was the "all 5 parts are 1.2 MB of HTML" bug from
+    June 15 — the on-disk 001.zip was an auth-challenge page that
+    aria2c wrote from one of the parallel attempts).
     """
     parts: list[dict] = []
     for i, p in enumerate(payloads):
-        # Filename from URL tail; fall back to a synthetic name if the
-        # URL doesn't end in a recognizable extension (rare).
-        filename = p.filename_hint()
-        if filename == "unknown":
-            filename = f"part-{i + 1:03d}.zip"
+        url, filename = _split_url_filename_for_part(p, i)
         dest = output_dir / filename
         size = meta.sizes.get(i, 0) or 0
         have = dest.exists() and dest.stat().st_size > 0 and (
@@ -1013,12 +1021,48 @@ def _build_parts_from_payloads(payloads: list[TakeoutPayload],
         )
         parts.append({
             "num": i + 1,
-            "url": p.url,
+            "url": url,
             "filename": filename,
             "size": size,
             "have": have,
         })
     return parts
+
+
+def _split_url_filename_for_part(payload: TakeoutPayload,
+                                 list_index: int) -> tuple[str, str]:
+    """Derive a unique (url, filename) pair for one part in a batch.
+
+    The modern Google Takeout URL pattern serves all parts of one
+    archive from the *same* path (``takeout-TS-BATCH-001.zip``) and
+    uses the ``?i=N`` query param to select which part to return. So
+    ``filename_hint()`` — which strips the query — would return the
+    same name for every part, and ``aria2c -j 5`` would race 5
+    writers on one file.
+
+    We rebuild the filename with the part number from ``i=N`` (or the
+    list index as a fallback) so each part lands on its own file. The
+    URL itself is returned untouched — ``i=N`` already encodes the
+    part index, so no further URL rewriting is needed.
+    """
+    url = payload.url
+    base, file_num, ext, query = extract_url_parts(url)
+    if not base or not ext:
+        # Couldn't parse the takeout pattern (e.g. URL doesn't end in
+        # .zip/.tgz). Fall back to filename_hint and let aria2c try.
+        hint = payload.filename_hint()
+        if hint == "unknown":
+            hint = f"part-{list_index + 1:03d}.zip"
+        return url, hint
+
+    i_match = re.search(r'(?:^|[?&])i=(\d+)', query or "")
+    part_num = int(i_match.group(1)) + 1 if i_match else (list_index + 1)
+    # The URL path is the same for every part in modern mode, but we
+    # still keep the original ``file_num`` (``001``) as a cosmetic hint
+    # in the filename — the canonical disambiguator is ``i=N``.
+    base_filename = base.split("/")[-1]
+    filename = f"{base_filename}{part_num:03d}{ext}"
+    return url, filename
 
 
 # ===========================================================================
@@ -1166,7 +1210,14 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path,
     for num in range(1, loop_limit + 1):
         if modern:
             i_value = num - 1
-            filename = f"{base_filename}001{ext}"  # cosmetic; aria2c uses
+            # The URL path ``-001.zip`` is shared across all parts of one
+            # archive in modern Google Takeout — the disambiguator is
+            # ``i=N``, not the path. We must still give each part a
+            # unique on-disk filename, otherwise ``aria2c -j 5`` will
+            # race 5 writers on one file. Use the part number (1-based
+            # ``num``) to construct a unique filename; the URL itself
+            # carries ``i=N`` so it stays correct.
+            filename = f"{base_filename}{num:03d}{ext}"
             url = _build_probe_url(f"{base}001{ext}", query, i_value)
         else:
             filename = f"{base_filename}{num:03d}{ext}"
@@ -1496,6 +1547,29 @@ def is_valid_zip(path: Path) -> bool:
         return False
 
 
+def _looks_like_html(path: Path) -> bool:
+    """True if the first bytes of `path` look like an HTML document.
+
+    The Google sign-in challenge page is ~1.2 MB of HTML — when the
+    cookie is challenged mid-download, ``aria2c`` writes that page to
+    disk in place of the real archive. We detect it cheaply by peeking
+    at the first few bytes. The check is permissive (whitespace, BOM,
+    or doctype) because Google's actual response starts with
+    ``<!doctype html>`` or ``<html ...>``.
+    """
+    try:
+        with path.open("rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    if not head:
+        return False
+    # Strip leading whitespace and BOMs.
+    head = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    return head.startswith(b"<!") and (
+        b"html" in head[:32].lower() or b"doctype" in head[:32].lower()
+    )
+
 def verify_parts(parts: list[dict], output_dir: Path) -> tuple[list[dict], list[dict]]:
     """Re-check the output dir. Returns (complete, incomplete).
     A part is complete if:
@@ -1518,6 +1592,22 @@ def verify_parts(parts: list[dict], output_dir: Path) -> tuple[list[dict], list[
             incomplete.append(p)
             continue
         if not is_valid_zip(dest):
+            # If the partial actually contains an HTML page (Google
+            # sign-in challenge), unlink it so aria2c -c doesn't try
+            # to "resume" from a 1.2 MB HTML blob. A legit in-progress
+            # ZIP partial would not look like HTML, so this is a safe
+            # heuristic.
+            if _looks_like_html(dest):
+                warn(f"{p['filename']}: looks like an HTML sign-in "
+                     f"page (auth challenge) — deleting partial so "
+                     f"aria2c re-downloads from scratch.")
+                try:
+                    dest.unlink()
+                except OSError as e:
+                    debug(f"  unlink failed: {e}")
+                p["have"] = False
+                incomplete.append(p)
+                continue
             warn(f"{p['filename']}: not a valid ZIP (missing EOCD signature)")
             p["have"] = False
             incomplete.append(p)
@@ -1828,6 +1918,14 @@ def _download_one_batch(payload: TakeoutPayload,
     ``initial_parts`` / ``initial_state`` let the caller reuse work from
     the first call (typically only set for batch 1).
     """
+    # Counter for the auth-failure re-prompt loop. Must be initialized
+    # here (outside the `if not parts:` discovery block) because the
+    # `while need:` download loop below also references it when the
+    # cookie expires mid-download. The previous placement (inside the
+    # discovery-only branch) caused UnboundLocalError whenever parts
+    # came from the multi-payload pre-built path (which skips the
+    # `if not parts:` branch entirely).
+    auth_failures = 0
     # Try to resume from state in the chosen folder.
     state = initial_state if initial_state is not None else load_state(output_dir)
     parts: list[dict] | None = initial_parts
@@ -1877,7 +1975,6 @@ def _download_one_batch(payload: TakeoutPayload,
                 err("  Please enter a number, or press Enter for "
                     "auto-detect.")
 
-        auth_failures = 0
         while True:
             try:
                 parts = discover_parts(payload, output_dir,

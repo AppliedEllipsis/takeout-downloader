@@ -254,6 +254,7 @@ python takeout_cli.py --relay           # receive the JSON via a browser relay
 python takeout_cli.py --relay --tunnel  # ...and expose it over a Cloudflare tunnel
 python takeout_cli.py --no-color        # strip ANSI colours (same as NO_COLOR=1)
 python takeout_cli.py --dry-run         # validate + show plan, don't download
+python takeout_cli.py --engine aria2c   # use the legacy aria2c subprocess engine
 ```
 
 See [section 6b](#6b-paste-relay-ngrok-but-zero-config) for the relay.
@@ -263,7 +264,8 @@ See [section 6b](#6b-paste-relay-ngrok-but-zero-config) for the relay.
 | var | default | what |
 |-----|---------|------|
 | `OUTPUT_DIR` | auto (JuiceFS if present, else `./downloads`) | where archives land |
-| `PARALLEL_DOWNLOADS` | `3` | concurrent downloads (`-j` to aria2c) |
+| `PARALLEL_DOWNLOADS` | `5` | concurrent downloads (parts fetched at once) |
+| `TAKEOUT_ENGINE` | `internal` | download engine: `internal` (in-process, exact live progress, no binary) or `aria2c` (legacy subprocess) |
 | `MAX_PARTS` | `500` | discovery safety cap |
 | `MAX_AUTH_REPROMPTS` | `5` | fresh-cookie prompts before giving up |
 | `TAKEOUT_LOG_FILE` | `<output>/takeout_cli.log` | log file path |
@@ -501,6 +503,7 @@ optional.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
+| `TAKEOUT_ENGINE` | Download engine: `internal` or `aria2c` | `internal` |
 | `MAX_PARTS` | Discovery safety cap | `500` |
 | `MAX_AUTH_REPROMPTS` | Fresh-cookie prompts before giving up | `5` |
 | `TAKEOUT_LOG_FILE` | Log file path | `<output>/takeout_cli.log` |

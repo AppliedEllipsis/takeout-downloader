@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here.
 
+## [6.5.0] — Internal parallel downloader (default engine), exact TTY-independent progress
+
+### Changed
+
+- **New default download engine: an in-process parallel HTTP downloader**
+  (`takeout_downloader.py`), replacing the aria2c subprocess. aria2c
+  worked, but its progress feedback required scraping another process's
+  human-readable stdout — fragile, and silently disabled whenever stdout
+  wasn't a TTY (the common SSH/tmux/Docker case), which is why downloads
+  "worked but showed no feedback". The internal engine owns the byte loop,
+  so:
+
+  - Progress is **exact** (we count the bytes) and **TTY-independent** —
+    the live grid is fed from in-process counters, and even on a
+    non-TTY/piped run a throttled one-line status keeps showing movement.
+    No more dead-silent downloads.
+  - Auth-challenge HTML is detected on the **first chunk**, before a single
+    byte hits the archive file — so a sign-in page can never corrupt an
+    output file (the old "every .zip is 1.2 MB of HTML" failure is now
+    structurally impossible).
+  - Resume is plain HTTP `Range:` from the on-disk size — no control files,
+    no second process.
+  - No `aria2c` binary dependency for the default path.
+
+- **`--engine` flag / `TAKEOUT_ENGINE` env var**: choose `internal`
+  (default) or `aria2c` (legacy subprocess, still fully supported for
+  anyone who prefers it — it just needs aria2c on PATH). The aria2c
+  presence check now only runs when that engine is selected.
+
+### Added
+
+- `takeout_downloader.py`: `InternalDownloader` with a bounded thread pool,
+  per-part `Range` resume, first-chunk HTML guard, smoothed speed (EMA),
+  cooperative stop on Ctrl-C, and a decoupled `on_progress` snapshot
+  callback so the renderer is fully testable without a TTY.
+- `tests/test_internal_downloader.py`: 6 tests against a local HTTP server
+  covering parallel download, `Range` resume with content integrity,
+  first-chunk auth-challenge detection (never written to disk), live
+  partial-progress snapshots, and the no-op path when everything is
+  already `have`. 178 tests pass.
+
 ## [6.4.0] — Live grid that actually updates, resize-safe rendering, size-ordered parts, --no-color
 
 ### Fixed

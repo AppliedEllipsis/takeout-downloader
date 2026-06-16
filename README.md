@@ -169,9 +169,11 @@ PAYLOAD_FILE=./in.json python takeout_cli.py
 Useful flags:
 
 ```bash
-python takeout_cli.py -p 5          # 5 concurrent downloads (aria2c -j 5)
+python takeout_cli.py -p 5          # 5 concurrent downloads
 python takeout_cli.py --max-parts 200  # cap discovery at 200 parts
 python takeout_cli.py --output-dir /srv/storage/google-takeout/me
+python takeout_cli.py --engine aria2c  # use legacy aria2c subprocess instead
+                                       # of the built-in downloader (default)
 ```
 
 Useful env vars (also accept from `.env`):
@@ -320,33 +322,45 @@ for the full write-up of this gotcha.)
 - **Auth detection** — checks status code, `Content-Type`, redirect
   target, and ZIP magic bytes to catch expired cookies that still
   return HTTP 200.
-- **aria2c backend (optional)** — hand off to aria2c for faster,
-  resumable transfers (see below).
+- **Internal downloader (default)** — in-process parallel `requests`
+  downloader; exact live progress, HTTP `Range` resume, no external
+  binary.
+- **aria2c backend (optional / legacy)** — `--engine aria2c` hands off to
+  aria2c instead (see below).
 - **cURL fallback** — bash and PowerShell formats both accepted.
 
-## aria2c acceleration (optional)
+## aria2c engine (optional / legacy)
+
+The CLI no longer needs aria2c — the internal downloader is the default.
+You can still opt into aria2c with `--engine aria2c` (or
+`TAKEOUT_ENGINE=aria2c`), which requires the binary on PATH:
 
 ```bash
 apt install aria2     # Debian/Ubuntu
 brew install aria2    # macOS
 ```
 
-When `aria2c` is on your PATH the TUI detects it on startup. Note that
-Google only permits **single-stream** downloads for Takeout, so the
-right aria2c flags are `-x 1 -s 1 -c` — more connections per file get
+Note that Google only permits **single-stream** downloads for Takeout, so
+the right aria2c flags are `-x 1 -s 1 -c` — more connections per file get
 throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 
 ## Live grid (CLI)
 
-When you run the CLI on a real terminal (not piped), it draws a
-**self-anchoring grid** of every part using ANSI escape codes — one row
-per file with a progress bar, bytes, speed, and ETA. The grid is
-re-rendered in place on every aria2c summary tick (default 1s) using
-*relative* cursor movement (it redraws over its own previous block
-rather than jumping to a fixed screen row), so it never collides with
-scrolled log output and there's no flicker. Each row animates live as
-aria2c reports progress — bound to its file via aria2c's `FILE:` line
-mid-download, not just at the end:
+The CLI downloads with its **internal in-process downloader** by default
+(no external binary). It streams each part with `requests`, counts the
+bytes itself, and feeds those exact counters straight to the grid — so
+progress is always accurate and, crucially, works even when stdout is
+**not** a TTY (the common SSH/tmux/Docker case). On a non-TTY it prints a
+throttled one-line status instead of the grid, so a piped or logged run
+still shows movement rather than dead silence.
+
+When you run on a real terminal it draws a **self-anchoring grid** of
+every part using ANSI escape codes — one row per file with a progress
+bar, bytes, speed, and ETA. The grid is re-rendered in place several
+times a second using *relative* cursor movement (it redraws over its own
+previous block rather than jumping to a fixed screen row), so it never
+collides with scrolled log output and there's no flicker. Each row
+animates live from the downloader's byte counters:
 
 ```
   Pass 1 | 0/100 done | 3 active | 100 pending | output: /opt/storage...
@@ -368,15 +382,28 @@ Set `NO_GRID=1` in the environment to force plain streaming output
 recording). Pass `--no-color` (or set `NO_COLOR=1`) to strip ANSI colors
 from the surrounding log lines.
 
+### Download engine
+
+The internal downloader is the default. It needs no external binary,
+gives exact live progress, and detects Google's sign-in challenge page on
+the **first chunk** — before a single byte is written to the archive — so
+a challenged cookie can never corrupt an output file. Resume is plain
+HTTP `Range:` from the on-disk size.
+
+If you'd rather use the legacy `aria2c` subprocess (e.g. you already
+depend on its tuning), pass `--engine aria2c` or set
+`TAKEOUT_ENGINE=aria2c`. It needs `aria2c` on `PATH`.
+
 ## Project structure
 
 ```
 ├── takeout.py                # Core engine: parsing, download, resume, integrity
 ├── google_takeout_tui.py     # Textual TUI (opt-in, profile `tui`)
 ├── takeout_cli.py            # Terminal-only CLI (default service)
+├── takeout_downloader.py     # In-process parallel HTTP downloader (default engine)
 ├── takeout_cli_analyze.py    # Offline log analyzer for takeout_cli
 ├── takeout_payload.py        # JSON payload schema shared with the extension
-├── aria2c_integration.py     # Optional aria2c RPC backend
+├── aria2c_integration.py     # Optional aria2c RPC backend (legacy --engine aria2c)
 ├── dedupe_takeout.py         # Deduplicate downloaded archives by hash
 ├── build.py                  # PyInstaller single-binary build
 ├── Dockerfile                # Self-contained image (Python deps + aria2c)

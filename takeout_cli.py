@@ -669,6 +669,188 @@ def _looks_like_json(text: str) -> bool:
     return bool(s) and s[0] in "{["
 
 
+# ===========================================================================
+# Subfolder picker — arrow-key selectable list of subfolders under a base
+# ===========================================================================
+def _list_subfolders(base: Path) -> list[str]:
+    """Sorted names of immediate subdirectories of ``base`` (no hidden ones).
+    Returns [] if base is missing/unreadable."""
+    try:
+        return sorted(
+            p.name for p in base.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+    except OSError:
+        return []
+
+
+def _arrow_menu(title: str, options: list[str]) -> int | None:
+    """Render an arrow-key selectable menu and return the chosen index, or
+    None if the user pressed 'q'/Esc to cancel.
+
+    Uses raw terminal mode on POSIX (the deploy target is Ubuntu). Arrow
+    keys (or j/k) move, Enter selects, q/Esc cancels. Falls back to a
+    numbered prompt when not on a POSIX TTY (Windows, pipes, Docker without
+    -t) so it degrades cleanly. The caller is responsible for any
+    follow-up prompts (e.g. typing a new folder name).
+    """
+    if not options:
+        return None
+
+    # Fallback: numbered menu for non-TTY or non-POSIX (no termios).
+    posix_tty = (
+        sys.stdin.isatty() and sys.stdout.isatty()
+        and os.name == "posix"
+    )
+    try:
+        import termios  # noqa: F401
+        import tty  # noqa: F401
+    except ImportError:
+        posix_tty = False
+
+    if not posix_tty:
+        info(_c("1;36", title))
+        for i, opt in enumerate(options, 1):
+            info(_c("36", f"  [{i}] {opt}"))
+        while True:
+            try:
+                raw = input("  pick > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if raw in ("q", "quit", ""):
+                return None
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(options):
+                    return idx
+            except ValueError:
+                pass
+            err(f"  Enter 1-{len(options)}, or 'q' to cancel.")
+
+    # POSIX raw-mode arrow navigation.
+    import termios
+    import tty
+
+    sel = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def draw(first: bool) -> None:
+        if not first:
+            # Move cursor up over the previously drawn option lines so the
+            # menu redraws in place instead of scrolling.
+            sys.stdout.write(f"\x1b[{len(options)}A")
+        for i, opt in enumerate(options):
+            marker = "\u276f" if i == sel else " "
+            line = f"  {marker} {opt}"
+            if i == sel:
+                line = _c("1;36", line)
+            # In raw mode the terminal does NOT translate \n to CR+LF, so
+            # end each line with \r\n to return to column 0 (otherwise the
+            # rows stair-step to the right).
+            sys.stdout.write("\r\x1b[K" + line + "\r\n")
+        sys.stdout.flush()
+
+    info(_c("1;36", title))
+    info(_c("2", "  \u2191/\u2193 (or j/k) to move, Enter to select, q to cancel"))
+    try:
+        tty.setraw(fd)
+        draw(first=True)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                return sel
+            if ch in ("q", "\x1b"):
+                # Esc may begin an arrow sequence; peek to disambiguate.
+                if ch == "\x1b":
+                    seq = sys.stdin.read(2)
+                    if seq == "[A":          # up arrow
+                        sel = (sel - 1) % len(options)
+                        draw(first=False)
+                        continue
+                    if seq == "[B":          # down arrow
+                        sel = (sel + 1) % len(options)
+                        draw(first=False)
+                        continue
+                    # Bare Esc -> cancel.
+                return None
+            if ch in ("k",):
+                sel = (sel - 1) % len(options)
+                draw(first=False)
+            elif ch in ("j",):
+                sel = (sel + 1) % len(options)
+                draw(first=False)
+            elif ch == "\x03":               # Ctrl-C
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def prompt_for_output_subfolder(base: Path, default: Path) -> Path:
+    """Pick a subfolder under ``base`` with arrow keys, or create a new one.
+
+    The menu lists every existing immediate subfolder of ``base`` plus two
+    actions: create a new subfolder, or use ``base`` itself. Selecting a
+    folder returns ``base/<name>`` (created if needed). Choosing "create"
+    prompts for a name. Cancelling (q/Esc) falls back to the typed-path
+    prompt so the user can still enter an arbitrary location.
+
+    When ``base`` doesn't exist or isn't a directory (e.g. running off the
+    server), this defers entirely to :func:`prompt_for_output_dir`.
+    """
+    base = Path(base)
+    if not base.is_dir():
+        return prompt_for_output_dir(default)
+
+    subs = _list_subfolders(base)
+    CREATE = "\u2795 Create a new subfolder\u2026"
+    USE_BASE = f"\U0001f4c1 Use this folder directly ({base})"
+    TYPE_PATH = "\u270f\ufe0f  Type a different path\u2026"
+    options = subs + [CREATE, USE_BASE, TYPE_PATH]
+
+    info("")
+    title = f"Where under {base} do you want to save the archives?"
+    idx = _arrow_menu(title, options)
+    if idx is None:
+        # Cancelled — fall back to free-form path entry.
+        return prompt_for_output_dir(default)
+
+    choice = options[idx]
+    if choice == TYPE_PATH:
+        return prompt_for_output_dir(default)
+    if choice == USE_BASE:
+        target = base
+    elif choice == CREATE:
+        info(_c("1;36", "  New subfolder name:"))
+        while True:
+            try:
+                name = input("  name > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return prompt_for_output_dir(default)
+            if not name:
+                err("  Name cannot be empty (or Ctrl-C to go back).")
+                continue
+            # Reject path separators / traversal — this is a single
+            # subfolder name under base, not an arbitrary path.
+            if "/" in name or "\\" in name or name in (".", ".."):
+                err("  Use a plain folder name (no slashes). "
+                    "For an arbitrary path, cancel and pick 'Type a path'.")
+                continue
+            target = base / name
+            break
+    else:
+        target = base / choice
+
+    try:
+        validated = validate_output_dir(str(target))
+        validated.mkdir(parents=True, exist_ok=True)
+    except (ValueError, OSError) as e:
+        err(f"  Could not use {target} ({e}).")
+        return prompt_for_output_dir(default)
+    ok(f"  Saving to {validated}")
+    return validated
+
+
 def prompt_for_output_dir(default: Path) -> Path:
     """Ask the user where to save archives. Empty input keeps the default.
     Type 'q' to quit. Anything else is treated as a path and validated.
@@ -2263,7 +2445,20 @@ def main() -> int:
     if args.output_dir:
         chosen_output_dir = output_dir
     else:
-        chosen_output_dir = prompt_for_output_dir(output_dir)
+        # If the resolved output dir is a Takeout *base* (the server's
+        # /srv/storage/google-takeout mount, or whatever
+        # OUTPUT_DIR/DEFAULT_OUTPUT_DIR points at), offer an arrow-key
+        # subfolder picker rooted there. Otherwise fall back to the
+        # free-form path prompt.
+        picker_base = Path(
+            os.environ.get("TAKEOUT_BASE_DIR")
+            or os.environ.get("OUTPUT_DIR")
+            or DEFAULT_OUTPUT_DIR
+        ).expanduser()
+        if picker_base.is_dir():
+            chosen_output_dir = prompt_for_output_subfolder(picker_base, output_dir)
+        else:
+            chosen_output_dir = prompt_for_output_dir(output_dir)
         if chosen_output_dir != output_dir:
             # Re-aim the logger at the chosen folder. Logger handlers are
             # already installed pointing at the env-derived path; swap them.

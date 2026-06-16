@@ -742,6 +742,77 @@ def test_prompt_for_output_dir_handles_path_too_long(monkeypatch, tmp_path, capl
 
 
 # ---------------------------------------------------------------------------
+# Subfolder picker (arrow menu + numbered fallback)
+# ---------------------------------------------------------------------------
+def test_list_subfolders_sorted_no_hidden(tmp_path):
+    (tmp_path / "bravo").mkdir()
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "afile.txt").write_text("x")
+    assert takeout_cli._list_subfolders(tmp_path) == ["alpha", "bravo"]
+
+
+def test_subfolder_picker_selects_existing(monkeypatch, tmp_path):
+    """Non-TTY numbered fallback: picking an existing subfolder returns
+    base/<name> and creates nothing new."""
+    _reset_cli_logger(monkeypatch)
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "beth").mkdir()
+    # Force the numbered-fallback path (non-TTY).
+    monkeypatch.setattr(takeout_cli.sys.stdin, "isatty", lambda: False, raising=False)
+    # Options are [alice, beth, create, use-base, type-path]; pick #2.
+    monkeypatch.setattr("builtins.input", lambda *a: "2")
+    out = takeout_cli.prompt_for_output_subfolder(tmp_path, tmp_path)
+    assert out == tmp_path / "beth"
+
+
+def test_subfolder_picker_creates_new(monkeypatch, tmp_path):
+    """Choosing 'create' then typing a name makes the new subfolder."""
+    _reset_cli_logger(monkeypatch)
+    monkeypatch.setattr(takeout_cli.sys.stdin, "isatty", lambda: False, raising=False)
+    # Only actions exist (no subfolders): [create, use-base, type-path].
+    # Pick #1 (create), then supply the new name at the follow-up prompt.
+    answers = iter(["1", "freshfolder"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    out = takeout_cli.prompt_for_output_subfolder(tmp_path, tmp_path)
+    assert out == tmp_path / "freshfolder"
+    assert out.is_dir()
+
+
+def test_subfolder_picker_rejects_slash_in_new_name(monkeypatch, tmp_path):
+    """A new-folder name with a path separator is rejected and re-prompted
+    (it must be a single folder under base, not an arbitrary path)."""
+    _reset_cli_logger(monkeypatch)
+    monkeypatch.setattr(takeout_cli.sys.stdin, "isatty", lambda: False, raising=False)
+    answers = iter(["1", "a/b", "good"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    out = takeout_cli.prompt_for_output_subfolder(tmp_path, tmp_path)
+    assert out == tmp_path / "good"
+
+
+def test_subfolder_picker_use_base(monkeypatch, tmp_path):
+    """'Use this folder directly' returns base itself."""
+    _reset_cli_logger(monkeypatch)
+    (tmp_path / "one").mkdir()
+    monkeypatch.setattr(takeout_cli.sys.stdin, "isatty", lambda: False, raising=False)
+    # Options: [one, create, use-base, type-path]; use-base is #3.
+    monkeypatch.setattr("builtins.input", lambda *a: "3")
+    out = takeout_cli.prompt_for_output_subfolder(tmp_path, tmp_path)
+    assert out == tmp_path
+
+
+def test_subfolder_picker_missing_base_defers_to_typed_prompt(monkeypatch, tmp_path):
+    """When base doesn't exist, the picker defers to the free-form path
+    prompt (so running off-server still works)."""
+    _reset_cli_logger(monkeypatch)
+    missing = tmp_path / "nope"
+    target = tmp_path / "typed"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(str(target) + "\n"))
+    out = takeout_cli.prompt_for_output_subfolder(missing, tmp_path)
+    assert out == target
+
+
+# ---------------------------------------------------------------------------
 # TermRender — control-char based grid UI
 # ---------------------------------------------------------------------------
 def _fake_tty():

@@ -925,6 +925,44 @@ def test_term_render_set_header_and_footer():
         sys.stdout = real
 
 
+def test_set_rows_single_redraw_for_many_rows():
+    """set_rows must emit exactly ONE block repaint regardless of how many
+    rows it's handed -- this is the fix for the 290-part flood where one
+    update_row per part produced 290 full-screen repaints per tick."""
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=3)
+        buf.truncate(0); buf.seek(0)
+        r.set_rows(["row a", "row b", "row c"])
+        out = buf.getvalue()
+        # A single repaint moves the cursor up at most once (and on the
+        # very first paint, zero times). Never once-per-row.
+        assert out.count("\x1b[") <= 1 + 3 + 1 + 1  # up + rows + header + footer slots
+        assert "row a" in out and "row b" in out and "row c" in out
+    finally:
+        sys.stdout = real
+
+
+def test_set_rows_clamps_to_body_height():
+    """More rows than the reserved body height are truncated, so the block
+    never grows past what begin() reserved (no runaway scrolling)."""
+    buf = _fake_tty()
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        r.set_rows([f"row {i}" for i in range(50)])
+        # Only 2 body rows are retained internally.
+        assert len(r.rows) == 2
+        assert r.rows == ["row 0", "row 1"]
+    finally:
+        sys.stdout = real
+
+
 def test_term_render_disabled_does_not_emit_escapes(capsys):
     """When enabled=False (no TTY), update_row just prints plain text."""
     r = takeout_cli.TermRender(enabled=False)

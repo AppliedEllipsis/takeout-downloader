@@ -271,6 +271,31 @@ class TermRender:
         self.rows[idx] = ""
         self._redraw()
 
+    def set_rows(self, rows: list[str]) -> None:
+        """Replace ALL body rows at once and redraw a SINGLE time.
+
+        This is the path for the internal downloader, which has the full
+        snapshot of every part on every tick. Calling :meth:`update_row`
+        once per part would emit one full-screen repaint per part (290
+        parts -> 290 repaints/tick -> megabytes/sec of escape codes that
+        flood an SSH pipe and stall the process). Here the caller hands us
+        the already-rendered, already-clamped list of visible rows and we
+        paint the whole block in one write.
+
+        ``rows`` is truncated/padded to ``body_rows`` so it always matches
+        the reserved block height."""
+        if not self.enabled:
+            for r in rows:
+                if r:
+                    print(r, flush=True)
+            return
+        if self._resized:
+            self._resized = False
+            self._reflow_for_resize()
+        n = self.body_rows
+        self.rows = (list(rows) + [""] * n)[:n]
+        self._redraw()
+
     def _redraw(self) -> None:
         if not self.enabled:
             return
@@ -2109,45 +2134,52 @@ def total_of(gid_state: dict, gid: str) -> int:
     return gid_state.get(gid, {}).get("total", 0)
 
 
-def _render_file_row(render: TermRender, filename: str, done: int,
-                     total: int, pct: int, speed_bps: int, eta: str,
-                     filename_to_size: dict, num_by_filename: dict) -> None:
-    if total <= 0:
-        total = filename_to_size.get(filename, 0)
-    # Build the row to FIT the terminal width so it can never wrap onto a
-    # second physical line (a wrapped row desyncs the redraw and corrupts
-    # the grid). Layout priority, narrow -> wide:
-    #   1. "#NNN <filename> [bar] PP%"   (always shown; bar shrinks 8..20)
-    #   2. " done/total"                  (added if it fits)
-    #   3. " speed"                       (added if it fits)
-    #   4. " ETA eta"                     (added if it fits)
-    # The filename and a >=8-char bar are protected; trailing columns are
-    # dropped first when space is tight.
-    try:
-        cols = shutil.get_terminal_size((100, 20)).columns
-    except (OSError, ValueError):
-        cols = 100
+def _format_file_row(filename: str, done: int, total: int, pct: int,
+                     speed_bps: int, eta: str, num: int,
+                     cols: int | None = None) -> str:
+    """Build a single width-fitted progress row string (no rendering).
+
+    Layout priority, narrow -> wide:
+      1. "#NNN <filename> [bar] PP%"   (always shown; bar shrinks 8..20)
+      2. " done/total"                  (added if it fits)
+      3. " speed"                       (added if it fits)
+      4. " ETA eta"                     (added if it fits)
+    The filename and a >=8-char bar are protected; trailing columns drop
+    first when space is tight. Never wraps (caller's redraw truncates too).
+    """
+    if cols is None:
+        try:
+            cols = shutil.get_terminal_size((100, 20)).columns
+        except (OSError, ValueError):
+            cols = 100
     cols = max(20, cols) - 1  # leave 1 col so EOL doesn't auto-wrap
 
-    num = num_by_filename.get(filename, 0)
     parts_str = (human_size(done) + "/" + human_size(total)) if total else human_size(done)
     speed_str = (human_size(speed_bps) + "/s") if speed_bps else "-"
     eta_str = eta or "-"
 
     prefix = f"  #{num:03d}  {filename}  "
     pct_str = f" {pct:3d}%"
-    # How much room is left for the bar after the mandatory prefix+pct?
     room_for_bar = cols - len(prefix) - len(pct_str)
     bar_width = max(8, min(20, room_for_bar))
     bar = make_progress_bar(pct, width=bar_width)
 
     row = f"{prefix}{bar}{pct_str}"
-    # Append optional columns only while they fit.
     for extra in (f"  {parts_str}", f"  {speed_str}", f"  ETA {eta_str}"):
         if len(row) + len(extra) <= cols:
             row += extra
         else:
             break
+    return row
+
+
+def _render_file_row(render: TermRender, filename: str, done: int,
+                     total: int, pct: int, speed_bps: int, eta: str,
+                     filename_to_size: dict, num_by_filename: dict) -> None:
+    if total <= 0:
+        total = filename_to_size.get(filename, 0)
+    row = _format_file_row(filename, done, total, pct, speed_bps, eta,
+                           num_by_filename.get(filename, 0))
     render.update_row(f"file:{filename}", row)
 
 
@@ -2201,32 +2233,47 @@ def run_internal(parts: list[dict], payload: TakeoutPayload, output_dir: Path,
     # Non-TTY fallback: throttle a plain one-line summary so piped/SSH runs
     # still see progress instead of dead silence.
     last_log = [0.0]
+    total_parts = len(parts)
+    grand_total = sum((p["size"] or 0) for p in parts)
 
     def on_progress(snapshot) -> None:
+        done_n = sum(1 for pp in snapshot if pp.status == "done")
+        active = [pp for pp in snapshot if pp.status == "active"]
+        got = sum(pp.done for pp in snapshot)
+        spd = sum(pp.speed_bps for pp in active)
         if render is not None and getattr(render, "enabled", False):
-            for pp in snapshot:
-                if pp.status == "done":
-                    render.clear_row(f"file:{pp.filename}")
-                    continue
-                if pp.status in ("queued",) and pp.done == 0:
-                    # Leave queued rows blank-ish but present.
-                    pass
-                eta = _eta_str(pp.done, pp.total, pp.speed_bps)
-                _render_file_row(render, pp.filename, pp.done, pp.total,
-                                 pp.pct, int(pp.speed_bps), eta,
-                                 size_by_filename, num_by_filename)
+            # ONE aggregate repaint per tick. With hundreds of parts we
+            # can't (and shouldn't) draw a row per part: that floods the
+            # terminal and stalls the process. Show a summary header plus
+            # only the currently-active parts, clamped to the reserved
+            # body height.
+            try:
+                cols = shutil.get_terminal_size((100, 24)).columns
+            except (OSError, ValueError):
+                cols = 100
+            overall_pct = int(got * 100 / grand_total) if grand_total else 0
+            render.set_header(
+                f"  {done_n}/{total_parts} done | {len(active)} active | "
+                f"{human_size(got)}/{human_size(grand_total)} "
+                f"({overall_pct}%) | {human_size(int(spd))}/s"
+            )
+            rows = [
+                _format_file_row(
+                    pp.filename, pp.done, pp.total, pp.pct,
+                    int(pp.speed_bps),
+                    _eta_str(pp.done, pp.total, pp.speed_bps),
+                    num_by_filename.get(pp.filename, 0), cols=cols)
+                for pp in active
+            ]
+            render.set_rows(rows)
         else:
             now = time.monotonic()
             if now - last_log[0] < 2.0:
                 return
             last_log[0] = now
-            done_n = sum(1 for pp in snapshot if pp.status == "done")
-            active = [pp for pp in snapshot if pp.status == "active"]
-            got = sum(pp.done for pp in snapshot)
-            tot = sum(pp.total for pp in snapshot) or 0
-            spd = sum(pp.speed_bps for pp in active)
-            info(f"  {done_n}/{len(snapshot)} done | {len(active)} active | "
-                 f"{human_size(got)}/{human_size(tot)} | {human_size(int(spd))}/s")
+            info(f"  {done_n}/{total_parts} done | {len(active)} active | "
+                 f"{human_size(got)}/{human_size(grand_total)} | "
+                 f"{human_size(int(spd))}/s")
 
     result = dl.download(need, on_progress=on_progress)
 
@@ -2811,8 +2858,18 @@ def _download_one_batch(payload: TakeoutPayload,
     attempt = 0
     use_grid = sys.stdout.isatty() and os.environ.get("NO_GRID") is None
     render = TermRender(enabled=use_grid)
+    engine = getattr(args, "engine", "internal")
     if use_grid:
-        render.begin(n_rows=len(parts))
+        # The internal engine paints an aggregate header + only the active
+        # rows (one batched repaint per tick), so it needs just enough rows
+        # for the concurrent slots -- NOT one row per part. Reserving
+        # len(parts) rows for 290 parts is what flooded the terminal and
+        # stalled the run. aria2c's parser still uses one row per file.
+        if engine == "aria2c":
+            grid_rows = len(parts)
+        else:
+            grid_rows = max(1, min(args.parallel, len(parts)))
+        render.begin(n_rows=grid_rows)
         info("")  # leave room above the grid for the header banner we just drew
 
     def header_line() -> str:
@@ -2829,7 +2886,6 @@ def _download_one_batch(payload: TakeoutPayload,
     def footer_line() -> str:
         return ""
 
-    engine = getattr(args, "engine", "internal")
     while need:
         attempt += 1
         if use_grid:

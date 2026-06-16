@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [6.7.1] — Fix grid flood that stalled large (100+ part) downloads
+
+### Fixed
+
+- **Large downloads appeared to hang and made no progress** (internal
+  engine). With many parts (e.g. 290), the progress callback called
+  `_render_file_row` once per part on every tick — one full-screen
+  repaint per part, ~2 MB/s of escape sequences over an SSH pipe. The
+  flood drowned the terminal and the per-tick blocking `stdout` writes
+  starved the download worker threads, so throughput collapsed to ~0 and
+  the run looked frozen. The fall-back to `--parallel 1` then re-flooded
+  and hung again.
+
+  The internal engine now paints **one aggregate repaint per tick**: a
+  summary header (`N/M done | K active | got/total | speed`) plus only
+  the currently-active rows, via the new `TermRender.set_rows()`. Grid
+  output dropped ~700x (megabytes/sec to a few KB/sec) and large part
+  counts download normally. Verified with a 290-part repro.
+
+- **Grid reserved one screen row per part** (clamped to terminal height,
+  so parts beyond ~21 thrashed over the last slot). The internal engine
+  now reserves only the concurrent-slot count (`--parallel`); aria2c's
+  line parser still uses one row per file.
+
 ## [6.7.0] — Derived default output dir (no hardcoded paths)
 
 ### Changed

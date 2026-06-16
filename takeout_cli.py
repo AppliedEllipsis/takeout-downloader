@@ -63,7 +63,8 @@ try:
 except Exception:
     pass
 
-from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR, VERSION
+from takeout import (extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR,
+                     VERSION, _TAKEOUT_DIR_NAME, _detect_takeout_base)
 from takeout_payload import parse_payload, parse_multi_payload, parse_multi_payload_meta, TakeoutPayload, MultiPayloadMeta, REQUIRED_COOKIE_MARKERS
 from takeout_downloader import InternalDownloader, PartProgress
 
@@ -809,6 +810,45 @@ def _arrow_menu(title: str, options: list[str]) -> int | None:
                 raise KeyboardInterrupt
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _derive_picker_base(resolved: Path) -> Path | None:
+    """Decide which directory the subfolder picker should be rooted at.
+
+    The problem this solves: ``OUTPUT_DIR`` (from the env / ``.env``) often
+    points at a *subfolder* the user previously downloaded into (e.g.
+    ``.../google-takeout/braincreation``), not the shared base. If we rooted
+    the picker there, the user could never pick a *sibling* folder or create
+    a new one next to it -- they'd be stuck inside one person's folder.
+
+    Resolution order:
+      1. ``TAKEOUT_BASE_DIR`` env var -- explicit override, used verbatim.
+      2. Walk ``resolved`` upward looking for the ``<TAKEOUT_DIR_NAME>``
+         component (default ``google-takeout``); if found, root the picker
+         at that directory so every sibling subfolder is selectable.
+      3. Auto-detect a ``google-takeout`` base under the known storage roots.
+      4. If ``resolved`` itself exists, use it (last resort).
+
+    Returns the base dir, or None if nothing usable exists (caller then
+    falls back to the free-form typed-path prompt).
+    """
+    override = os.environ.get("TAKEOUT_BASE_DIR", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        return p if p.is_dir() else None
+
+    # Walk up to the named base component (e.g. .../google-takeout/foo -> .../google-takeout).
+    name = _TAKEOUT_DIR_NAME
+    cur = resolved
+    for ancestor in [cur, *cur.parents]:
+        if ancestor.name == name and ancestor.is_dir():
+            return ancestor
+
+    detected = _detect_takeout_base()
+    if detected and Path(detected).is_dir():
+        return Path(detected)
+
+    return resolved if resolved.is_dir() else None
 
 
 def prompt_for_output_subfolder(base: Path, default: Path) -> Path:
@@ -2527,17 +2567,14 @@ def main() -> int:
     if args.output_dir:
         chosen_output_dir = output_dir
     else:
-        # If the resolved output dir is a Takeout *base* (an auto-detected
-        # storage mount, or whatever OUTPUT_DIR/TAKEOUT_BASE_DIR/
-        # DEFAULT_OUTPUT_DIR points at), offer an arrow-key subfolder
-        # picker rooted there. Otherwise fall back to the free-form
-        # path prompt.
-        picker_base = Path(
-            os.environ.get("TAKEOUT_BASE_DIR")
-            or os.environ.get("OUTPUT_DIR")
-            or DEFAULT_OUTPUT_DIR
-        ).expanduser()
-        if picker_base.is_dir():
+        # Root the arrow-key picker at the shared Takeout *base*
+        # (e.g. /opt/.../google-takeout), NOT at whatever subfolder
+        # OUTPUT_DIR happens to point at. _derive_picker_base walks up to
+        # the google-takeout component (or honors TAKEOUT_BASE_DIR), so the
+        # user can always pick a sibling folder or create a new one rather
+        # than being trapped inside one previously-used subfolder.
+        picker_base = _derive_picker_base(output_dir)
+        if picker_base is not None and picker_base.is_dir():
             chosen_output_dir = prompt_for_output_subfolder(picker_base, output_dir)
         else:
             chosen_output_dir = prompt_for_output_dir(output_dir)

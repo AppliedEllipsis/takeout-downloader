@@ -812,6 +812,37 @@ def test_subfolder_picker_missing_base_defers_to_typed_prompt(monkeypatch, tmp_p
     assert out == target
 
 
+def test_derive_picker_base_walks_up_to_named_component(monkeypatch, tmp_path):
+    """When OUTPUT_DIR resolves to a SUBFOLDER (e.g. .../google-takeout/foo),
+    the picker base must walk up to the google-takeout component so sibling
+    folders are selectable -- not stay trapped in foo."""
+    monkeypatch.delenv("TAKEOUT_BASE_DIR", raising=False)
+    monkeypatch.setattr(takeout_cli, "_TAKEOUT_DIR_NAME", "google-takeout")
+    base = tmp_path / "opt" / "google-takeout"
+    sub = base / "foo"
+    sub.mkdir(parents=True)
+    assert takeout_cli._derive_picker_base(sub) == base
+
+
+def test_derive_picker_base_keeps_base_when_already_base(monkeypatch, tmp_path):
+    """If the resolved dir IS the named base, keep it."""
+    monkeypatch.delenv("TAKEOUT_BASE_DIR", raising=False)
+    monkeypatch.setattr(takeout_cli, "_TAKEOUT_DIR_NAME", "google-takeout")
+    base = tmp_path / "google-takeout"
+    base.mkdir()
+    assert takeout_cli._derive_picker_base(base) == base
+
+
+def test_derive_picker_base_env_override_wins(monkeypatch, tmp_path):
+    """TAKEOUT_BASE_DIR is honored verbatim over the walk-up logic."""
+    forced = tmp_path / "forced-base"
+    forced.mkdir()
+    other = tmp_path / "google-takeout" / "foo"
+    other.mkdir(parents=True)
+    monkeypatch.setenv("TAKEOUT_BASE_DIR", str(forced))
+    assert takeout_cli._derive_picker_base(other) == forced
+
+
 # ---------------------------------------------------------------------------
 # TermRender — control-char based grid UI
 # ---------------------------------------------------------------------------

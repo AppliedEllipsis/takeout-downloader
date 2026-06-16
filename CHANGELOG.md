@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.1] — Subfolder picker roots at the shared base, not a saved subfolder
+
+### Fixed
+
+- **The picker was rooted at the wrong directory.** `OUTPUT_DIR` (from
+  `.env`) usually points at a *subfolder* the user previously downloaded
+  into (e.g. `.../google-takeout/braincreation`), not the shared base. The
+  picker rooted itself there, so the user could never select a sibling
+  folder or create a new one next to it — and `resolve_output_dir()` kept
+  defaulting to that same subfolder every run no matter what was picked.
+  New `_derive_picker_base()` walks the resolved path upward to the
+  `google-takeout` component (configurable via `TAKEOUT_DIR_NAME`, or
+  overridden outright with `TAKEOUT_BASE_DIR`) and roots the arrow-key
+  picker there. So with `OUTPUT_DIR=/opt/storage.jfs002/google-takeout/foo`
+  the picker now lists every subfolder under `.../google-takeout/` and lets
+  you pick or create one.
+
 ## [6.8.0] — Containers run live source from /work (git pull, no rebuild)
 
 ### Changed

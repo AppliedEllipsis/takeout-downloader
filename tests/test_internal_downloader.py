@@ -187,3 +187,29 @@ def test_404_is_recorded_as_failure(server, tmp_path):
                       on_progress=lambda s: None)
     assert not res.ok
     assert 7 in res.failed
+
+def test_per_part_start_and_done_are_logged(server, tmp_path):
+    """Each part must emit a 'start' and a 'done' INFO line via the wired
+    logger, so a second SSH session tailing the log file sees a heartbeat
+    even when the live grid is only painting the (invisible-to-the-log)
+    terminal. This is the regression behind 'it just sits there with
+    nothing in the log'."""
+    import logging
+    logger = logging.getLogger("test_dl_logging")
+    logger.setLevel(logging.INFO)
+    records: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger.addHandler(_Cap())
+    dl = D.InternalDownloader(
+        cookie="SID=x", headers={"User-Agent": "test"},
+        output_dir=tmp_path, parallel=2, retry_wait=0.1, max_tries=2,
+        logger=logger)
+    dl.download(_parts(server), on_progress=lambda s: None)
+    starts = [m for m in records if " start: " in m]
+    dones = [m for m in records if " done: " in m]
+    assert len(starts) == 3, f"expected 3 start lines, got {starts}"
+    assert len(dones) == 3, f"expected 3 done lines, got {dones}"

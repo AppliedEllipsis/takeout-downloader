@@ -62,6 +62,17 @@ ZIP_MAGIC = b"PK\x03\x04"
 ZIP_EOCD = b"PK\x05\x06"
 
 
+def _human(n: int) -> str:
+    """Compact human-readable byte size (mirrors takeout_cli.human_size so
+    the downloader stays import-independent of the CLI module)."""
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{f:.1f} TB"
+
+
 def _looks_like_html_bytes(body: bytes) -> bool:
     """True if ``body`` starts like an HTML document (a Google sign-in
     challenge page). Mirrors takeout_cli._looks_like_html_bytes so the
@@ -163,6 +174,10 @@ class InternalDownloader:
     def _warn(self, msg: str) -> None:
         if self.log:
             self.log.warning(msg)
+
+    def _info(self, msg: str) -> None:
+        if self.log:
+            self.log.info(msg)
 
     # -- public API --------------------------------------------------------
     def snapshot(self) -> list[PartProgress]:
@@ -287,6 +302,8 @@ class InternalDownloader:
 
         self._set(num, status="active")
         last_err = ""
+        self._info(f"part {num:03d} start: {part['filename']} "
+                   f"({_human(part.get('size', 0) or 0)})")
 
         for attempt in range(1, self.max_tries + 1):
             if self._stop.is_set():
@@ -296,6 +313,8 @@ class InternalDownloader:
             total_known = part.get("size", 0) or 0
             if total_known and existing >= total_known:
                 self._set(num, done=existing, total=total_known, status="done")
+                self._info(f"part {num:03d} done (already complete on disk): "
+                           f"{part['filename']}")
                 return
 
             try:
@@ -305,13 +324,15 @@ class InternalDownloader:
                 self._set(num, done=final,
                           total=(self._progress[num].total or final),
                           status="done")
+                self._info(f"part {num:03d} done: {part['filename']} "
+                           f"({_human(final)})")
                 return
             except AuthChallenge:
                 raise  # never retry an auth failure
             except (requests.RequestException, OSError) as e:
                 last_err = repr(e)
-                self._debug(f"part {num:03d} attempt {attempt}/{self.max_tries} "
-                            f"error: {last_err}")
+                self._info(f"part {num:03d} attempt {attempt}/{self.max_tries} "
+                           f"error, will retry: {last_err[:120]}")
                 if attempt < self.max_tries and not self._stop.is_set():
                     # Back off, then resume from the new on-disk size.
                     self._set(num, speed_bps=0.0)

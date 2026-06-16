@@ -2300,17 +2300,30 @@ def run_internal(parts: list[dict], payload: TakeoutPayload, output_dir: Path,
         logger=log,
     )
 
-    # Non-TTY fallback: throttle a plain one-line summary so piped/SSH runs
-    # still see progress instead of dead silence.
+    # Throttle a plain one-line summary to the LOG FILE on every run
+    # (grid or not), so `tail -f takeout_cli.log` from a second SSH session
+    # always shows a heartbeat -- the grid only paints the terminal, which
+    # is invisible to the log and to anyone not watching that exact pane.
     last_log = [0.0]
     total_parts = len(parts)
     grand_total = sum((p["size"] or 0) for p in parts)
+
+    def _log_heartbeat(done_n, active, got, spd) -> None:
+        now = time.monotonic()
+        if now - last_log[0] < 5.0:
+            return
+        last_log[0] = now
+        log.info(f"  progress: {done_n}/{total_parts} done | {len(active)} active | "
+                 f"{human_size(got)}/{human_size(grand_total)} | "
+                 f"{human_size(int(spd))}/s")
 
     def on_progress(snapshot) -> None:
         done_n = sum(1 for pp in snapshot if pp.status == "done")
         active = [pp for pp in snapshot if pp.status == "active"]
         got = sum(pp.done for pp in snapshot)
         spd = sum(pp.speed_bps for pp in active)
+        # Always emit a throttled heartbeat to the log file.
+        _log_heartbeat(done_n, active, got, spd)
         if render is not None and getattr(render, "enabled", False):
             # ONE aggregate repaint per tick. With hundreds of parts we
             # can't (and shouldn't) draw a row per part: that floods the
@@ -2336,14 +2349,8 @@ def run_internal(parts: list[dict], payload: TakeoutPayload, output_dir: Path,
                 for pp in active
             ]
             render.set_rows(rows)
-        else:
-            now = time.monotonic()
-            if now - last_log[0] < 2.0:
-                return
-            last_log[0] = now
-            info(f"  {done_n}/{total_parts} done | {len(active)} active | "
-                 f"{human_size(got)}/{human_size(grand_total)} | "
-                 f"{human_size(int(spd))}/s")
+        # No grid (non-TTY/NO_GRID): the log heartbeat above is the only
+        # progress channel, which is exactly what a piped/SSH run needs.
 
     result = dl.download(need, on_progress=on_progress)
 

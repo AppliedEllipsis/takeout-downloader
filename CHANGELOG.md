@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.3] — Download heartbeat in the log file + per-part start/done logging
+
+### Fixed
+
+- **No feedback in the log file during downloads.** In grid mode the
+  progress callback only painted the terminal, so `tail -f takeout_cli.log`
+  from a second SSH session showed dead silence whether the download was
+  healthy or stalled. `run_internal` now emits a throttled one-line
+  progress heartbeat to the log (every ~5s) on every run, grid or not.
+
+### Added
+
+- **Per-part start/done/retry logging** in the internal downloader. Each
+  worker now logs `part NNN start`, `part NNN done`, and (on a transient
+  error) `part NNN attempt X/Y error, will retry` at INFO. This turns the
+  log into a real activity trace so a stalled connection is distinguishable
+  from a slow one -- previously the downloader only logged retries at DEBUG,
+  which was invisible in the default log.
+
 ## [6.8.2] — Skip the blocking pre-flight for the internal engine
 
 ### Changed

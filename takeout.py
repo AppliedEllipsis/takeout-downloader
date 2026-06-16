@@ -46,29 +46,67 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "6.6.0"
+VERSION = "6.7.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "10"))
 MAX_PARALLEL = 20
 DEFAULT_FILE_COUNT = int(os.environ.get("FILE_COUNT", "100"))
 
 def _default_output_dir() -> str:
-    """Pick a sensible default output directory.
+    """Pick a sensible default output directory, derived at runtime.
 
-    Priority: OUTPUT_DIR env var > the JuiceFS takeout path if it exists >
-    ./downloads. The JuiceFS preference means a server with that mount gets a
-    useful default without any config.
+    Priority:
+      1. ``OUTPUT_DIR`` env var (explicit wins).
+      2. ``TAKEOUT_BASE_DIR`` env var (explicit base for the picker).
+      3. Auto-detect: the first existing ``<root>/*/google-takeout`` (or
+         ``<root>/google-takeout``) directory under common storage mount
+         roots. This lets a server with a mounted storage volume get a
+         useful default with no hardcoded, identifying path in the code.
+      4. ``./downloads`` as the portable fallback.
     """
     env = os.environ.get("OUTPUT_DIR", "").strip()
     if env:
         return env
-    preferred = "/srv/storage/google-takeout"
-    try:
-        if Path(preferred).is_dir():
-            return preferred
-    except OSError:
-        pass
+    base = os.environ.get("TAKEOUT_BASE_DIR", "").strip()
+    if base:
+        return base
+    found = _detect_takeout_base()
+    if found:
+        return found
     return "./downloads"
+
+
+# Folder name we look for under storage mount roots. Override with
+# TAKEOUT_DIR_NAME if your archives live under a differently-named folder.
+_TAKEOUT_DIR_NAME = os.environ.get("TAKEOUT_DIR_NAME", "google-takeout")
+# Mount roots to probe for ``*/<name>`` storage volumes. Override with
+# TAKEOUT_SEARCH_ROOTS (os.pathsep-separated) for non-standard layouts.
+_TAKEOUT_SEARCH_ROOTS = [
+    r for r in (os.environ.get("TAKEOUT_SEARCH_ROOTS", "").split(os.pathsep))
+    if r
+] or ["/opt", "/mnt", "/media", "/srv", "/data"]
+
+
+def _detect_takeout_base() -> str | None:
+    """Find an existing Takeout base dir under the known mount roots without
+    baking any specific (identifying) path into the source.
+
+    Looks for ``<root>/<name>`` and ``<root>/*/<name>`` (one level of mount
+    nesting, e.g. a named storage volume under ``/opt``). Returns the first
+    match as a string, or None. Glob/stat errors are swallowed so this can
+    never break startup on a locked-down filesystem.
+    """
+    import glob
+    name = _TAKEOUT_DIR_NAME
+    for root in _TAKEOUT_SEARCH_ROOTS:
+        for pattern in (f"{root}/{name}", f"{root}/*/{name}"):
+            try:
+                for hit in sorted(glob.glob(pattern)):
+                    if Path(hit).is_dir():
+                        return hit
+            except OSError:
+                continue
+    return None
 
 DEFAULT_OUTPUT_DIR = _default_output_dir()
 SIZE_HISTORY_FILE = ".takeout_sizes.json"

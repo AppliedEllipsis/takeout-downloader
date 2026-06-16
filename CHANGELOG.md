@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [6.7.0] — Derived default output dir (no hardcoded paths)
+
+### Changed
+
+- **Default output directory is now derived at runtime** instead of being
+  a hardcoded path. The app auto-detects an existing
+  ``<root>/<*>/google-takeout`` (or ``<root>/google-takeout``) directory
+  under common storage mount roots (`/opt`, `/mnt`, `/media`, `/srv`,
+  `/data`), falling back to ``./downloads``. ``OUTPUT_DIR`` (explicit) and
+  ``TAKEOUT_BASE_DIR`` (picker base) still win when set. New overrides:
+  ``TAKEOUT_DIR_NAME`` (folder name to look for, default ``google-takeout``)
+  and ``TAKEOUT_SEARCH_ROOTS`` (os.pathsep-separated mount roots). This
+  keeps any environment-specific path out of the source tree while still
+  giving a server with a mounted storage volume a useful default with no
+  config.
+
 ## [6.6.0] — Docker bundles the internal downloader; arrow-key subfolder picker
 
 ### Fixed
@@ -312,7 +328,7 @@ All notable changes to this project are documented here.
 
 - **Docker `/opt` mount** — `docker-compose.yml` recursively binds host
   `/opt` with `rslave` propagation so JuiceFS / encfs FUSE submounts
-  (e.g. `/srv/storage`) are visible inside the container instead of
+  (e.g. `<storage-mount>`) are visible inside the container instead of
   showing as empty dirs. Settings persist on the `/downloads` volume
   (`TAKEOUT_SETTINGS`) so they survive `docker compose run --rm`.
 - **Directory browser** in the TUI — a Browse button (and `b` key) opens a

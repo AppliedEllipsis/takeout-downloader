@@ -51,7 +51,7 @@
 #
 # JUICEFS / FUSE SUBMOUNTS
 # ------------------------
-# /opt on the host has FUSE submounts under it (JuiceFS: /srv/storage,
+# /opt on the host has FUSE submounts under it (JuiceFS: <storage-mount>,
 # gocryptfs: /opt/docker, /opt/caches). A plain bind mount would show those as
 # EMPTY dirs in the container. `recursive: enabled` (rbind) captures the
 # submounts that exist at start; `propagation: rslave` additionally keeps them
@@ -142,7 +142,7 @@ services:
   #     docker compose run --rm takeout-cli
   #
   # Pass flags after the service name. NOTE: use SPACE not = with --out:
-  #   docker compose run --rm takeout-cli --out /opt/storage/...
+  #   docker compose run --rm takeout-cli --out /srv/storage/...
   # If you use --out=/path the equals sign confuses Docker Compose/runc
   # into thinking --out is an executable. Space is required.
   # Alternatively, set OUTPUT_DIR in .env to avoid the flag entirely.

@@ -2445,11 +2445,11 @@ def main() -> int:
     if args.output_dir:
         chosen_output_dir = output_dir
     else:
-        # If the resolved output dir is a Takeout *base* (the server's
-        # /srv/storage/google-takeout mount, or whatever
-        # OUTPUT_DIR/DEFAULT_OUTPUT_DIR points at), offer an arrow-key
-        # subfolder picker rooted there. Otherwise fall back to the
-        # free-form path prompt.
+        # If the resolved output dir is a Takeout *base* (an auto-detected
+        # storage mount, or whatever OUTPUT_DIR/TAKEOUT_BASE_DIR/
+        # DEFAULT_OUTPUT_DIR points at), offer an arrow-key subfolder
+        # picker rooted there. Otherwise fall back to the free-form
+        # path prompt.
         picker_base = Path(
             os.environ.get("TAKEOUT_BASE_DIR")
             or os.environ.get("OUTPUT_DIR")

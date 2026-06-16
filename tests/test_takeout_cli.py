@@ -756,14 +756,14 @@ def test_subfolder_picker_selects_existing(monkeypatch, tmp_path):
     """Non-TTY numbered fallback: picking an existing subfolder returns
     base/<name> and creates nothing new."""
     _reset_cli_logger(monkeypatch)
-    (tmp_path / "alice").mkdir()
-    (tmp_path / "beth").mkdir()
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "bravo").mkdir()
     # Force the numbered-fallback path (non-TTY).
     monkeypatch.setattr(takeout_cli.sys.stdin, "isatty", lambda: False, raising=False)
-    # Options are [alice, beth, create, use-base, type-path]; pick #2.
+    # Options are [alpha, bravo, create, use-base, type-path]; pick #2.
     monkeypatch.setattr("builtins.input", lambda *a: "2")
     out = takeout_cli.prompt_for_output_subfolder(tmp_path, tmp_path)
-    assert out == tmp_path / "beth"
+    assert out == tmp_path / "bravo"
 
 
 def test_subfolder_picker_creates_new(monkeypatch, tmp_path):
@@ -1507,7 +1507,7 @@ def test_save_and_load_config_roundtrip(tmp_path, monkeypatch):
     """Saving and loading config preserves all fields."""
     cfg_path = tmp_path / "test-config.json"
     monkeypatch.setenv("TAKEOUT_CONFIG", str(cfg_path))
-    cfg = {"output_dir": "/opt/storage/google-takeout", "extra": "stuff"}
+    cfg = {"output_dir": "/srv/storage/google-takeout", "extra": "stuff"}
     takeout_cli.save_config(cfg)
     assert cfg_path.exists()
     loaded = takeout_cli.load_config()

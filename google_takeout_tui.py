@@ -561,7 +561,7 @@ class TakeoutTUI(App):
         The output dir is only restored if it still exists. A stale saved
         path (e.g. an old ./downloads from before a JuiceFS mount existed)
         must NOT shadow the smarter current default — otherwise the TUI keeps
-        defaulting to ./downloads even though /srv/storage/... is now
+        defaulting to ./downloads even though /srv/storage/google-takeout/... is now
         available.
         """
         s = load_settings()

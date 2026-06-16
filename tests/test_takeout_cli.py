@@ -1694,6 +1694,51 @@ def test_no_color_flag_disables_color(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# OSC 8 clickable hyperlinks (ctrl+click / ctrl+shift+click to open URL)
+# ---------------------------------------------------------------------------
+def test_link_wraps_url_in_osc8_when_enabled(monkeypatch):
+    """With hyperlinks + color on, _link() wraps the label in the OSC 8
+    escape so a supporting terminal makes it ctrl+clickable."""
+    monkeypatch.setattr(takeout_cli, "_USE_HYPERLINKS", True)
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", True)
+    url = "https://takeout-download.usercontent.google.com/download/x-001.zip?i=0"
+    out = takeout_cli._link(url, "part 1")
+    esc = "\033"
+    assert out == f"{esc}]8;;{url}{esc}\\part 1{esc}]8;;{esc}\\"
+    # The visible label is present and the raw URL is embedded as the target.
+    assert "part 1" in out
+    assert url in out
+
+
+def test_link_defaults_label_to_url(monkeypatch):
+    """No label -> the URL is both the target and the visible text."""
+    monkeypatch.setattr(takeout_cli, "_USE_HYPERLINKS", True)
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", True)
+    url = "https://example/takeout-001.zip"
+    out = takeout_cli._link(url)
+    assert out.count(url) == 2  # once as target, once as label
+
+
+def test_link_plain_when_hyperlinks_off(monkeypatch):
+    """NO_HYPERLINKS / non-TTY: _link() returns the bare label, no escapes,
+    so logs and dumb terminals stay clean."""
+    monkeypatch.setattr(takeout_cli, "_USE_HYPERLINKS", False)
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", True)
+    out = takeout_cli._link("https://example/x.zip", "label")
+    assert out == "label"
+    assert "\033" not in out
+
+
+def test_link_plain_when_color_off(monkeypatch):
+    """--no-color also suppresses hyperlinks (shared escape-output policy)."""
+    monkeypatch.setattr(takeout_cli, "_USE_HYPERLINKS", True)
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", False)
+    out = takeout_cli._link("https://example/x.zip", "label")
+    assert out == "label"
+    assert "\033" not in out
+
+
+# ---------------------------------------------------------------------------
 # _build_parts_from_payloads — modern i= mode (same URL path, different i=N)
 # ---------------------------------------------------------------------------
 def _make_i_mode_multi_payload(n: int = 5) -> dict:

@@ -270,6 +270,7 @@ See [section 6b](#6b-paste-relay-ngrok-but-zero-config) for the relay.
 | `TAKEOUT_LOG_MAX_BYTES` | `512000` | rotate log at this size |
 | `TAKEOUT_LOG_BACKUP_COUNT` | `3` | keep N rotated backups |
 | `NO_COLOR` | unset | disable ANSI colours |
+| `NO_HYPERLINKS` | unset | disable OSC 8 clickable URLs (auto-off when piped) |
 
 ### After a run
 
@@ -506,6 +507,7 @@ optional.
 | `TAKEOUT_LOG_MAX_BYTES` | Rotate log at this size | `512000` |
 | `TAKEOUT_LOG_BACKUP_COUNT` | Keep N rotated backups | `3` |
 | `NO_COLOR` | Disable ANSI colours | unset |
+| `NO_HYPERLINKS` | Disable OSC 8 clickable URLs | unset |
 
 ### TUI only
 

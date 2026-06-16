@@ -46,6 +46,14 @@ All notable changes to this project are documented here.
   CLI-flag equivalent of `NO_COLOR=1`), for logs, pipes, and dumb
   terminals.
 
+- **Clickable URLs (OSC 8 hyperlinks)**: the `--dry-run` part listing now
+  emits OSC 8 terminal hyperlinks, so each part's filename and URL are a
+  ctrl+click / ctrl+shift+click target in terminals that support them
+  (Windows Terminal, iTerm2, kitty, WezTerm, GNOME Terminal / recent VTE).
+  Terminals without OSC 8 just print the label, so it degrades cleanly.
+  Set `NO_HYPERLINKS=1` (or `--no-color`, or pipe the output) to force
+  plain text.
+
 - New v2 multi-payload test fixture (`tests/fixtures/sample_multi_payload.json`)
   matching the exact shape the extension's "Copy ALL exports" button
   emits, plus tests covering live `FILE:`-line binding against real

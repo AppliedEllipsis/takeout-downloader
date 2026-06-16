@@ -35,6 +35,7 @@ Environment
   TAKEOUT_LOG_FILE    log file path (default: <OUTPUT_DIR>/takeout_cli.log)
   TAKEOUT_LOG_MAX_BYTES / TAKEOUT_LOG_BACKUP_COUNT  rotation settings
   NO_COLOR            disable ANSI colors (or pass --no-color)
+  NO_HYPERLINKS       disable OSC 8 clickable URLs (auto-off when piped)
 """
 from __future__ import annotations
 
@@ -90,6 +91,36 @@ def _c(code: str, text: str) -> str:
     if not _USE_COLOR:
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+# OSC 8 hyperlinks let modern terminals (Windows Terminal, iTerm2, kitty,
+# WezTerm, GNOME Terminal, recent VTE) turn text into a ctrl+click /
+# ctrl+shift+click target without showing the raw escape codes. Honored
+# only on a TTY; piped/redirected output and --no-color stay plain so logs
+# and non-supporting terminals aren't polluted with control characters.
+#   ESC ] 8 ; ; <url> ST   <label>   ESC ] 8 ; ; ST
+# (ST = ESC \). Terminals that don't understand OSC 8 ignore it and just
+# print the label, so this degrades cleanly.
+_USE_HYPERLINKS = (
+    sys.stdout.isatty()
+    and os.environ.get("NO_HYPERLINKS") is None
+    and os.environ.get("TERM") != "dumb"
+)
+
+
+def _link(url: str, label: str | None = None) -> str:
+    """Wrap `url` as a clickable OSC 8 terminal hyperlink.
+
+    `label` is the visible text (defaults to the URL itself). Falls back to
+    plain text when hyperlinks are disabled (non-TTY, NO_HYPERLINKS, dumb
+    terminal, or --no-color). The module-level switch is re-read on every
+    call so the --no-color flag can flip it after argparse runs.
+    """
+    text = label if label is not None else url
+    if not (_USE_HYPERLINKS and _USE_COLOR):
+        return text
+    esc = "\033"
+    return f"{esc}]8;;{url}{esc}\\{text}{esc}]8;;{esc}\\"
 
 
 log = logging.getLogger("takeout_cli")
@@ -2453,8 +2484,11 @@ def _download_one_batch(payload: TakeoutPayload,
            f"cookie is valid.")
         for p in parts:
             status = _c("32", "✓") if p["have"] else _c("33", "↓")
-            info(f"  {status} {p['filename']:40s} "
-                 f"{human_size(p['size']):>10s}  {p['url'][:80]}")
+            # The filename is a ctrl+click target opening the part's URL;
+            # the trimmed URL stays visible for terminals without OSC 8.
+            name = _link(p["url"], f"{p['filename']:40s}")
+            info(f"  {status} {name} "
+                 f"{human_size(p['size']):>10s}  {_link(p['url'], p['url'][:80])}")
         ok(f"Dry-run complete. Run without --dry-run to download.")
         state = update_state_from_parts(state, parts)
         save_state(output_dir, state)

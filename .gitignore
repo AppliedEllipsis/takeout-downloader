@@ -111,3 +111,7 @@ drop/*
 # TUI runtime logs (TAKEOUT_LOG_FILE)
 takeout.log
 downloads/*.log
+
+# Pi agent research/scratch dir (local tooling, not project code)
+.pi/
+.commit_scratch/

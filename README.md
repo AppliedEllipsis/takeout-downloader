@@ -339,10 +339,14 @@ throttled or rejected. See [`aria2c_integration.py`](./aria2c_integration.py).
 ## Live grid (CLI)
 
 When you run the CLI on a real terminal (not piped), it draws a
-**fixed-position grid** of every part using ANSI escape codes — one row
+**self-anchoring grid** of every part using ANSI escape codes — one row
 per file with a progress bar, bytes, speed, and ETA. The grid is
-re-rendered in place on every aria2c summary tick (default 1s), so
-there's no scroll-back and no flicker:
+re-rendered in place on every aria2c summary tick (default 1s) using
+*relative* cursor movement (it redraws over its own previous block
+rather than jumping to a fixed screen row), so it never collides with
+scrolled log output and there's no flicker. Each row animates live as
+aria2c reports progress — bound to its file via aria2c's `FILE:` line
+mid-download, not just at the end:
 
 ```
   Pass 1 | 0/100 done | 3 active | 100 pending | output: /opt/storage...
@@ -353,9 +357,16 @@ there's no scroll-back and no flicker:
   overall: 50 MB/s | eta: 5m
 ```
 
+The grid is resize-aware: it repaints on `SIGWINCH`, clamps the visible
+row count to the terminal height, and truncates each row to the terminal
+width so a narrowed window never wraps a row. When space is tight the
+filename and progress bar are protected; the size/speed/ETA columns drop
+off first.
+
 Set `NO_GRID=1` in the environment to force plain streaming output
 (useful when piping to a file or running under `script(1)` for
-recording).
+recording). Pass `--no-color` (or set `NO_COLOR=1`) to strip ANSI colors
+from the surrounding log lines.
 
 ## Project structure
 

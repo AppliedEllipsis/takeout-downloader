@@ -252,6 +252,8 @@ python takeout_cli.py --max-parts 200   # cap discovery at 200 parts
 python takeout_cli.py --output-dir /srv/storage/google-takeout/me
 python takeout_cli.py --relay           # receive the JSON via a browser relay
 python takeout_cli.py --relay --tunnel  # ...and expose it over a Cloudflare tunnel
+python takeout_cli.py --no-color        # strip ANSI colours (same as NO_COLOR=1)
+python takeout_cli.py --dry-run         # validate + show plan, don't download
 ```
 
 See [section 6b](#6b-paste-relay-ngrok-but-zero-config) for the relay.

@@ -2,6 +2,56 @@
 
 All notable changes to this project are documented here.
 
+## [6.4.0] — Live grid that actually updates, resize-safe rendering, size-ordered parts, --no-color
+
+### Fixed
+
+- **Live grid never updated during download** (the big one). The aria2c
+  output parser bound each download's GID to its filename *only* from
+  aria2c's terminal `Download Results:` block — which prints after every
+  download finishes. Verified against aria2c 1.35.0: the GID→filename
+  binding actually arrives mid-download as a `FILE:` line interleaved
+  with the `[#GID ...]` progress lines. The grid sat at "queued" for the
+  whole transfer, then snapped straight to done. `_update_from_aria2_line`
+  now binds from `FILE:` lines (remembering the most-recent progress GID)
+  and flushes the buffered progress sample, so every row animates live.
+  The `Download Results:` block is kept only as a final-status backstop.
+
+- **Grid collided with scrolling log output**. `TermRender` positioned
+  itself with absolute cursor coordinates (`\x1b[1;1H` — jump to screen
+  row 1) on every redraw, while the logger kept scrolling normally, so
+  the fixed grid and the scrolling log wrote over each other. Rewrote the
+  renderer to use *relative* cursor movement (draw once, then move up N
+  lines and overwrite in place). The grid now anchors to the surrounding
+  log flow instead of fighting it — no collision, no flicker.
+
+### Added
+
+- **Terminal-resize handling**: a `SIGWINCH` handler (POSIX) repaints on
+  resize, the visible row count is clamped to the terminal height, and
+  every emitted line is hard-truncated to the terminal width so a
+  narrowed window can never wrap a row (a wrapped row would desync the
+  move-up redraw count and corrupt the grid). The per-row layout now
+  protects the filename and an 8-char-minimum progress bar, dropping the
+  size/speed/ETA columns first when space is tight.
+
+- **Size-ordered parts (smallest → biggest)**: parts are now fed to
+  aria2c smallest-first in both the v2 multi-payload path
+  (`_build_parts_from_payloads`) and the probe-discovery path
+  (`discover_parts`), so the quick parts finish first. Unknown sizes
+  sort last. Part identity (`num` / `i=`) is preserved; only feed order
+  changes.
+
+- **`--no-color` flag**: disables ANSI colors per-invocation (the
+  CLI-flag equivalent of `NO_COLOR=1`), for logs, pipes, and dumb
+  terminals.
+
+- New v2 multi-payload test fixture (`tests/fixtures/sample_multi_payload.json`)
+  matching the exact shape the extension's "Copy ALL exports" button
+  emits, plus tests covering live `FILE:`-line binding against real
+  aria2c output, smallest-first ordering, parts-mode end-to-end, and the
+  `--no-color` switch. 168 tests pass.
+
 ## [6.3.0] — Stream-abort pre-flight, adaptive parallelism, dry-run, cookie warnings
 
 ### Fixed

@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.4] — Single-stream by default (fixes the "1 active | 0 B/s" hang)
+
+### Fixed
+
+- **Parallel downloads stalled at 0 B/s.** Google serves Takeout archives
+  single-stream per session: opening N parallel connections leaves N-1
+  stalled at zero bytes until their read timeout fires (the
+  `1 active | 0 B/s` hang you'd see after "Found N parts"). The internal
+  engine now defaults to **1 concurrent stream**, so the one connection
+  gets Google's full bandwidth instead of competing with stalled siblings.
+  Pass `-p N` to override if you really want parallel. aria2c keeps its
+  previous default.
+
+- **Stalls now recover in ~30s instead of ~60s.** The read timeout dropped
+  from 60s to 30s (override with `TAKEOUT_READ_TIMEOUT`). When a stream
+  sends no data within that window the worker reconnects with Range from
+  where it stopped, so a transient stall costs half a minute, not a full
+  one.
+
+- **Empty `PARALLEL_DOWNLOADS` no longer crashes startup.** An empty-string
+  env value (now the compose default) was `int()`-parsed and raised
+  `ValueError` at import. Both `takeout.py` and `takeout_cli.py` now treat
+  blank/non-numeric values as unset.
+
+### Added
+
+- `TAKEOUT_READ_TIMEOUT` / `TAKEOUT_CONNECT_TIMEOUT` env vars to tune the
+  socket timeouts.
+- `_resolve_parallel()` helper centralises the precedence (explicit `-p` >
+  engine default), covered by unit tests.
+
 ## [6.8.3] — Download heartbeat in the log file + per-part start/done logging
 
 ### Fixed

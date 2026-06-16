@@ -46,11 +46,28 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "6.8.3"
+VERSION = "6.8.4"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-DEFAULT_PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "10"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, tolerating unset/blank values.
+
+    Compose files commonly set ``VAR: ${VAR:-}`` which exports an EMPTY
+    string, and ``int("")`` raises. Treat blank as 'use the default'.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+DEFAULT_PARALLEL = _env_int("PARALLEL_DOWNLOADS", 10)
 MAX_PARALLEL = 20
-DEFAULT_FILE_COUNT = int(os.environ.get("FILE_COUNT", "100"))
+DEFAULT_FILE_COUNT = _env_int("FILE_COUNT", 100)
 
 def _default_output_dir() -> str:
     """Pick a sensible default output directory, derived at runtime.

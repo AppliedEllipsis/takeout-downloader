@@ -53,10 +53,17 @@ import requests
 # plenty smooth; the renderer throttles to its own cadence anyway).
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 
-# (connect, read) timeouts. The read timeout is generous because Google can
-# stall mid-stream under load; the worker's retry loop handles a genuine
-# hang by reconnecting with Range from where it stopped.
-DEFAULT_TIMEOUT = (10, 60)
+# (connect, read) timeouts. The read timeout is what bounds a stalled
+# stream: Google's per-session throttle often accepts a connection and then
+# sends zero bytes (you see "1 active | 0 B/s"). When no data arrives within
+# the read timeout, requests raises and the worker reconnects with Range
+# from where it stopped -- so a shorter read timeout means a stall recovers
+# in seconds instead of dead-waiting a full minute. Override with
+# TAKEOUT_READ_TIMEOUT / TAKEOUT_CONNECT_TIMEOUT.
+DEFAULT_TIMEOUT = (
+    float(os.environ.get("TAKEOUT_CONNECT_TIMEOUT", "10")),
+    float(os.environ.get("TAKEOUT_READ_TIMEOUT", "30")),
+)
 
 ZIP_MAGIC = b"PK\x03\x04"
 ZIP_EOCD = b"PK\x05\x06"

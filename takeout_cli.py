@@ -28,7 +28,12 @@ Flow
 Environment
 -----------
   OUTPUT_DIR          default output dir (auto-detects JuiceFS, else ./downloads)
-  PARALLEL_DOWNLOADS  concurrent downloads, passed to aria2c -j (default 3)
+  PARALLEL_DOWNLOADS  concurrent downloads. Internal engine defaults to 1
+                      (Google serves Takeout single-stream; more just stall);
+                      aria2c defaults to 5. -p/--parallel overrides.
+  TAKEOUT_READ_TIMEOUT / TAKEOUT_CONNECT_TIMEOUT  socket timeouts (s); a
+                      shorter read timeout makes a stalled stream recover
+                      fast instead of dead-waiting (internal engine).
   MAX_PARTS           safety cap on discovery probing (default 500)
   MAX_AUTH_REPROMPTS  how many times to ask for a fresh cookie before giving up
                       (default 5; on the Nth re-prompt we exit cleanly)
@@ -72,8 +77,35 @@ from takeout_downloader import InternalDownloader, PartProgress
 # ===========================================================================
 # Tunables
 # ===========================================================================
-PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "5"))
+# Default concurrency. Note: Google serves Takeout archives single-stream
+# per session -- opening N parallel connections just leaves N-1 stalled at
+# 0 B/s until their read timeout fires (the "1 active | 0 B/s" hang). So the
+# internal engine defaults to 1 stream (resolved in main() unless the user
+# passes -p explicitly); aria2c keeps the higher default. PARALLEL_DOWNLOADS
+# in the env still overrides when set.
+_PARALLEL_ENV = (os.environ.get("PARALLEL_DOWNLOADS") or "").strip()
+PARALLEL = int(_PARALLEL_ENV) if _PARALLEL_ENV.isdigit() else 5
 MAX_PARTS = int(os.environ.get("MAX_PARTS", "500"))
+
+
+def _resolve_parallel(explicit, engine: str, env_val: str) -> int:
+    """Decide the concurrent-download count.
+
+    Precedence:
+      1. ``explicit`` (the -p/--parallel flag) always wins, for either engine.
+      2. internal engine -> 1. Google serves Takeout single-stream; extra
+         connections just stall at 0 B/s and burn the read timeout (the
+         "1 active | 0 B/s" hang). The PARALLEL_DOWNLOADS env is ignored here
+         because a stale value of 5 (the aria2c-era `-j`) is exactly what
+         made parallel runs hang.
+      3. aria2c -> PARALLEL_DOWNLOADS env if it's a positive int, else 5.
+    """
+    if explicit is not None:
+        return max(1, int(explicit))
+    if engine == "internal":
+        return 1
+    env_val = (env_val or "").strip()
+    return int(env_val) if env_val.isdigit() and int(env_val) > 0 else 5
 MAX_AUTH_REPROMPTS = int(os.environ.get("MAX_AUTH_REPROMPTS", "5"))
 PROBE_TIMEOUT = (10, 30)
 CONSECUTIVE_404_STOP = 2
@@ -2472,8 +2504,12 @@ def main() -> int:
         description="Download a Google Takeout archive using aria2c. "
                     "Paste a JSON payload, the CLI does the rest.",
     )
-    parser.add_argument("-p", "--parallel", type=int, default=PARALLEL,
-                        help=f"concurrent downloads (default {PARALLEL})")
+    parser.add_argument("-p", "--parallel", type=int, default=None,
+                        help="concurrent downloads. Default: 1 for the "
+                             "internal engine (Google serves Takeout "
+                             "single-stream; more just stall), or "
+                             f"{PARALLEL} for aria2c. PARALLEL_DOWNLOADS env "
+                             "overrides.")
     parser.add_argument("--max-parts", type=int, default=MAX_PARTS,
                         help=f"max parts to discover (default {MAX_PARTS})")
     parser.add_argument("--version", action="version",
@@ -2519,6 +2555,9 @@ def main() -> int:
     if args.no_color:
         global _USE_COLOR
         _USE_COLOR = False
+
+    # Resolve parallelism now that the engine is known.
+    args.parallel = _resolve_parallel(args.parallel, args.engine, _PARALLEL_ENV)
 
     # Wire up the payload source. With --relay, every paste prompt (including
     # the stale-cookie re-prompt loop) reads from the ephemeral browser relay.

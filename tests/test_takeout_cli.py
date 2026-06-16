@@ -2389,6 +2389,35 @@ def test_preflight_env_forces_on_for_internal(monkeypatch, tmp_path):
     assert calls["n"] == 1, "TAKEOUT_PREFLIGHT=1 should force pre-flight on"
 
 
+# ---------------------------------------------------------------------------
+# Parallelism resolution: internal defaults to single-stream (Google limit)
+# ---------------------------------------------------------------------------
+def test_resolve_parallel_internal_defaults_to_1():
+    """Internal engine ignores the (aria2c-era) PARALLEL_DOWNLOADS env and
+    defaults to a single stream, because Google serves Takeout single-stream
+    and extra connections just stall at 0 B/s."""
+    assert takeout_cli._resolve_parallel(None, "internal", "") == 1
+    assert takeout_cli._resolve_parallel(None, "internal", "5") == 1
+    assert takeout_cli._resolve_parallel(None, "internal", "  ") == 1
+
+
+def test_resolve_parallel_explicit_wins_for_either_engine():
+    """An explicit -p always wins, even raising the internal engine above 1."""
+    assert takeout_cli._resolve_parallel(4, "internal", "") == 4
+    assert takeout_cli._resolve_parallel(3, "aria2c", "9") == 3
+    # Never below 1.
+    assert takeout_cli._resolve_parallel(0, "internal", "") == 1
+
+
+def test_resolve_parallel_aria2c_honors_env_else_default():
+    """aria2c keeps its historical behavior: PARALLEL_DOWNLOADS env if a
+    positive int, else the legacy default of 5. Empty/garbage falls back."""
+    assert takeout_cli._resolve_parallel(None, "aria2c", "8") == 8
+    assert takeout_cli._resolve_parallel(None, "aria2c", "") == 5
+    assert takeout_cli._resolve_parallel(None, "aria2c", "x") == 5
+    assert takeout_cli._resolve_parallel(None, "aria2c", "0") == 5
+
+
 def test_adaptive_parallelism_reduces_to_1(monkeypatch, tmp_path):
     """When all parts fail and parallel > 1, the download loop should
     automatically reduce parallelism to 1 before asking for a new cookie.

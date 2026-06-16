@@ -169,7 +169,10 @@ services:
       OUTPUT_DIR: ${OUTPUT_DIR:-}
       TERM: ${TERM:-xterm-256color}
       ALLOWED_DIRS: /opt:/downloads
-      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-5}
+      # Empty by default: the CLI picks 1 for the internal engine (Google
+      # serves Takeout single-stream) and 5 for aria2c. Set PARALLEL_DOWNLOADS
+      # in .env/shell only to force a specific value.
+      PARALLEL_DOWNLOADS: ${PARALLEL_DOWNLOADS:-}
       MAX_PARTS: ${MAX_PARTS:-500}
       MAX_AUTH_REPROMPTS: ${MAX_AUTH_REPROMPTS:-5}
     volumes:

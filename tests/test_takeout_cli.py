@@ -1658,6 +1658,42 @@ def test_cli_version_flag(capsys):
 
 
 # ---------------------------------------------------------------------------
+# --no-color / NO_COLOR
+# ---------------------------------------------------------------------------
+def test_c_helper_emits_ansi_when_color_on(monkeypatch):
+    """When _USE_COLOR is on, _c() wraps text in the ANSI escape."""
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", True)
+    out = takeout_cli._c("32", "hello")
+    assert out == "\033[32mhello\033[0m"
+
+
+def test_c_helper_plain_when_color_off(monkeypatch):
+    """When _USE_COLOR is off, _c() returns the bare text (no escapes)."""
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", False)
+    out = takeout_cli._c("32", "hello")
+    assert out == "hello"
+    assert "\033[" not in out
+
+
+def test_no_color_flag_disables_color(monkeypatch):
+    """`--no-color` flips the module-level _USE_COLOR switch off so all
+    subsequent _c() calls emit plain text. We stop main() right after the
+    flag is processed by having --reset-config short-circuit the return."""
+    # Force color ON first so the flag has something to turn off.
+    monkeypatch.setattr(takeout_cli, "_USE_COLOR", True)
+    # Point config at a non-existent path so --reset-config returns 0 early
+    # (before any paste prompt or network access).
+    monkeypatch.setenv("TAKEOUT_CONFIG", "/nonexistent/takeout-cli-test.json")
+    with mock.patch("sys.argv",
+                    ["takeout_cli.py", "--no-color", "--reset-config"]):
+        rc = takeout_cli.main()
+    assert rc == 0
+    # The flag should have disabled color for the rest of the process.
+    assert takeout_cli._USE_COLOR is False
+    assert takeout_cli._c("31", "x") == "x"
+
+
+# ---------------------------------------------------------------------------
 # _build_parts_from_payloads — modern i= mode (same URL path, different i=N)
 # ---------------------------------------------------------------------------
 def _make_i_mode_multi_payload(n: int = 5) -> dict:

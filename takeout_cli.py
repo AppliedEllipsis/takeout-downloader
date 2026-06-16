@@ -34,7 +34,7 @@ Environment
                       (default 5; on the Nth re-prompt we exit cleanly)
   TAKEOUT_LOG_FILE    log file path (default: <OUTPUT_DIR>/takeout_cli.log)
   TAKEOUT_LOG_MAX_BYTES / TAKEOUT_LOG_BACKUP_COUNT  rotation settings
-  NO_COLOR            disable ANSI colors
+  NO_COLOR            disable ANSI colors (or pass --no-color)
 """
 from __future__ import annotations
 
@@ -2070,7 +2070,18 @@ def main() -> int:
                         default=int(os.environ.get("PASTE_RELAY_TIMEOUT", "600")),
                         help="seconds the relay waits before self-destruct "
                              "(default 600)")
+    parser.add_argument("--no-color", dest="no_color", action="store_true",
+                        help="disable ANSI colors (same as NO_COLOR=1); "
+                             "useful for logs, pipes, and dumb terminals")
     args = parser.parse_args()
+
+    # Honor --no-color by flipping the module-level color switch the
+    # `_c()` helper reads. The NO_COLOR env var is already respected at
+    # import time; this lets a user force it off per-invocation without
+    # setting an env var. Color stays on only when the output is a TTY.
+    if args.no_color:
+        global _USE_COLOR
+        _USE_COLOR = False
 
     # Wire up the payload source. With --relay, every paste prompt (including
     # the stale-cookie re-prompt loop) reads from the ephemeral browser relay.

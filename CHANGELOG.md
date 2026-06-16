@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.2] — Skip the blocking pre-flight for the internal engine
+
+### Changed
+
+- **Pre-flight full-GET is now skipped by default for the internal
+  downloader.** It only ever mattered for aria2c, which would blindly
+  write a 1.2 MB HTML sign-in page to disk if the session were challenged
+  mid-download. The internal engine already inspects the first chunk of
+  every part and raises an auth challenge *before* any bytes touch the
+  archive file, so the pre-flight added nothing but a blocking,
+  feedback-less request before downloads began (the "it hangs on
+  pre-flight" symptom). The internal engine now goes straight to
+  downloading parts in order.
+- Pre-flight still runs automatically for `--engine aria2c`. Override
+  either way with `TAKEOUT_PREFLIGHT=1` (force on) or `TAKEOUT_PREFLIGHT=0`
+  (force off) regardless of engine.
+
 ## [6.8.1] — Subfolder picker roots at the shared base, not a saved subfolder
 
 ### Fixed

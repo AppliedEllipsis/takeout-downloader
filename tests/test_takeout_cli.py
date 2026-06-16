@@ -2314,6 +2314,81 @@ def test_drain_response_reads_up_to_max_bytes():
     assert resp2._closed
 
 
+def _gating_args(tmp_path, engine):
+    import argparse
+    return argparse.Namespace(
+        parallel=1, max_parts=500, fresh=False,
+        output_dir=str(tmp_path), verbose=0, version=False,
+        engine=engine,
+    )
+
+
+def _stub_batch_io(monkeypatch):
+    """Stub out everything _download_one_batch touches except pre-flight,
+    so the only thing under test is whether pre-flight ran."""
+    monkeypatch.setattr(takeout_cli, "verify_parts",
+                        lambda parts, outdir: (list(parts), []))
+    monkeypatch.setattr(takeout_cli, "save_state", lambda *a: None)
+    monkeypatch.setattr(takeout_cli, "state_matches_payload", lambda *a: True)
+    monkeypatch.setattr(takeout_cli, "load_state", lambda *a: None)
+    monkeypatch.setattr(takeout_cli, "make_state", lambda *a: {})
+    monkeypatch.setattr(takeout_cli, "update_state_from_parts", lambda *a: {})
+    monkeypatch.setattr(takeout_cli, "build_aria2_input", lambda *a: "")
+    monkeypatch.setattr(takeout_cli, "run_aria2c", lambda *a, **k: 0)
+    monkeypatch.setattr(takeout_cli, "run_internal",
+                        lambda *a, **k: {"auth_failed": False, "auth_body": b"",
+                                         "auth_url": "", "failed": []})
+    monkeypatch.setattr(takeout_cli.sys, "stdout", io.StringIO())
+
+
+def test_preflight_skipped_for_internal_engine(monkeypatch, tmp_path):
+    """The internal engine guards the first bytes of every part itself, so
+    the blocking pre-flight GET is skipped (it gave no feedback and looked
+    like a hang). aria2c still runs it."""
+    _stub_batch_io(monkeypatch)
+    monkeypatch.delenv("TAKEOUT_PREFLIGHT", raising=False)
+    calls = {"n": 0}
+    monkeypatch.setattr(takeout_cli, "_preflight_full_download",
+                        lambda *a: calls.__setitem__("n", calls["n"] + 1))
+    parts = [{"num": 1, "url": "https://x?i=0", "filename": "p-001.zip",
+              "size": 100, "have": False}]
+    takeout_cli._download_one_batch(
+        _fixture_payload(), tmp_path, _gating_args(tmp_path, "internal"),
+        logging.getLogger("test"), initial_parts=parts, initial_state=None)
+    assert calls["n"] == 0, "pre-flight should be skipped for the internal engine"
+
+
+def test_preflight_runs_for_aria2c_engine(monkeypatch, tmp_path):
+    """aria2c would blindly write a sign-in page to disk, so it keeps the
+    pre-flight guard."""
+    _stub_batch_io(monkeypatch)
+    monkeypatch.delenv("TAKEOUT_PREFLIGHT", raising=False)
+    calls = {"n": 0}
+    monkeypatch.setattr(takeout_cli, "_preflight_full_download",
+                        lambda *a: calls.__setitem__("n", calls["n"] + 1))
+    parts = [{"num": 1, "url": "https://x?i=0", "filename": "p-001.zip",
+              "size": 100, "have": False}]
+    takeout_cli._download_one_batch(
+        _fixture_payload(), tmp_path, _gating_args(tmp_path, "aria2c"),
+        logging.getLogger("test"), initial_parts=parts, initial_state=None)
+    assert calls["n"] == 1, "pre-flight should run for the aria2c engine"
+
+
+def test_preflight_env_forces_on_for_internal(monkeypatch, tmp_path):
+    """TAKEOUT_PREFLIGHT=1 forces the pre-flight even on the internal engine."""
+    _stub_batch_io(monkeypatch)
+    monkeypatch.setenv("TAKEOUT_PREFLIGHT", "1")
+    calls = {"n": 0}
+    monkeypatch.setattr(takeout_cli, "_preflight_full_download",
+                        lambda *a: calls.__setitem__("n", calls["n"] + 1))
+    parts = [{"num": 1, "url": "https://x?i=0", "filename": "p-001.zip",
+              "size": 100, "have": False}]
+    takeout_cli._download_one_batch(
+        _fixture_payload(), tmp_path, _gating_args(tmp_path, "internal"),
+        logging.getLogger("test"), initial_parts=parts, initial_state=None)
+    assert calls["n"] == 1, "TAKEOUT_PREFLIGHT=1 should force pre-flight on"
+
+
 def test_adaptive_parallelism_reduces_to_1(monkeypatch, tmp_path):
     """When all parts fail and parallel > 1, the download loop should
     automatically reduce parallelism to 1 before asking for a new cookie.

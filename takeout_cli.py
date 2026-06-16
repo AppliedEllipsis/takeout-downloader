@@ -2904,33 +2904,32 @@ def _download_one_batch(payload: TakeoutPayload,
         save_state(output_dir, state)
         return 0
 
-    # ----------------------------------------------------------------
-    # Pre-flight check: prove the cookie works for *full-file* GETs
-    # (not just 1-byte Range probes) BEFORE we kick off aria2c.
-    #
-    # Why this matters: Google's auth-challenge response (a 1.2 MB
-    # HTML sign-in page) is triggered by full GETs from a challenged
-    # session, but a Range: bytes=0-0 probe passes through cleanly.
-    # So the user can see "Found 5 parts, 1.8 GB total" (probes
-    # succeeded) and then watch every download come back as 1.2 MB
-    # of HTML (full GETs challenged). The script would then loop
-    # asking for a new cookie — but the *new* cookie has the same
-    # problem, because the issue isn't staleness, it's per-session
-    # full-download rate limiting.
-    #
-    # We do a single full GET of the *smallest* part (the user can
-    # have 5 parts totalling 2 GB but a 43 KB part to test with) to
-    # confirm the session is healthy for the actual download path.
-    # If the response is HTML, we save it for inspection and bail
-    # out immediately — no more 5x failing-then-re-prompting loops.
-    # ----------------------------------------------------------------
-    _preflight_full_download(parts, payload, output_dir)
-
     # Main download loop
     attempt = 0
+    engine = getattr(args, "engine", "internal")
+
+    # ----------------------------------------------------------------
+    # Pre-flight check: prove the cookie works for *full-file* GETs
+    # before committing to the download. Only meaningful for aria2c,
+    # which would blindly write a 1.2 MB HTML sign-in page to disk if
+    # the session were challenged mid-download.
+    #
+    # The internal engine does NOT need this: every worker inspects the
+    # first chunk of each part and raises an AuthChallenge *before* any
+    # bytes touch the archive file, so a sign-in page can never corrupt
+    # an output file. Running the pre-flight there just adds a blocking,
+    # feedback-less request before downloads start (the exact "it hangs
+    # on pre-flight" symptom). So we skip it for the internal engine and
+    # go straight to downloading. Set TAKEOUT_PREFLIGHT=1 to force it on,
+    # or =0 to force it off, regardless of engine.
+    # ----------------------------------------------------------------
+    _pf = os.environ.get("TAKEOUT_PREFLIGHT", "").strip()
+    do_preflight = (_pf == "1") or (_pf != "0" and engine == "aria2c")
+    if do_preflight:
+        _preflight_full_download(parts, payload, output_dir)
+
     use_grid = sys.stdout.isatty() and os.environ.get("NO_GRID") is None
     render = TermRender(enabled=use_grid)
-    engine = getattr(args, "engine", "internal")
     if use_grid:
         # The internal engine paints an aggregate header + only the active
         # rows (one batched repaint per tick), so it needs just enough rows

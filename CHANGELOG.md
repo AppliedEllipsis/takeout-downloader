@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [6.7.2] — Single-scandir part snapshot (no more multi-minute pre-download stall)
+
+### Fixed
+
+- **Multi-minute stall before download started on slow filesystems.** Building
+  the parts list (`_build_parts_from_payloads`) and `verify_parts` did an
+  `exists()` + `stat()` per part. On a network filesystem (JuiceFS/encfs)
+  that is two serial round-trips per part, so a 290-part export cost ~580
+  serial syscalls and several minutes of dead time *before* the first byte
+  was fetched. Both now snapshot the output directory with a single
+  `os.scandir` pass (`_dir_size_map`) and look filenames up in memory.
+  `verify_parts` still only opens files that actually exist on disk for the
+  ZIP/EOCD check, so a fresh run (nothing downloaded yet) does effectively
+  zero per-part I/O.
+
 ## [6.7.1] — Fix grid flood that stalled large (100+ part) downloads
 
 ### Fixed

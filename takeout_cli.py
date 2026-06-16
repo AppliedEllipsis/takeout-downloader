@@ -1309,6 +1309,33 @@ def _payload_fix_hint() -> None:
     info(f"  (Or save to {out}/in.json and re-run.)")
 
 
+def _dir_size_map(output_dir: Path) -> dict[str, int]:
+    """Return ``{filename: size_bytes}`` for every file in ``output_dir`` via
+    a SINGLE ``os.scandir`` pass.
+
+    Why: building the parts list used to call ``exists()`` + ``stat()`` per
+    part. On a slow network filesystem (JuiceFS/encfs) that is two
+    round-trips per part, so 290 parts cost ~580 serial syscalls and several
+    minutes of dead time before the download even started. One ``scandir``
+    is a single directory read, and ``entry.stat()`` on the yielded entries
+    is served from the readdir cache on most filesystems. Missing files are
+    simply absent from the map (callers treat absent as size 0).
+    """
+    sizes: dict[str, int] = {}
+    try:
+        with os.scandir(output_dir) as it:
+            for entry in it:
+                try:
+                    if entry.is_file():
+                        sizes[entry.name] = entry.stat().st_size
+                except OSError:
+                    continue
+    except (OSError, ValueError):
+        # Dir missing/unreadable -> empty map; every part counts as "need".
+        pass
+    return sizes
+
+
 def _build_parts_from_payloads(payloads: list[TakeoutPayload],
                                 meta: MultiPayloadMeta,
                                 output_dir: Path) -> list[dict]:
@@ -1336,14 +1363,17 @@ def _build_parts_from_payloads(payloads: list[TakeoutPayload],
     June 15 — the on-disk 001.zip was an auth-challenge page that
     aria2c wrote from one of the parallel attempts).
     """
+    # Snapshot the output dir once (a single scandir) instead of doing
+    # exists()+stat() per part. On a slow network FS (JuiceFS/encfs) 290
+    # parts x 2 syscalls each was ~7 minutes of dead time before download
+    # even started. One scandir is a single round-trip.
+    on_disk = _dir_size_map(output_dir)
     parts: list[dict] = []
     for i, p in enumerate(payloads):
         url, filename = _split_url_filename_for_part(p, i)
-        dest = output_dir / filename
         size = meta.sizes.get(i, 0) or 0
-        have = dest.exists() and dest.stat().st_size > 0 and (
-            size == 0 or dest.stat().st_size >= size
-        )
+        disk_size = on_disk.get(filename, 0)
+        have = disk_size > 0 and (size == 0 or disk_size >= size)
         parts.append({
             "num": i + 1,
             "url": url,
@@ -2332,15 +2362,20 @@ def verify_parts(parts: list[dict], output_dir: Path) -> tuple[list[dict], list[
       - the file looks like a real ZIP (EOCD signature present).
     """
     complete, incomplete = [], []
+    # One scandir snapshot instead of exists()+stat() per part. On a slow
+    # network FS a fresh 290-part run otherwise spent minutes here just
+    # confirming nothing is on disk yet.
+    on_disk = _dir_size_map(output_dir)
     for p in parts:
         dest = output_dir / p["filename"]
-        if not dest.exists() or dest.stat().st_size == 0:
+        disk_size = on_disk.get(p["filename"], 0)
+        if disk_size == 0:
             p["have"] = False
             incomplete.append(p)
             continue
-        if p["size"] and dest.stat().st_size < p["size"]:
+        if p["size"] and disk_size < p["size"]:
             warn(f"{p['filename']}: "
-                 f"size {human_size(dest.stat().st_size)} < "
+                 f"size {human_size(disk_size)} < "
                  f"expected {human_size(p['size'])} (will retry)")
             p["have"] = False
             incomplete.append(p)

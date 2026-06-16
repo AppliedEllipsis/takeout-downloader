@@ -2401,6 +2401,24 @@ def test_v2_multi_payload_resume_marks_have(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _dir_size_map — single-scandir snapshot (no per-part stat storm)
+# ---------------------------------------------------------------------------
+def test_dir_size_map_reads_sizes(tmp_path):
+    """One scandir returns {filename: size} for every file, skipping dirs."""
+    (tmp_path / "a.zip").write_bytes(b"x" * 10)
+    (tmp_path / "b.zip").write_bytes(b"y" * 20)
+    (tmp_path / "sub").mkdir()
+    m = takeout_cli._dir_size_map(tmp_path)
+    assert m == {"a.zip": 10, "b.zip": 20}
+
+
+def test_dir_size_map_missing_dir_is_empty(tmp_path):
+    """A missing/unreadable dir yields an empty map (every part = 'need'),
+    not an exception."""
+    assert takeout_cli._dir_size_map(tmp_path / "nope") == {}
+
+
+# ---------------------------------------------------------------------------
 # Parts mode feeds smallest-first (size ordering)
 # ---------------------------------------------------------------------------
 def test_build_parts_from_payloads_sorts_smallest_first(tmp_path):

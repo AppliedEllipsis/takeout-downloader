@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [6.6.0] — Docker bundles the internal downloader; arrow-key subfolder picker
+
+### Fixed
+
+- **`ModuleNotFoundError: takeout_downloader` in Docker**. The 6.5.0
+  internal downloader added `takeout_downloader.py`, but the Dockerfile
+  `COPY`s an explicit file list and the new module wasn't on it — so
+  `docker compose run --rm takeout-cli` crashed on import. Added
+  `takeout_downloader.py` to the COPY list.
+
+### Added
+
+- **Arrow-key subfolder picker**. When the output base is a real
+  directory (e.g. the server's `/srv/storage/google-takeout`),
+  the CLI now shows an interactive menu of its existing subfolders plus
+  "create a new subfolder", "use this folder directly", and "type a
+  different path". On a POSIX TTY you navigate with ↑/↓ (or j/k), Enter
+  to select, q/Esc to cancel; the menu redraws in place. Non-TTY /
+  non-POSIX (Windows, pipes, Docker without `-t`) degrades to a numbered
+  menu. Cancelling falls back to the existing free-form path prompt, so
+  arbitrary locations are still reachable. The free-form
+  `prompt_for_output_dir` (and its JSON-paste / long-path guards) is
+  unchanged underneath.
+
 ## [6.5.0] — Internal parallel downloader (default engine), exact TTY-independent progress
 
 ### Changed

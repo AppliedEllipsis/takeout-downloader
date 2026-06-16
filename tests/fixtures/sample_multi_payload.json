@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "captured_at": "2026-06-14T23:58:38.340Z",
+  "source": "extension",
+  "multi": true,
+  "archiveId": "ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20",
+  "expectedParts": 5,
+  "exports": [
+    {
+      "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=0&user=853339084521&authuser=3",
+      "filename": "takeout-20260612T190148Z-9-001.zip",
+      "partIndex": 0,
+      "size": 2147483648
+    },
+    {
+      "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=1&user=853339084521&authuser=3",
+      "filename": "takeout-20260612T190148Z-9-002.zip",
+      "partIndex": 1,
+      "size": 524288000
+    },
+    {
+      "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=2&user=853339084521&authuser=3",
+      "filename": "takeout-20260612T190148Z-9-003.zip",
+      "partIndex": 2,
+      "size": 45056
+    },
+    {
+      "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=3&user=853339084521&authuser=3",
+      "filename": "takeout-20260612T190148Z-9-004.zip",
+      "partIndex": 3,
+      "size": 1073741824
+    },
+    {
+      "url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-9-001.zip?j=ccb0dc6c-ba0c-466f-9228-2ebd83fbcd20&i=4&user=853339084521&authuser=3",
+      "filename": "takeout-20260612T190148Z-9-005.zip",
+      "partIndex": 4,
+      "size": 104857600
+    }
+  ],
+  "headers": {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://takeout.google.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+  },
+  "cookie": "SID=PLACEHOLDER; __Secure-1PSID=PLACEHOLDER; __Secure-3PSID=PLACEHOLDER; HSID=PLACEHOLDER; SSID=PLACEHOLDER; APISID=PLACEHOLDER; SAPISID=PLACEHOLDER"
+}

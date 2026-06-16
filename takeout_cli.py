@@ -1112,6 +1112,12 @@ def _build_parts_from_payloads(payloads: list[TakeoutPayload],
             "size": size,
             "have": have,
         })
+    # Order smallest-first so the fastest parts finish first and the
+    # parallel pool (aria2c -j N) consumes them in size order. ``num``
+    # stays tied to the part's ``i=`` identity; only the list (feed)
+    # order changes. Unknown sizes (0) sort to the end so known-small
+    # parts lead.
+    parts.sort(key=lambda p: (p["size"] == 0, p["size"]))
     return parts
 
 
@@ -1602,6 +1608,11 @@ def discover_parts(payload: TakeoutPayload, output_dir: Path,
         info(f"   {num:03d}  {human_size(size) if size else 'unknown':>10}  "
              f"{'have' if have else 'need'}")
 
+    # Feed smallest-first so the fastest parts finish first and the
+    # parallel pool (aria2c -j N) starts them in size order. ``num`` keeps
+    # the part's probe identity; only list (feed) order changes. Unknown
+    # sizes (0) sort last so known-small parts lead.
+    parts.sort(key=lambda p: (p["size"] == 0, p["size"]))
     return parts
 
 

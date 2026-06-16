@@ -2148,3 +2148,96 @@ def test_adaptive_parallelism_reduces_to_1(monkeypatch, tmp_path):
         f"Expected parallel to be reduced to 1, got {args.parallel}"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Production path: v2 multi-payload from the extension's "Copy ALL exports"
+# ---------------------------------------------------------------------------
+def _multi_fixture_text():
+    return (ROOT / "tests" / "fixtures" / "sample_multi_payload.json").read_text()
+
+
+def test_v2_multi_payload_parses_to_parts_mode(monkeypatch):
+    """The extension's v2 multi-payload (archiveId + expectedParts ==
+    len(exports)) must be recognised as 'parts' mode — one batch whose
+    URLs are its parts — NOT as separate 'batches' and NOT as a single
+    export needing probe-based discovery."""
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_multi_fixture_text() + "\n"))
+    payload, ctx = takeout_cli.parse_one_payload()
+    assert ctx["mode"] == "parts", f"expected parts mode, got {ctx['mode']}"
+    assert ctx["meta"].expectedParts == 5
+    assert ctx["meta"].archiveId
+    assert len(ctx["all_payloads"]) == 5
+
+
+def test_v2_multi_payload_builds_sorted_parts(tmp_path):
+    """parts mode must build all 5 parts directly from the payload (no
+    network probe) and feed them smallest-first so the parallel pool
+    finishes quick parts early."""
+    from takeout_payload import parse_multi_payload_meta
+    payloads, meta = parse_multi_payload_meta(_multi_fixture_text())
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+
+    assert len(parts) == 5
+    # Every part has a unique on-disk filename (so aria2c -j N can't race
+    # five writers onto one file).
+    names = [p["filename"] for p in parts]
+    assert len(set(names)) == 5, f"filenames not unique: {names}"
+
+    # Feed order is smallest-first (known sizes ascending). The fixture
+    # sizes (bytes) are deliberately out of order in the payload.
+    known = [p["size"] for p in parts if p["size"] > 0]
+    assert known == sorted(known), f"parts not smallest-first: {known}"
+
+
+def test_v2_multi_payload_resume_marks_have(tmp_path):
+    """A part already present on disk at >= its known size is marked
+    have=True so resume skips it."""
+    from takeout_payload import parse_multi_payload_meta
+    payloads, meta = parse_multi_payload_meta(_multi_fixture_text())
+    # Pre-create the smallest part on disk at full size.
+    smallest_i = min(meta.sizes, key=lambda k: meta.sizes[k])
+    parts_preview = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    target = next(p for p in parts_preview
+                  if p["num"] == smallest_i + 1)
+    (tmp_path / target["filename"]).write_bytes(b"\x00" * target["size"])
+
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    have = [p for p in parts if p["have"]]
+    assert any(p["filename"] == target["filename"] for p in have), (
+        "pre-existing full-size part should be marked have=True"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parts mode feeds smallest-first (size ordering)
+# ---------------------------------------------------------------------------
+def test_build_parts_from_payloads_sorts_smallest_first(tmp_path):
+    """`parts` mode must hand aria2c the parts ordered smallest->biggest so
+    the fast parts finish first. `num` stays tied to the i= identity;
+    only feed order changes. Unknown sizes (0) sort last."""
+    from takeout_payload import parse_multi_payload_meta
+    payload_json = json.dumps({
+        "schema": 2,
+        "multi": True,
+        "archiveId": "abc-123",
+        "expectedParts": 4,
+        "cookie": "SID=x; __Secure-1PSID=y",
+        "headers": {},
+        "exports": [
+            {"url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-1-001.zip?j=abc-123&i=0", "size": 800, "partIndex": 0},
+            {"url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-1-001.zip?j=abc-123&i=1", "size": 100, "partIndex": 1},
+            {"url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-1-001.zip?j=abc-123&i=2", "size": 0, "partIndex": 2},
+            {"url": "https://takeout-download.usercontent.google.com/download/takeout-20260612T190148Z-1-001.zip?j=abc-123&i=3", "size": 400, "partIndex": 3},
+        ],
+    })
+    payloads, meta = parse_multi_payload_meta(payload_json)
+    parts = takeout_cli._build_parts_from_payloads(payloads, meta, tmp_path)
+    sizes = [p["size"] for p in parts]
+    # Known sizes ascending, unknown (0) last.
+    assert sizes == [100, 400, 800, 0], sizes
+    # num must still map to the i= identity (1-based), not the feed pos.
+    by_size = {p["size"]: p["num"] for p in parts}
+    assert by_size[100] == 2  # i=1 -> num 2
+    assert by_size[800] == 1  # i=0 -> num 1
+    assert by_size[400] == 4  # i=3 -> num 4

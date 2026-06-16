@@ -65,6 +65,7 @@ except Exception:
 
 from takeout import extract_url_parts, validate_output_dir, DEFAULT_OUTPUT_DIR, VERSION
 from takeout_payload import parse_payload, parse_multi_payload, parse_multi_payload_meta, TakeoutPayload, MultiPayloadMeta, REQUIRED_COOKIE_MARKERS
+from takeout_downloader import InternalDownloader, PartProgress
 
 
 # ===========================================================================
@@ -1968,6 +1969,93 @@ def _render_file_row(render: TermRender, filename: str, done: int,
     render.update_row(f"file:{filename}", row)
 
 
+def _eta_str(done: int, total: int, speed_bps: float) -> str:
+    """Human ETA from remaining bytes and current speed. '-' when unknown."""
+    if speed_bps <= 0 or total <= 0 or done >= total:
+        return "-"
+    secs = int((total - done) / speed_bps)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+# ===========================================================================
+# Internal downloader driver (replaces aria2c)
+# ===========================================================================
+def run_internal(parts: list[dict], payload: TakeoutPayload, output_dir: Path,
+                 parallel: int, render: "TermRender | None" = None) -> dict:
+    """Download the parts that still need fetching using the in-process
+    :class:`InternalDownloader`, driving the live grid (when ``render`` is
+    given) from the downloader's exact byte counters.
+
+    Returns a dict ``{"auth_failed": bool, "auth_body": bytes,
+    "auth_url": str, "failed": [num,...]}`` so the caller's retry/re-prompt
+    loop can react the same way it did to aria2c's exit code.
+
+    Unlike the aria2c path, progress here does NOT depend on stdout being a
+    TTY: the grid is fed from in-process counters, and when there's no grid
+    we emit periodic one-line status logs so SSH/Docker/piped runs still
+    show movement.
+    """
+    from takeout_downloader import InternalDownloader
+
+    need = [p for p in parts if not p["have"]]
+    if not need:
+        return {"auth_failed": False, "auth_body": b"", "auth_url": "", "failed": []}
+
+    num_by_filename = {p["filename"]: p["num"] for p in parts}
+    size_by_filename = {p["filename"]: p["size"] for p in parts}
+
+    dl = InternalDownloader(
+        cookie=payload.cookie,
+        headers=payload.headers,
+        output_dir=output_dir,
+        parallel=parallel,
+        logger=log,
+    )
+
+    # Non-TTY fallback: throttle a plain one-line summary so piped/SSH runs
+    # still see progress instead of dead silence.
+    last_log = [0.0]
+
+    def on_progress(snapshot) -> None:
+        if render is not None and getattr(render, "enabled", False):
+            for pp in snapshot:
+                if pp.status == "done":
+                    render.clear_row(f"file:{pp.filename}")
+                    continue
+                if pp.status in ("queued",) and pp.done == 0:
+                    # Leave queued rows blank-ish but present.
+                    pass
+                eta = _eta_str(pp.done, pp.total, pp.speed_bps)
+                _render_file_row(render, pp.filename, pp.done, pp.total,
+                                 pp.pct, int(pp.speed_bps), eta,
+                                 size_by_filename, num_by_filename)
+        else:
+            now = time.monotonic()
+            if now - last_log[0] < 2.0:
+                return
+            last_log[0] = now
+            done_n = sum(1 for pp in snapshot if pp.status == "done")
+            active = [pp for pp in snapshot if pp.status == "active"]
+            got = sum(pp.done for pp in snapshot)
+            tot = sum(pp.total for pp in snapshot) or 0
+            spd = sum(pp.speed_bps for pp in active)
+            info(f"  {done_n}/{len(snapshot)} done | {len(active)} active | "
+                 f"{human_size(got)}/{human_size(tot)} | {human_size(int(spd))}/s")
+
+    result = dl.download(need, on_progress=on_progress)
+
+    return {
+        "auth_failed": result.auth_failed,
+        "auth_body": result.auth_body,
+        "auth_url": result.auth_url,
+        "failed": result.failed,
+    }
+
+
 # ===========================================================================
 # Verification — size + ZIP signature
 # ===========================================================================
@@ -2104,6 +2192,13 @@ def main() -> int:
     parser.add_argument("--no-color", dest="no_color", action="store_true",
                         help="disable ANSI colors (same as NO_COLOR=1); "
                              "useful for logs, pipes, and dumb terminals")
+    parser.add_argument("--engine", dest="engine",
+                        choices=("internal", "aria2c"),
+                        default=os.environ.get("TAKEOUT_ENGINE", "internal"),
+                        help="download engine: 'internal' (in-process, exact "
+                             "live progress, no external binary; default) or "
+                             "'aria2c' (legacy subprocess, needs aria2c on "
+                             "PATH)")
     args = parser.parse_args()
 
     # Honor --no-color by flipping the module-level color switch the
@@ -2155,8 +2250,9 @@ def main() -> int:
     info(f"Working dir: {Path.cwd()}")
     info(f"Output directory: {output_dir}")
 
-    if not detect_aria2c():
-        err("aria2c not found on PATH. Install it (apt install aria2) and retry.")
+    if args.engine == "aria2c" and not detect_aria2c():
+        err("aria2c not found on PATH. Install it (apt install aria2) and "
+            "retry, or use the default --engine internal (no binary needed).")
         return 2
 
     header(f"Google Takeout Downloader v{VERSION} — paste, go.")
@@ -2538,20 +2634,31 @@ def _download_one_batch(payload: TakeoutPayload,
     def footer_line() -> str:
         return ""
 
+    engine = getattr(args, "engine", "internal")
     while need:
         attempt += 1
         if use_grid:
             render.set_header(header_line())
         else:
             header(f"Downloading {len(need)} parts — pass {attempt} "
-                   f"(aria2c, {args.parallel} concurrent)")
-        body = build_aria2_input(parts, payload, output_dir)
-        rc = run_aria2c(body, output_dir, args.parallel,
-                        render=render if use_grid else None,
-                        parts=parts)
-        if rc != 0:
-            warn(f"aria2c exited with code {rc} "
-                 f"(some files may have failed).")
+                   f"({engine}, {args.parallel} concurrent)")
+
+        auth_challenge_body = b""
+        auth_challenge_url = ""
+        if engine == "aria2c":
+            body = build_aria2_input(parts, payload, output_dir)
+            rc = run_aria2c(body, output_dir, args.parallel,
+                            render=render if use_grid else None,
+                            parts=parts)
+            if rc != 0:
+                warn(f"aria2c exited with code {rc} "
+                     f"(some files may have failed).")
+        else:
+            res = run_internal(parts, payload, output_dir, args.parallel,
+                               render=render if use_grid else None)
+            if res["auth_failed"]:
+                auth_challenge_body = res["auth_body"]
+                auth_challenge_url = res["auth_url"]
 
         complete, incomplete = verify_parts(parts, output_dir)
         if use_grid:
@@ -2569,7 +2676,7 @@ def _download_one_batch(payload: TakeoutPayload,
 
         if not looks_like_auth_failure(parts, incomplete):
             warn(f"{len(incomplete)} parts still incomplete; "
-                 f"retrying in place (aria2c -c resumes).")
+                 f"retrying in place (resume continues from on-disk bytes).")
             if attempt >= 5:
                 warn("5 retries exhausted; giving up on these parts:")
                 for p in incomplete[:10]:
@@ -2597,12 +2704,19 @@ def _download_one_batch(payload: TakeoutPayload,
         # Cookie likely expired, or sequential download also failed.
         warn(f"{len(incomplete)} parts still incomplete; "
              "cookie likely expired mid-run.")
+        # Save the captured sign-in HTML (internal engine grabs the first
+        # bytes of the challenge) so the user can inspect what Google sent.
+        if auth_challenge_body:
+            saved = _save_auth_challenge_body(
+                auth_challenge_body, auth_challenge_url or "(unknown)",
+                output_dir, ctype="text/html", status=0)
+            info(f"Saved sign-in challenge page to {saved}")
         for p in incomplete[:10]:
             info(f"   {p['num']:03d}  {p['filename']}")
         if len(incomplete) > 10:
             info(f"   ... and {len(incomplete) - 10} more")
         info("Re-capture in your browser, then paste the new JSON. "
-             "aria2c -c will resume the partials.")
+             "Resume continues from the partials already on disk.")
         auth_failures += 1
         if auth_failures > MAX_AUTH_REPROMPTS:
             err(f"Auth still failing after {MAX_AUTH_REPROMPTS} attempts. "

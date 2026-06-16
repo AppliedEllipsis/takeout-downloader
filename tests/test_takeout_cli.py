@@ -1935,7 +1935,7 @@ def test_auth_failures_initialized_in_parts_mode(monkeypatch, tmp_path):
     args = argparse.Namespace(fresh=False, parallel=1, max_parts=10,
                                reset_config=False, output_dir=str(tmp_path),
                                relay=False, tunnel=False,
-                               relay_timeout=600)
+                               relay_timeout=600, engine="aria2c")
     monkeypatch.setattr(takeout_cli, "args", args, raising=False)
     # The first iteration should NOT raise UnboundLocalError; it
     # should at least reach the ``looks_like_auth_failure`` branch
@@ -2215,6 +2215,7 @@ def test_adaptive_parallelism_reduces_to_1(monkeypatch, tmp_path):
     args = argparse.Namespace(
         parallel=5, max_parts=500, fresh=False,
         output_dir=str(tmp_path), verbose=0, version=False,
+        engine="aria2c",
     )
 
     rc = takeout_cli._download_one_batch(

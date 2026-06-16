@@ -48,6 +48,7 @@ COPY takeout.py \
      aria2c_integration.py \
      dedupe_takeout.py \
      takeout_cli.py \
+     takeout_downloader.py \
      takeout_cli_analyze.py \
      paste_server.py ./
 

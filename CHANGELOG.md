@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.0] — Containers run live source from /work (git pull, no rebuild)
+
+### Changed
+
+- **Both compose services now run the live source bind-mounted at `/work`**
+  instead of the copy baked into the image at `/app`. The repo is already
+  mounted (`.:/work`); the entrypoints now point there
+  (`working_dir: /work`, `entrypoint: ["python", "-u", "/work/takeout_cli.py"]`).
+
+  Why: the image bakes the code in at build time, so `docker compose run`
+  kept executing stale code until someone remembered to
+  `docker compose build`. Repeated field reports showed the server running
+  old code (old output-dir prompt, pre-flood-fix grid) because the rebuild
+  step was missed. Running from `/work` means a host-side
+  `git pull` (or `git reset --hard origin/main`) updates the running code
+  immediately — **no rebuild needed for a code change**. Python dependencies
+  are still installed system-wide in the image, so only a dependency change
+  requires `docker compose build`.
+
+- The standalone `Dockerfile` is unchanged and still works for plain
+  `docker run`; compose simply overrides its entrypoint (as it already did).
+
 ## [6.7.2] — Single-scandir part snapshot (no more multi-minute pre-download stall)
 
 ### Fixed

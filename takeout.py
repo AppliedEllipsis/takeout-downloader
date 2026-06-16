@@ -46,7 +46,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "6.7.2"
+VERSION = "6.8.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "10"))
 MAX_PARALLEL = 20

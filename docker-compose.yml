@@ -2,11 +2,10 @@
 #
 # TWO SERVICES, ONE PROFILE:
 #
-#   takeout-cli  (default)  terminal-native aria2c CLI — recommended for SSH
+#   takeout-cli  (default)  terminal-native CLI — recommended for SSH
 #                          /tmux/Docker chains. Paste a JSON payload when
-#                          prompted; aria2c handles the rest.
+#                          prompted; the in-process downloader handles the rest.
 #
-#                          docker compose build
 #                          docker compose run --rm takeout-cli
 #
 #   takeout     (profile: tui)  Textual TUI with progress bars, queue
@@ -14,11 +13,17 @@
 #                               SSH+tmux+brackets-paste; kept for users who
 #                               prefer a UI on a local terminal.
 #
-#                          docker compose build
 #                          docker compose --profile tui run --rm takeout
 #
 # Both services are INTERACTIVE: do NOT start with `up -d`. Use `run` so
 # Docker attaches your terminal to them.
+#
+# UPDATING THE CODE
+# -----------------
+# Both services run the LIVE source bind-mounted at /work, NOT the copy baked
+# into the image. So to update after a `git pull`, you do NOTHING extra — the
+# next `docker compose run` picks up the new code. You only need
+# `docker compose build` when requirements.txt (Python deps) changes.
 #
 # WHERE FILES LAND
 # ----------------
@@ -131,6 +136,11 @@ services:
           propagation: rslave
           recursive: enabled
 
+    # Run the live source from the /work bind-mount (not the image's /app
+    # copy) so a host `git pull` updates the running code with no rebuild.
+    working_dir: /work
+    entrypoint: ["python", "-u", "/work/takeout.py"]
+
   # CLI variant — same image, no terminal UI. Drop in.json into the output dir
   # (or pipe via stdin) and aria2c takes over with native progress output.
   # This is the recommended path for SSH->tmux->Docker chains where Textual's
@@ -172,4 +182,11 @@ services:
         bind:
           propagation: rslave
           recursive: enabled
-    entrypoint: ["python", "-u", "takeout_cli.py"]
+    # Run the LIVE source mounted at /work, not the copy baked into the image
+    # at build time. This means `git pull` on the host updates the running
+    # code immediately -- no `docker compose build` needed for a code change.
+    # (Dependencies are installed system-wide in the image, so /work just
+    # needs the .py files, which the `.:/work` mount provides.) Rebuild is
+    # only needed when requirements.txt or the Dockerfile itself changes.
+    working_dir: /work
+    entrypoint: ["python", "-u", "/work/takeout_cli.py"]

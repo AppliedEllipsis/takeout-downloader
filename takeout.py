@@ -46,7 +46,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "6.8.4"
+VERSION = "6.8.5"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
 

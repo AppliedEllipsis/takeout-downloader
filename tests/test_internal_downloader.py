@@ -213,3 +213,54 @@ def test_per_part_start_and_done_are_logged(server, tmp_path):
     dones = [m for m in records if " done: " in m]
     assert len(starts) == 3, f"expected 3 start lines, got {starts}"
     assert len(dones) == 3, f"expected 3 done lines, got {dones}"
+
+
+def test_sequential_parts_reuse_one_connection(tmp_path):
+    """The single-stream path (parallel=1) must reuse one TCP/TLS
+    connection across sequential parts via a per-worker requests.Session,
+    not open a fresh connection per part. This is the connection-reuse win
+    that matters when downloading hundreds of parts one stream at a time."""
+    import http.server
+    import socketserver
+
+    conns = {"n": 0}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keep-alive
+
+        def setup(self):
+            super().setup()
+            conns["n"] += 1  # one count per accepted TCP connection
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = b"PK\x03\x04" + os.urandom(60_000)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        parts = [{"num": i, "url": f"{base}/p{i}.zip",
+                  "filename": f"p{i:03d}.zip", "size": 60_004, "have": False}
+                 for i in range(1, 7)]
+        dl = D.InternalDownloader(
+            cookie="SID=x", headers={"User-Agent": "test"},
+            output_dir=tmp_path, parallel=1, retry_wait=0.1, max_tries=2)
+        res = dl.download(parts, on_progress=lambda s: None)
+        assert res.ok
+        assert len(res.completed) == 6
+        # One worker (parallel=1) -> one Session -> one connection for all 6.
+        assert conns["n"] == 1, (
+            f"expected 1 reused connection for 6 sequential parts, "
+            f"got {conns['n']}")
+    finally:
+        srv.shutdown()

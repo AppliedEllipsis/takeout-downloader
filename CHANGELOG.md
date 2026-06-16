@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [6.8.5] — Connection reuse across sequential parts
+
+### Changed
+
+- **Per-worker `requests.Session`**: the internal downloader now reuses one
+  TCP/TLS connection across all the parts a worker handles, instead of
+  opening a fresh connection (and full TLS handshake) per part. For the
+  single-stream default this means 290 sequential parts share one
+  connection rather than performing 290 handshakes — a measurable win on a
+  high-latency link. The session is closed cleanly when the worker exits.
+
 ## [6.8.4] — Single-stream by default (fixes the "1 active | 0 B/s" hang)
 
 ### Fixed

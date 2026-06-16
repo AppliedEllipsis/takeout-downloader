@@ -271,13 +271,24 @@ class InternalDownloader:
 
     # -- worker ------------------------------------------------------------
     def _worker(self, work: "queue.Queue[dict]", result: DownloadResult) -> None:
+        # One Session per worker, reused across every part this worker
+        # pulls. On the single-stream path (290 sequential parts to the
+        # same Google host) this keeps the TLS connection alive between
+        # parts instead of paying a fresh handshake each time.
+        session = requests.Session()
+        try:
+            self._worker_loop(work, result, session)
+        finally:
+            session.close()
+
+    def _worker_loop(self, work, result, session) -> None:
         while not self._stop.is_set():
             try:
                 part = work.get_nowait()
             except queue.Empty:
                 return
             try:
-                self._download_one(part)
+                self._download_one(part, session)
                 with self._lock:
                     result.completed.append(part["num"])
             except AuthChallenge as e:
@@ -296,13 +307,17 @@ class InternalDownloader:
             finally:
                 work.task_done()
 
-    def _download_one(self, part: dict) -> None:
+    def _download_one(self, part: dict, session=None) -> None:
         """Download a single part with Range resume and live byte counting.
 
         Retries transient network errors up to ``max_tries``, reconnecting
         with a fresh Range from wherever the on-disk file stopped. An auth
         challenge is NOT retried — it raises immediately so the pool stops.
+
+        ``session`` is the per-worker ``requests.Session`` (connection reuse);
+        falls back to the module-level ``requests`` if not supplied.
         """
+        getter = session or requests
         num = part["num"]
         dest = self.output_dir / part["filename"]
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +340,8 @@ class InternalDownloader:
                 return
 
             try:
-                self._stream_to_disk(num, dest, part["url"], existing, total_known)
+                self._stream_to_disk(num, dest, part["url"], existing,
+                                     total_known, getter)
                 # Success: mark done using the final on-disk size.
                 final = dest.stat().st_size if dest.exists() else 0
                 self._set(num, done=final,
@@ -350,17 +366,20 @@ class InternalDownloader:
         raise RuntimeError(last_err or "exhausted retries")
 
     def _stream_to_disk(self, num: int, dest: Path, url: str,
-                        existing: int, total_known: int) -> None:
+                        existing: int, total_known: int, getter=None) -> None:
         """One GET attempt. Streams to ``dest`` resuming from ``existing``
-        bytes. Raises AuthChallenge if the first bytes look like HTML."""
+        bytes. Raises AuthChallenge if the first bytes look like HTML.
+
+        ``getter`` is the per-worker Session (or module ``requests``)."""
+        getter = getter or requests
         headers = dict(self.headers)
         headers["Cookie"] = self.cookie
         resume = existing > 0
         if resume:
             headers["Range"] = f"bytes={existing}-"
 
-        with requests.get(url, headers=headers, stream=True,
-                          timeout=self.timeout, allow_redirects=True) as resp:
+        with getter.get(url, headers=headers, stream=True,
+                        timeout=self.timeout, allow_redirects=True) as resp:
             final_host = resp.url.split("/")[2] if "://" in resp.url else ""
             ctype = resp.headers.get("content-type", "").lower()
 

@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -100,9 +101,18 @@ log = logging.getLogger("takeout_cli")
 class TermRender:
     """Fixed-area terminal display with control-char redraws.
 
-    Owns a region of the screen starting at `start_row`. Every draw() call
-    clears the previous content with \\x1b[K (erase to EOL) on each line and
-    emits the new state. No flicker.
+    Uses *relative* cursor positioning: the grid is printed once wherever
+    the cursor happens to be (i.e. right after whatever log output came
+    before it), and every subsequent redraw moves the cursor UP by the
+    number of lines last drawn, then rewrites each line clearing to EOL
+    (\\x1b[K). This means the grid anchors itself to the surrounding log
+    flow instead of jumping to an absolute screen row — so it never
+    collides with scrolled-up log lines, and it survives terminal resize
+    because no absolute coordinates are baked in.
+
+    Every emitted line is hard-truncated to the current terminal width so
+    a narrowed terminal can never wrap a row (a wrapped row would occupy
+    two physical lines and desync the move-up count, corrupting the grid).
 
     Header line: live status (downloads active, total done, ETA, throughput).
     Body: one row per file, with progress bar + bytes + speed + ETA.
@@ -114,22 +124,59 @@ class TermRender:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled and sys.stdout.isatty()
-        self.start_row: int = 0
         self.body_rows: int = 0
+        self.requested_rows: int = 0
         self.last_drawn_lines: int = 0
         self.header: str = ""
         self.rows: list[str] = []
         self.footer: str = ""
+        self.drawn: bool = False
+        self._resized: bool = False
+        self._prev_sigwinch = None
         # Track which file is on which row so we can keep redrawing.
         self._row_keys: list[str] = []
 
+    # -- terminal geometry -------------------------------------------------
+    @staticmethod
+    def _term_size() -> tuple[int, int]:
+        try:
+            sz = shutil.get_terminal_size((100, 24))
+            return max(20, sz.columns), max(6, sz.lines)
+        except (OSError, ValueError):
+            return 100, 24
+
+    def _max_body_rows(self) -> int:
+        """How many file rows fit, leaving room for header + footer + a
+        prompt line below the grid."""
+        _, lines = self._term_size()
+        return max(1, lines - 3)
+
+    def _on_resize(self, *_args) -> None:
+        # Signal handler: just flag it. The next redraw repaints with the
+        # new geometry. Doing real work in a signal handler is unsafe.
+        self._resized = True
+
     def begin(self, n_rows: int) -> None:
-        """Reserve `n_rows` body rows. Call once after discovery."""
+        """Reserve `n_rows` body rows. Call once after discovery. The row
+        count is clamped to what fits on screen; if there are more parts
+        than rows, the overflow shares the last row (best-effort)."""
         if not self.enabled:
             return
-        self.body_rows = n_rows
-        self.rows = [""] * n_rows
-        self._row_keys = [""] * n_rows
+        self.requested_rows = n_rows
+        self.body_rows = min(n_rows, self._max_body_rows())
+        self.rows = [""] * self.body_rows
+        self._row_keys = [""] * self.body_rows
+        self.drawn = False
+        # Install a SIGWINCH handler where the platform supports it
+        # (POSIX). Windows has no SIGWINCH; per-redraw geometry checks
+        # still adapt the bar width, just without instant repaint.
+        if hasattr(signal, "SIGWINCH"):
+            try:
+                self._prev_sigwinch = signal.signal(signal.SIGWINCH,
+                                                     self._on_resize)
+            except (ValueError, OSError):
+                # Not in the main thread, or unsupported — degrade quietly.
+                self._prev_sigwinch = None
 
     def set_header(self, text: str) -> None:
         self.header = text
@@ -138,6 +185,25 @@ class TermRender:
     def set_footer(self, text: str) -> None:
         self.footer = text
         self._redraw()
+
+    def _reflow_for_resize(self) -> None:
+        """Re-clamp the visible row count when the terminal was resized.
+        Keeps existing row->key assignments; only grows/shrinks the slot
+        list. Called lazily from _redraw when the resize flag is set."""
+        new_max = self._max_body_rows()
+        target = min(self.requested_rows, new_max)
+        if target == self.body_rows:
+            return
+        if target > self.body_rows:
+            self.rows.extend([""] * (target - self.body_rows))
+            self._row_keys.extend([""] * (target - self.body_rows))
+        else:
+            self.rows = self.rows[:target]
+            self._row_keys = self._row_keys[:target]
+        self.body_rows = target
+        # Force a clean repaint: the block height changed, so the old
+        # move-up count is stale. Start fresh on the next write.
+        self.drawn = False
 
     def update_row(self, key: str, content: str) -> None:
         """Update one row by key. Re-uses the same screen line across
@@ -176,41 +242,58 @@ class TermRender:
     def _redraw(self) -> None:
         if not self.enabled:
             return
+        if self._resized:
+            self._resized = False
+            self._reflow_for_resize()
+        cols, _ = self._term_size()
+        lines = [self.header] + self.rows + [self.footer]
         out = []
-        # Save cursor, move to start_row, clear lines, write new content,
-        # restore cursor.
-        out.append("\x1b[s")                    # save cursor
-        out.append(f"\x1b[{self.start_row + 1};1H")  # move to start
-        out.append(self._format_line(self.header))
-        for row in self.rows:
-            out.append(self._format_line(row))
-        out.append(self._format_line(self.footer))
-        out.append("\x1b[u")                    # restore cursor
-        # Track height so the caller can position their prompt below us.
-        self.last_drawn_lines = 1 + self.body_rows + 1
+        # Move the cursor back up to the top of our block (relative), so we
+        # overwrite in place instead of scrolling. On the very first draw
+        # there is nothing to move over.
+        if self.drawn and self.last_drawn_lines:
+            out.append(f"\x1b[{self.last_drawn_lines}A")
+        for ln in lines:
+            out.append(self._format_line(ln, cols))
+        self.last_drawn_lines = len(lines)
+        self.drawn = True
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
     @staticmethod
-    def _format_line(text: str) -> str:
-        # Erase to EOL, write text, then move to next line.
-        if not text:
-            return "\x1b[K\n"
+    def _format_line(text: str, cols: int) -> str:
+        # Hard-truncate to the terminal width so a row can never wrap onto
+        # a second physical line (which would desync the move-up count).
+        # Reserve 1 column so the cursor sitting at EOL doesn't auto-wrap.
+        if text:
+            text = text[: max(0, cols - 1)]
+        # Erase to EOL (clears leftover chars from a previous longer line),
+        # write text, advance to next line.
         return f"\x1b[K{text}\n"
 
     def reserve_lines_below(self) -> int:
-        """After we're done redrawing, the cursor is somewhere inside our
-        region. Caller needs to scroll past us before printing more text.
-        Returns how many newlines are needed."""
+        """After a redraw the cursor sits just below our block already
+        (we end every line with \\n). Nothing extra to scroll; return the
+        block height for callers that want to know it."""
         if not self.enabled:
             return 0
-        sys.stdout.write("\n" * (1 + self.body_rows + 1))
         sys.stdout.flush()
-        return 1 + self.body_rows + 1
+        return self.last_drawn_lines
 
     def teardown(self) -> None:
-        """Move the cursor below our region so subsequent logs don't overwrite."""
-        self.reserve_lines_below()
+        """Restore the SIGWINCH handler and leave the cursor below our
+        region so subsequent logs don't overwrite the final grid state."""
+        if not self.enabled:
+            return
+        if hasattr(signal, "SIGWINCH") and self._prev_sigwinch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, self._prev_sigwinch)
+            except (ValueError, OSError):
+                pass
+            self._prev_sigwinch = None
+        # Cursor is already below the block (last redraw ended with \n per
+        # line). Nothing more to emit.
+        sys.stdout.flush()
 
 
 def make_progress_bar(pct: float, width: int = 24) -> str:
@@ -1672,6 +1755,31 @@ def _aria2_unit_to_bytes(n_str: str, unit: str | None) -> int:
     return int(n * mult)
 
 
+# Matches aria2c's per-download path line, emitted right after each
+# download's progress line in the periodic summary:
+#   FILE: /downloads/takeout-20260612T190148Z-15-001.zip
+_ARIA2_FILE_RE = re.compile(r"^FILE:\s*(.+?)\s*$")
+
+
+def _flush_buffered_progress(gid: str,
+                             gid_state: dict,
+                             gid_to_filename: dict,
+                             filename_to_size: dict,
+                             num_by_filename: dict,
+                             render: TermRender) -> None:
+    """Render the last buffered progress sample for ``gid`` now that its
+    filename is known. No-op if there's nothing buffered."""
+    filename = gid_to_filename.get(gid)
+    if not filename:
+        return
+    st = gid_state.get(gid)
+    if not st:
+        return
+    _render_file_row(render, filename, st.get("done", 0), st.get("total", 0),
+                     st.get("pct", 0), st.get("speed", 0), st.get("eta", ""),
+                     filename_to_size, num_by_filename)
+
+
 def _update_from_aria2_line(line: str,
                             gid_state: dict,
                             gid_to_filename: dict,
@@ -1679,12 +1787,26 @@ def _update_from_aria2_line(line: str,
                             filename_to_size: dict,
                             num_by_filename: dict,
                             render: TermRender) -> None:
-    """Translate one aria2c stdout line into a grid row update."""
+    """Translate one aria2c stdout line into a grid row update.
+
+    Real aria2c (verified against 1.35.0) emits its periodic summary as
+    pairs of lines, one pair per active download::
+
+        [#GID 16KiB/28MiB(0%) CN:1 DL:15KiB ETA:30m48s]
+        FILE: /downloads/takeout-...-001.zip
+
+    The progress ``[#GID ...]`` line carries the live numbers but NOT the
+    filename; the ``FILE:`` line that immediately follows carries the
+    filename but NOT the GID. So we bind GID->filename by remembering the
+    GID from the most recent progress line and attaching it to the next
+    ``FILE:`` line. The terminal ``Download Results:`` block (printed only
+    after everything finishes) is used as a backstop for final status.
+
+    ``gid_state['_last_gid']`` holds the most-recent progress GID across
+    calls (the caller passes the same ``gid_state`` dict on every line).
+    """
     # Detect the "Downloading" announcement, which gives us the filename.
     if line.startswith("Downloading"):
-        # aria2 prints e.g. "[#abc 411.6MiB/8.0GiB(0%) CN:1 DL:0B]" but also
-        # the path on a separate line. We rely on the per-file summary
-        # block that comes later. Skip for now.
         return
     if line.startswith("[#"):
         m = _ARIA2_PROGRESS_RE.search(line)
@@ -1696,29 +1818,51 @@ def _update_from_aria2_line(line: str,
         pct = int(m.group(6))
         speed_bps = _aria2_unit_to_bytes(m.group(7), m.group(8))
         eta = m.group(9) or ""
-        # Look up filename for this GID. If unknown, defer the update.
+        # Always buffer the latest sample so the FILE: line (or a late
+        # GID binding) can render it.
+        gid_state[gid] = {
+            "done": done, "total": total, "pct": pct,
+            "speed": speed_bps, "eta": eta,
+        }
+        # Remember this GID so the FILE: line that follows can bind it.
+        gid_state["_last_gid"] = gid
         filename = gid_to_filename.get(gid)
         if not filename:
-            # Heuristic: keep state so we can fill in once we know filename.
-            gid_state[gid] = {
-                "done": done, "total": total, "pct": pct,
-                "speed": speed_bps, "eta": eta,
-            }
+            # Filename not known yet — the FILE: line right after this
+            # will bind it and flush the buffered sample.
             return
         _render_file_row(render, filename, done, total, pct,
                          speed_bps, eta, filename_to_size,
                          num_by_filename)
         return
-    # aria2c downloads use one-line summaries like:
-    #   [#abc 50MiB/100MiB(50%) CN:1 DL:50MiB ETA:1m]     (live)
-    # When --download-result=full, on completion:
-    #   Download Results:
+    # FILE: path line — binds the most-recent progress GID to a filename
+    # *during* the download, so the grid updates live instead of only at
+    # the end.
+    mf = _ARIA2_FILE_RE.match(line)
+    if mf:
+        path = mf.group(1).strip()
+        basename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        # Ignore non-archive paths aria2c may print (e.g. .aria2 control).
+        if not basename or basename.endswith(".aria2"):
+            return
+        last_gid = gid_state.get("_last_gid")
+        if last_gid and gid_to_filename.get(last_gid) != basename:
+            gid_to_filename[last_gid] = basename
+            filename_to_rowkey.setdefault(basename, f"file:{basename}")
+            _flush_buffered_progress(last_gid, gid_state, gid_to_filename,
+                                     filename_to_size, num_by_filename, render)
+        elif last_gid:
+            # Already bound; just refresh the row from the buffered sample.
+            _flush_buffered_progress(last_gid, gid_state, gid_to_filename,
+                                     filename_to_size, num_by_filename, render)
+        return
+    # Terminal "Download Results:" block (printed once at the very end):
     #   gid|stat|avg speed|path
     #   abc123|OK|  1.2MiB/s|./foo.zip
-    # ...
-    # We grep for the result row to bind GID -> filename once complete.
+    # Backstop for final status when the FILE: binding never arrived
+    # (e.g. an instant 404).
     m2 = re.search(
-        r"\b([0-9a-f]{4,16})\s*\|\s*(OK|ERR|WARN)\s*\|.*?\|\s*(.+?\.zip)\s*$",
+        r"\b([0-9a-f]{4,16})\s*\|\s*(OK|ERR|WARN)\s*\|.*?\|\s*(.+?\.(?:zip|tgz))\s*$",
         line)
     if m2:
         gid, status, filename = m2.group(1), m2.group(2), m2.group(3).strip()
@@ -1745,25 +1889,40 @@ def _render_file_row(render: TermRender, filename: str, done: int,
                      filename_to_size: dict, num_by_filename: dict) -> None:
     if total <= 0:
         total = filename_to_size.get(filename, 0)
-    # Adapt the progress bar width to the terminal so all five concurrent
-    # rows fit without clipping. Reserve 60 chars for the prefix
-    # (number, bar, percent, done/total, speed, ETA, separators) and
-    # give the rest to the filename. Falls back to 20 for unknown sizes.
+    # Build the row to FIT the terminal width so it can never wrap onto a
+    # second physical line (a wrapped row desyncs the redraw and corrupts
+    # the grid). Layout priority, narrow -> wide:
+    #   1. "#NNN <filename> [bar] PP%"   (always shown; bar shrinks 8..20)
+    #   2. " done/total"                  (added if it fits)
+    #   3. " speed"                       (added if it fits)
+    #   4. " ETA eta"                     (added if it fits)
+    # The filename and a >=8-char bar are protected; trailing columns are
+    # dropped first when space is tight.
     try:
-        term_width = shutil.get_terminal_size((100, 20)).columns
+        cols = shutil.get_terminal_size((100, 20)).columns
     except (OSError, ValueError):
-        term_width = 100
-    fixed_overhead = 60  # the part of the row that isn't the bar or filename
-    bar_width = max(8, min(20, term_width - fixed_overhead - len(filename)))
-    bar = make_progress_bar(pct, width=bar_width)
-    parts_str = human_size(done) + "/" + human_size(total) if total else human_size(done)
-    speed_str = human_size(speed_bps) + "/s" if speed_bps else "    -    "
-    eta_str = eta or "-"
+        cols = 100
+    cols = max(20, cols) - 1  # leave 1 col so EOL doesn't auto-wrap
+
     num = num_by_filename.get(filename, 0)
-    row = (
-        f"  #{num:03d}  {bar} {pct:3d}%  {parts_str:>20}  "
-        f"{speed_str:>10}  ETA {eta_str:>6}  {filename}"
-    )
+    parts_str = (human_size(done) + "/" + human_size(total)) if total else human_size(done)
+    speed_str = (human_size(speed_bps) + "/s") if speed_bps else "-"
+    eta_str = eta or "-"
+
+    prefix = f"  #{num:03d}  {filename}  "
+    pct_str = f" {pct:3d}%"
+    # How much room is left for the bar after the mandatory prefix+pct?
+    room_for_bar = cols - len(prefix) - len(pct_str)
+    bar_width = max(8, min(20, room_for_bar))
+    bar = make_progress_bar(pct, width=bar_width)
+
+    row = f"{prefix}{bar}{pct_str}"
+    # Append optional columns only while they fit.
+    for extra in (f"  {parts_str}", f"  {speed_str}", f"  ETA {eta_str}"):
+        if len(row) + len(extra) <= cols:
+            row += extra
+        else:
+            break
     render.update_row(f"file:{filename}", row)
 
 

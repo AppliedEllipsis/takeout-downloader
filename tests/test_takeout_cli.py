@@ -783,13 +783,15 @@ def test_term_render_update_row_writes_escape_sequence():
     try:
         r = takeout_cli.TermRender(enabled=True)
         r.begin(n_rows=3)
+        # First draw lays the block down; second redraws in place by moving
+        # the cursor UP (relative positioning, no absolute save/restore).
         r.update_row("file:a.zip", "row content for a")
+        r.update_row("file:a.zip", "row content for a v2")
         out = buf.getvalue()
-        # Should contain save-cursor, move-to-row, erase-EOL, restore-cursor.
-        assert "\x1b[s" in out
-        assert "\x1b[u" in out
+        # Erase-to-EOL on every line, and a relative cursor-up before redraw.
         assert "\x1b[K" in out
-        assert "row content for a" in out
+        assert "\x1b[" in out and "A" in out  # \x1b[<n>A cursor-up
+        assert "row content for a v2" in out
     finally:
         sys.stdout = real
 
@@ -1099,6 +1101,98 @@ def test_grid_render_buffers_progress_before_gid_known():
         out = buf.getvalue()
         # Should now contain the rendered row.
         assert "x.zip" in out
+    finally:
+        sys.stdout = real
+
+
+# ---------------------------------------------------------------------------
+# Real aria2c line order: progress line, then FILE: line (the bug fix)
+# ---------------------------------------------------------------------------
+def test_grid_binds_filename_from_FILE_line_during_download():
+    """Reproduces real aria2c 1.35.0 output order: each periodic summary
+    is a [#GID ...] progress line IMMEDIATELY FOLLOWED by a `FILE: path`
+    line. The grid must bind GID->filename from the FILE: line and render
+    the row live -- NOT wait for the terminal `Download Results:` block
+    (which only prints after everything finishes). This is the regression
+    that left every progress bar stuck at 'queued' until the very end.
+    """
+    import io
+    parts = [
+        {"num": 1, "filename": "takeout-001.zip", "size": 28 * 1024 ** 2,
+         "have": False, "url": "http://x/001.zip?i=0"},
+    ]
+    filename_to_size = {p["filename"]: p["size"] for p in parts}
+    num_by_filename = {p["filename"]: p["num"] for p in parts}
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=1)
+        gid_state = {}
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        # Exactly the order aria2c emits (verified against 1.35.0):
+        takeout_cli._update_from_aria2_line(
+            "[#859ca6 3.0MiB/28MiB(10%) CN:1 DL:1.5MiB ETA:16s]",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            filename_to_size, num_by_filename, r,
+        )
+        takeout_cli._update_from_aria2_line(
+            "FILE: C:/downloads/takeout-001.zip",
+            gid_state, gid_to_filename, filename_to_rowkey,
+            filename_to_size, num_by_filename, r,
+        )
+        out = buf.getvalue()
+        # The row must render LIVE (before any Download Results block).
+        assert "takeout-001.zip" in out
+        assert "10%" in out
+        assert "\u2588" in out  # progress bar drawn
+        # GID must be bound to the filename from the FILE: line.
+        assert gid_to_filename.get("859ca6") == "takeout-001.zip"
+    finally:
+        sys.stdout = real
+
+
+def test_grid_multi_file_FILE_line_binding():
+    """With -j>1, aria2c interleaves [#GID]/FILE: pairs for each active
+    download. Each progress GID must bind to the FILE: line that follows
+    it, so concurrent rows don't cross-bind."""
+    import io
+    parts = [
+        {"num": 1, "filename": "o1.zip", "size": 19 * 1024 ** 2,
+         "have": False, "url": "http://x/001.zip?i=0"},
+        {"num": 2, "filename": "o2.zip", "size": 19 * 1024 ** 2,
+         "have": False, "url": "http://x/001.zip?i=1"},
+    ]
+    filename_to_size = {p["filename"]: p["size"] for p in parts}
+    num_by_filename = {p["filename"]: p["num"] for p in parts}
+    buf = io.StringIO()
+    buf.isatty = lambda: True
+    real = sys.stdout
+    sys.stdout = buf
+    try:
+        r = takeout_cli.TermRender(enabled=True)
+        r.begin(n_rows=2)
+        gid_state = {}
+        gid_to_filename: dict[str, str] = {}
+        filename_to_rowkey: dict[str, str] = {}
+        feed = [
+            "[#c9502e 2.0MiB/19MiB(10%) CN:1 DL:1.0MiB ETA:16s]",
+            "FILE: C:/downloads/o1.zip",
+            "[#ce4448 4.0MiB/19MiB(21%) CN:1 DL:1.3MiB ETA:11s]",
+            "FILE: C:/downloads/o2.zip",
+        ]
+        for line in feed:
+            takeout_cli._update_from_aria2_line(
+                line, gid_state, gid_to_filename, filename_to_rowkey,
+                filename_to_size, num_by_filename, r,
+            )
+        assert gid_to_filename.get("c9502e") == "o1.zip"
+        assert gid_to_filename.get("ce4448") == "o2.zip"
+        out = buf.getvalue()
+        assert "o1.zip" in out and "o2.zip" in out
     finally:
         sys.stdout = real
 

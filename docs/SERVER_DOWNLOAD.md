@@ -195,3 +195,68 @@ archive data** with a `PK\x03\x04` header and no HTML — confirming the SOCKS
 approach resolves the auth problem. The internal downloader's HTML-rejection and
 Range-resume were verified with a local test harness (HTML response rejected and
 never written; real archive resumed to full size on the next pass).
+
+---
+
+## Important: `--max-exports` for large batches
+
+The default `--max-exports` is **50**. For multi-payloads the script trims the
+exports list to this cap, so a 290-part export stops at 50 unless you raise it:
+
+```bash
+python3 /tmp/takeout_dl.py \
+  --payload /tmp/payload.json \
+  --out /opt/storage.jfs002/google-takeout/braincreation \
+  --parallel 4 \
+  --max-exports 290
+```
+
+Set `--max-exports` to at least the part count from the Takeout page.
+
+---
+
+## Deployment (server)
+
+The repo is cloned on the server at:
+
+```
+/opt/storage.local_1/projects/takeout-downloader
+```
+
+To update and run the latest code:
+
+```bash
+cd /opt/storage.local_1/projects/takeout-downloader
+git fetch origin
+git checkout feat/internal-downloader      # or main once merged
+git pull
+
+# Keep the /tmp copy in sync (optional; they are byte-identical when synced)
+cp takeout_dl.py /tmp/takeout_dl.py
+```
+
+### Docker image
+
+Built on the server as `takeout-dl` (Python 3.12-slim, `requests` only — no
+aria2c). Rebuild after pulling new code:
+
+```bash
+cd /opt/storage.local_1/projects/takeout-downloader
+docker build -f Dockerfile.takeout_dl -t takeout-dl .
+docker run --rm takeout-dl --help          # smoke test
+```
+
+For the auto-resume workflow under Docker, mount a *directory* (not a single
+file) so host edits to the payload are visible inside the container:
+
+```bash
+docker run --rm -it \
+  -v /opt/storage.jfs002/google-takeout/braincreation:/downloads \
+  -v /tmp/takeout:/payload \
+  takeout-dl --payload /payload/payload.json --out /downloads \
+  --parallel 4 --max-exports 290
+# refresh: rm /tmp/takeout/payload.json && nano /tmp/takeout/payload.json
+```
+
+For live tmux monitoring, the bare Python run is simpler than Docker — you watch
+progress directly and refresh the payload in a second pane.

@@ -1,11 +1,8 @@
-# Self-contained Google Takeout downloader CLI.
+# Self-contained Google Takeout downloader CLI (internal downloader, no aria2c).
 # Build: docker build -f Dockerfile.takeout_dl -t takeout-dl .
-# Run:  docker run --rm -it -v /srv/storage/google-takeout/my-takeout:/downloads takeout-dl
+# Run:   docker run --rm -it -v /srv/storage/google-takeout/my-takeout:/downloads \
+#          -v /path/to/payload.json:/payload.json takeout-dl --payload /payload.json --out /downloads
 FROM python:3.12-slim
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends aria2 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir requests
 

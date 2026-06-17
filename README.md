@@ -9,6 +9,12 @@ is auto-sent anywhere.
 > **License:** [GLWTS (Good Luck With That Shit) Public License](./LICENSE).
 > **Forked from:** [`Kalainilavann/takeout_downloader_script`](https://github.com/Kalainilavann/takeout_downloader_script) — see [`NOTICE.md`](./NOTICE.md) for attribution, license change history, and what was removed from the upstream repo before publication.
 
+> ⚠️ **Running on a remote server?** The download cookie is bound to the
+> IP that started the export. Capture through a SOCKS tunnel so the browser
+> uses the server's IP. See **[`docs/SERVER_DOWNLOAD.md`](./docs/SERVER_DOWNLOAD.md)**
+> for the full workflow and **[`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md)**
+> for auth/cookie failures.
+
 ## How it works
 
 ```

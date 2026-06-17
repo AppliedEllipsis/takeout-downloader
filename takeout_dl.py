@@ -5,7 +5,7 @@ Google Takeout Downloader — server-side CLI
 
 A self-contained Python CLI that accepts a JSON payload from the browser
 extension (cookies, headers, download URL) and downloads all export files
-concurrently via aria2c, with resume and ZIP validation.
+concurrently with an internal threaded downloader, resume, and ZIP validation.
 
 Designed for remote servers over SSH/tmux where a mouse-grabbing TUI is
 not usable. Plain prompts, plain ANSI progress display, paste-friendly.
@@ -191,6 +191,14 @@ def setup_logging(log_path: Optional[Path] = None, level: int = logging.INFO) ->
 # Payload parsing
 # -----------------------------------------------------------------------------
 @dataclass
+class ExportEntry:
+    url: str
+    filename: str
+    size: int
+    part_index: int = 0
+
+
+@dataclass
 class Payload:
     url: str
     cookie: str
@@ -198,6 +206,7 @@ class Payload:
     method: str = "GET"
     source: str = "extension"
     captured_at: str = ""
+    exports: list[ExportEntry] = field(default_factory=list)
 
 
 def parse_payload(text: str) -> Payload:
@@ -210,8 +219,14 @@ def parse_payload(text: str) -> Payload:
     if not isinstance(data, dict):
         raise ValueError("Payload must be a JSON object")
 
-    url = data.get("url") or ""
     cookie = data.get("cookie") or ""
+    url = data.get("url") or ""
+
+    # Multi-payload: URLs live inside the exports array.
+    exports_raw = data.get("exports") if data.get("multi") else None
+    if not url and isinstance(exports_raw, list) and exports_raw:
+        url = exports_raw[0].get("url", "")
+
     if not url or not cookie:
         raise ValueError("Payload missing url or cookie")
 
@@ -234,6 +249,17 @@ def parse_payload(text: str) -> Payload:
     headers.setdefault("Accept-Language", "en-US,en;q=0.9")
     headers.setdefault("Referer", "https://takeout.google.com/")
 
+    # Multi-payload: extension has already enumerated all part URLs.
+    exports = []
+    if data.get("multi") and isinstance(data.get("exports"), list):
+        for idx, entry in enumerate(data["exports"]):
+            exports.append(ExportEntry(
+                url=entry.get("url", ""),
+                filename=entry.get("filename") or f"part-{idx:03d}",
+                size=int(entry.get("size") or 0),
+                part_index=int(entry.get("partIndex", idx)),
+            ))
+
     return Payload(
         url=url,
         cookie=cookie,
@@ -241,6 +267,7 @@ def parse_payload(text: str) -> Payload:
         method=data.get("method", "GET"),
         source=data.get("source", "extension"),
         captured_at=data.get("captured_at") or datetime.now(timezone.utc).isoformat(),
+        exports=exports,
     )
 
 
@@ -340,6 +367,24 @@ class Export:
 
 
 def discover_exports(payload: Payload, max_exports: int = DEFAULT_MAX_EXPORTS) -> list[Export]:
+    """Use provided exports if present, otherwise sweep export indices."""
+    if payload.exports:
+        exports = []
+        for e in payload.exports[:max_exports]:
+            # Extension-provided filenames are often truncated/identical for all parts;
+            # build a unique output name from the URL basename plus part index.
+            from urllib.parse import urlparse
+            base = urlparse(e.url).path.split("/")[-1] or "takeout.zip"
+            if "." in base:
+                stem, ext = base.rsplit(".", 1)
+                unique_name = f"{stem}-part-{e.part_index:03d}.{ext}"
+            else:
+                unique_name = f"{base}-part-{e.part_index:03d}"
+            exports.append(Export(index=e.part_index, url=e.url, size=e.size, filename=unique_name))
+        total_size = sum(e.size for e in exports)
+        print(cyan(f"Using {len(exports)} export URL(s) from extension payload, {human_size(total_size)} total"))
+        return exports
+
     """Sweep export indices until two consecutive invalid responses."""
     exports: list[Export] = []
     consecutive_invalid = 0
@@ -392,6 +437,7 @@ class Aria2cManager:
         self.rpc_url = f"http://localhost:{self.port}/jsonrpc"
         self.proc: Optional[subprocess.Popen] = None
         self.gid_to_export: dict[str, Export] = {}
+        self._seen_names: set[str] = set()
 
     @staticmethod
     def _free_port() -> int:
@@ -459,9 +505,22 @@ class Aria2cManager:
             return None
 
     def add_download(self, export: Export, payload: Payload, out_filename: Optional[str] = None) -> Optional[str]:
+        def safe_name(name):
+            bad = "…"  # horizontal ellipsis
+            n = name.replace(bad, "")
+            n = n.replace("%20", " ")
+            n = n.strip()
+            if not n:
+                n = f"takeout-part-{export.index:03d}"
+            candidate = n
+            if candidate in self._seen_names:
+                stem, ext = (candidate.rsplit(".", 1) if "." in candidate else (candidate, ""))
+                candidate = f"{stem}-{export.index:03d}.{ext}" if ext else f"{stem}-{export.index:03d}"
+            self._seen_names.add(candidate)
+            return candidate
         options = {
             "dir": str(self.download_dir),
-            "out": out_filename or export.filename,
+            "out": safe_name(out_filename or export.filename),
             "header": [f"Cookie: {payload.cookie}"],
             "allow-overwrite": "false",
             "auto-file-renaming": "false",
@@ -522,58 +581,47 @@ class ProgressDisplay:
     def __init__(self, exports: list[Export], parallel: int):
         self.exports = exports
         self.parallel = parallel
-        self.rows = len(exports)
+        # Only ever render header + active slots + total = parallel + ~4 lines.
+        self.rows = parallel + 4
         self.drawn = False
 
-    def render(self, active: list[dict], statuses: dict[str, dict], gid_to_export: dict[str, Export]) -> None:
+    def render(self, snapshot: list, done_count: int, verified_bytes: int) -> None:
         if not _IS_TTY:
             return
 
         total_size = sum(e.size for e in self.exports)
-        completed_sum = 0
-        active_count = len(active)
-        speed_sum = 0.0
+        n_total = len(self.exports)
+
+        active = [p for p in snapshot if p.status == "active"]
+        speed_sum = sum(p.speed for p in active)
+        # Bytes done across everything (completed files + in-flight partials).
+        completed_sum = sum(
+            p.size if p.status == "done" else min(p.done, p.size or p.done)
+            for p in snapshot
+        )
 
         lines: list[str] = []
         lines.append(
             bold("Google Takeout Downloader")
             + "  "
-            + dim(f"{len([e for e in self.exports if e.verified])}/{len(self.exports)} done · "
-                  f"{active_count} active · concurrency={self.parallel}")
+            + dim(f"{done_count}/{n_total} done · {len(active)} active · "
+                  f"concurrency={self.parallel}")
         )
         lines.append("")
 
-        for exp in self.exports:
-            if exp.verified:
-                lines.append(f"  {green('✓')} {exp.filename:<50} {green('done')}")
-                completed_sum += exp.size
-                continue
-
-            gid = None
-            for g, e in gid_to_export.items():
-                if e is exp:
-                    gid = g
-                    break
-
-            if gid and gid in statuses:
-                st = statuses[gid]
-                done = parse_aria2_byte_field(st.get("completedLength"))
-                total = parse_aria2_byte_field(st.get("totalLength")) or exp.size
-                speed = parse_aria2_byte_field(st.get("downloadSpeed"))
-                state = st.get("status", "unknown")
-                speed_sum += speed
-                completed_sum += min(done, exp.size)
-                pct = (done / total * 100) if total else 0
-                bar = progress_bar(pct, 14)
-                lines.append(
-                    f"  {yellow('↓')} {exp.filename:<34} "
-                    f"{bar} {human_size(done):>8}/{human_size(total):>8} "
-                    f"{human_speed(speed):>12} {state}"
-                )
-            elif exp.downloaded:
-                lines.append(f"  {cyan('◇')} {exp.filename:<50} {cyan('verifying...')}")
-            else:
-                lines.append(f"  {dim('○')} {exp.filename:<50} {dim('queued')}")
+        # Show only the in-flight files (cap at parallel rows).
+        for p in active[: self.parallel]:
+            total = p.total or p.size or p.done
+            pct = (p.done / total * 100) if total else 0
+            bar = progress_bar(pct, 14)
+            name = p.filename if len(p.filename) <= 34 else p.filename[:31] + "..."
+            lines.append(
+                f"  {yellow('↓')} {name:<34} "
+                f"{bar} {human_size(p.done):>9}/{human_size(total):>9} "
+                f"{human_speed(p.speed):>12}"
+            )
+        if not active:
+            lines.append(dim("  (waiting for downloads to start...)"))
 
         lines.append("")
         pct_all = (completed_sum / total_size * 100) if total_size else 0
@@ -583,19 +631,15 @@ class ProgressDisplay:
             f"{human_speed(speed_sum)}"
         )
 
-        # Erase previous block and redraw.
         if self.drawn:
             clear_screen_region(self.rows + 3)
-        text = "\n".join(lines)
-        sys.stdout.write(text + "\n")
+        sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
         self.drawn = True
-
 
     def teardown(self) -> None:
         if self.drawn and _IS_TTY:
             clear_screen_region(self.rows + 3)
-
 
 # -----------------------------------------------------------------------------
 # ZIP validation
@@ -680,15 +724,64 @@ def find_payload_file(output_dir: Path) -> Optional[Path]:
     return None
 
 
-def get_payload(output_dir: Path, args: argparse.Namespace, reprompt: bool = False) -> Payload:
+def _payload_cookie(text: str) -> str:
+    """Best-effort extract the cookie from raw payload JSON for change detection."""
+    try:
+        d = json.loads(text)
+    except Exception:
+        return ""
+    return (d.get("cookie") or "").strip()
+
+def get_payload(output_dir: Path, args: argparse.Namespace, reprompt: bool = False,
+                prev_cookie: str = "") -> Payload:
     text = ""
 
+    if reprompt:
+        # Cookie expired mid-run. Re-acquire through the SAME channel the
+        # original payload came from, then continue (partials resume).
+        if args.payload:
+            pf = Path(args.payload)
+            print(yellow(f"\nWaiting for a fresh payload at {pf}"))
+            print(dim("  Re-capture in your proxied browser (Copy ALL exports),"))
+            print(dim(f"  overwrite {pf} with the new JSON, and the download resumes automatically."))
+            print(dim("  Polling every 5s — press Ctrl-C to stop (partials are kept).\n"))
+            while True:
+                try:
+                    if pf.exists() and pf.stat().st_size > 0:
+                        candidate = pf.read_text(encoding="utf-8")
+                        cookie = _payload_cookie(candidate)
+                        # Accept once the cookie is present, valid, and different
+                        # from the stale one that just failed.
+                        if cookie and cookie != prev_cookie:
+                            ok, _ = validate_cookie(cookie)
+                            if ok:
+                                text = candidate
+                                print(green("  Fresh payload detected — resuming.\n"))
+                                break
+                    time.sleep(5)
+                except KeyboardInterrupt:
+                    raise
+        elif not sys.stdin.isatty():
+            # Non-file, non-TTY (piped stdin) run: can't re-read a stream, so
+            # the caller must restart with a fresh payload. Surface clearly.
+            raise ValueError("cookie expired and no --payload file to watch; "
+                             "re-run with a fresh payload")
+        else:
+            text = read_payload_interactive()
+
+        payload = parse_payload(text)
+        ok, msg = validate_cookie(payload.cookie)
+        if not ok:
+            raise ValueError(msg)
+        return payload
+
+    # First acquisition.
     # 1. Explicit payload file argument.
     if args.payload and Path(args.payload).exists():
         text = Path(args.payload).read_text(encoding="utf-8")
 
-    # 2. Auto-discovered payload file (only on first run, not re-prompts).
-    if not text and not reprompt:
+    # 2. Auto-discovered payload file.
+    if not text:
         f = find_payload_file(output_dir)
         if f:
             log.info("Reading payload from %s", f)
@@ -696,7 +789,7 @@ def get_payload(output_dir: Path, args: argparse.Namespace, reprompt: bool = Fal
 
     # 3. Try stdin if it's not a TTY.
     if not text and not sys.stdin.isatty():
-        text = sys.stdin.read()
+        text = read_payload_from_stdin()
 
     # 4. Interactive paste.
     if not text:
@@ -707,70 +800,234 @@ def get_payload(output_dir: Path, args: argparse.Namespace, reprompt: bool = Fal
     if not ok:
         raise ValueError(msg)
     return payload
-
-
 # -----------------------------------------------------------------------------
 # Main download orchestration
 # -----------------------------------------------------------------------------
+@dataclass
+class PartProgress:
+    index: int
+    filename: str
+    url: str
+    size: int
+    done: int = 0
+    total: int = 0
+    speed: float = 0.0
+    status: str = "queued"  # queued, active, done, error, auth
+
+
+def _looks_like_html_bytes(body: bytes) -> bool:
+    if not body:
+        return False
+    head = body[:64].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not head:
+        return False
+    if head.startswith(b"<!"):
+        return b"html" in head[:32].lower() or b"doctype" in head[:32].lower()
+    if head.lower().startswith(b"<html"):
+        return True
+    return False
+
+
+class _AuthChallenge(Exception):
+    def __init__(self, msg, body=b""):
+        super().__init__(msg)
+        self.body = body
+
+
 def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
                      parallel: int) -> None:
-    manager = Aria2cManager(download_dir=output_dir)
+    """Internal threaded downloader (no aria2c).
+
+    Every response's first bytes are inspected before the output file is
+    opened for writing, so Google's HTML sign-in page can NEVER be saved as
+    a .zip. On the first auth challenge the whole pool stops and AuthError is
+    raised so main() can re-prompt for a fresh cookie; partials on disk are
+    kept and resumed (HTTP Range) on the next pass.
+
+    Only the in-flight files (parallel slots) are rendered, so a 290-part
+    batch shows the 4-5 active downloads, not all 290 rows.
+    """
+    import threading
+    import queue as _queue
+
     display = ProgressDisplay(exports, parallel)
-    try:
-        manager.start()
-        manager._call("aria2.changeGlobalOption", [{"max-concurrent-downloads": str(parallel)}])
+    progress: dict[int, PartProgress] = {}
+    lock = threading.Lock()
+    stop = threading.Event()
+    auth = threading.Event()
+    auth_info = {"url": "", "body": b""}
 
-        # Add all downloads.
-        pending = list(exports)
-        for exp in exports:
-            gid = manager.add_download(exp, payload)
-            if not gid:
-                log.error("Failed to queue %s", exp.filename)
+    for e in exports:
+        progress[e.index] = PartProgress(index=e.index, filename=e.filename,
+                                         url=e.url, size=e.size,
+                                         total=e.size, status="queued")
 
-        # Poll until complete.
-        last_statuses: dict[str, dict] = {}
-        all_done = False
-        while not all_done:
-            active = manager.tell_active()
-            gids = list(manager.gid_to_export.keys())
-            statuses: dict[str, dict] = {}
-            for gid in gids:
-                st = manager.tell_status(gid)
-                if st:
-                    statuses[gid] = st
-            last_statuses = statuses
+    chunk_size = 1024 * 1024
+    timeout = (15, 60)
+    max_tries = 5
+    retry_wait = 5.0
 
-            # Update progress display.
-            display.render(active, statuses, manager.gid_to_export)
+    def _set(idx, **kw):
+        with lock:
+            p = progress.get(idx)
+            if not p:
+                return
+            for k, v in kw.items():
+                setattr(p, k, v)
 
-            # Check completion / errors.
-            all_done = True
-            for gid, exp in list(manager.gid_to_export.items()):
-                st = statuses.get(gid)
-                if not st:
+    def _stream_one(exp, session):
+        dest = output_dir / exp.filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        for attempt in range(1, max_tries + 1):
+            if stop.is_set():
+                return
+            existing = dest.stat().st_size if dest.exists() else 0
+            if exp.size and existing >= exp.size:
+                _set(exp.index, done=existing, total=exp.size, status="done")
+                return
+            headers = dict(payload.headers)
+            headers["Cookie"] = payload.cookie
+            if existing > 0:
+                headers["Range"] = f"bytes={existing}-"
+            try:
+                with session.get(exp.url, headers=headers, stream=True,
+                                 timeout=timeout, allow_redirects=True) as resp:
+                    final_host = resp.url.split("/")[2] if "://" in resp.url else ""
+                    ctype = resp.headers.get("content-type", "").lower()
+                    if final_host.endswith("accounts.google.com"):
+                        raise _AuthChallenge(f"redirected to {final_host}")
+                    if "text/html" in ctype:
+                        body = next(resp.iter_content(4096), b"")
+                        raise _AuthChallenge(f"HTML response (ct={ctype[:40]})", body)
+                    if resp.status_code in (401, 403):
+                        raise _AuthChallenge(f"HTTP {resp.status_code}")
+                    resp.raise_for_status()
+
+                    mode = "wb"
+                    start = 0
+                    if existing > 0 and resp.status_code == 206:
+                        mode = "ab"
+                        start = existing
+                    total = exp.size
+                    cr = resp.headers.get("content-range", "")
+                    if cr and "/" in cr:
+                        try:
+                            total = int(cr.rsplit("/", 1)[1])
+                        except ValueError:
+                            pass
+                    elif resp.status_code == 200:
+                        cl = resp.headers.get("content-length")
+                        if cl and cl.isdigit():
+                            total = int(cl)
+                    _set(exp.index, total=total or exp.size, status="active")
+
+                    done = start
+                    first = True
+                    ema = 0.0
+                    t_prev = time.monotonic()
+                    b_prev = done
+                    with dest.open(mode) as fh:
+                        for chunk in resp.iter_content(chunk_size=chunk_size):
+                            if stop.is_set():
+                                fh.flush()
+                                return
+                            if not chunk:
+                                continue
+                            if first:
+                                first = False
+                                if start == 0 and _looks_like_html_bytes(chunk):
+                                    raise _AuthChallenge("first bytes look like HTML",
+                                                         chunk[:4096])
+                            fh.write(chunk)
+                            done += len(chunk)
+                            now = time.monotonic()
+                            dt = now - t_prev
+                            if dt >= 0.5:
+                                inst = (done - b_prev) / dt
+                                ema = inst if ema == 0 else 0.6 * ema + 0.4 * inst
+                                t_prev, b_prev = now, done
+                                _set(exp.index, done=done, speed=ema)
+                            else:
+                                _set(exp.index, done=done)
+                final = dest.stat().st_size if dest.exists() else 0
+                _set(exp.index, done=final, status="done", speed=0.0)
+                return
+            except _AuthChallenge:
+                raise
+            except (requests.RequestException, OSError) as ex:
+                if attempt < max_tries and not stop.is_set():
+                    _set(exp.index, speed=0.0)
+                    time.sleep(retry_wait)
                     continue
-                state = st.get("status")
-                if state == "complete":
-                    exp.downloaded = True
-                elif state == "removed":
-                    err_msg = st.get("errorMessage", "removed")
-                    log.warning("Download removed for %s: %s", exp.filename, err_msg)
-                elif state == "error":
-                    err_msg = st.get("errorMessage", "unknown")
-                    log.warning("Download error for %s: %s", exp.filename, err_msg)
-                    # If it looks like auth failure, bail so main can re-prompt.
-                    if "401" in err_msg or "403" in err_msg or "html" in err_msg.lower():
-                        raise AuthError(f"aria2c auth error on {exp.filename}: {err_msg}")
-                else:
-                    all_done = False
+                raise
 
-            if not all_done:
-                time.sleep(1)
+    def _worker(work):
+        session = requests.Session()
+        try:
+            while not stop.is_set():
+                try:
+                    exp = work.get_nowait()
+                except _queue.Empty:
+                    return
+                try:
+                    _stream_one(exp, session)
+                except _AuthChallenge as e:
+                    if not auth.is_set():
+                        auth_info["url"] = exp.url
+                        auth_info["body"] = e.body
+                        auth.set()
+                    stop.set()
+                    _set(exp.index, status="auth")
+                except Exception as e:
+                    log.warning("part %03d failed: %r", exp.index, e)
+                    _set(exp.index, status="error")
+                finally:
+                    work.task_done()
+        finally:
+            session.close()
 
+    # Skip files already complete on disk; queue the rest.
+    work: "_queue.Queue" = _queue.Queue()
+    todo = []
+    for e in exports:
+        dest = output_dir / e.filename
+        if dest.exists() and e.size and dest.stat().st_size >= e.size:
+            _set(e.index, done=e.size, status="done")
+        else:
+            todo.append(e)
+    for e in todo:
+        work.put(e)
+
+    if not todo:
+        snap = [PartProgress(**vars(p)) for p in progress.values()]
+        display.render(snap, len(exports), sum(e.size for e in exports))
         display.teardown()
-    finally:
-        manager.shutdown()
+        return
 
+    n_workers = max(1, min(parallel, len(todo)))
+    threads = [threading.Thread(target=_worker, args=(work,), daemon=True)
+               for _ in range(n_workers)]
+    for t in threads:
+        t.start()
+
+    try:
+        while any(t.is_alive() for t in threads):
+            with lock:
+                snap = [PartProgress(**vars(p)) for p in progress.values()]
+            done_count = sum(1 for p in snap if p.status == "done")
+            verified_bytes = sum(p.size for p in snap if p.status == "done")
+            display.render(snap, done_count, verified_bytes)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        stop.set()
+        raise
+    finally:
+        for t in threads:
+            t.join(timeout=30)
+        display.teardown()
+
+    if auth.is_set():
+        raise AuthError(f"auth challenge during download ({auth_info['url']})")
 
 def verify_exports(exports: list[Export], output_dir: Path) -> tuple[list[Export], list[Export]]:
     complete: list[Export] = []
@@ -805,7 +1062,7 @@ def prompt_for_output_dir(default: Path) -> Path:
 # -----------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Download Google Takeout archives server-side via aria2c.",
+        description="Download Google Takeout archives server-side (internal downloader, resume, ZIP validation).",
     )
     p.add_argument("-o", "--out", dest="output_dir",
                    help="output directory (prompted if omitted)")
@@ -889,7 +1146,7 @@ def main() -> int:
             auth_failures += 1
             if auth_failures > DEFAULT_MAX_AUTH_REPROMPTS:
                 return 1
-            payload = get_payload(output_dir, args, reprompt=True)
+            payload = get_payload(output_dir, args, reprompt=True, prev_cookie=payload.cookie)
             continue
         except RuntimeError as e:
             print(red(f"Discovery failed: {e}"))
@@ -928,7 +1185,7 @@ def main() -> int:
             auth_failures += 1
             if auth_failures > DEFAULT_MAX_AUTH_REPROMPTS:
                 return 1
-            payload = get_payload(output_dir, args, reprompt=True)
+            payload = get_payload(output_dir, args, reprompt=True, prev_cookie=payload.cookie)
             continue
         except Exception as e:
             log.exception("Download failed: %s", e)

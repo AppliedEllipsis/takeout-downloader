@@ -98,16 +98,32 @@ section refs + recommended actions. recapture_count escalates cookie_expired ->
 auth_loop after 2 cycles. `/api/control/health` reports disk free + cookie age.
 Verified in `manager/tests/test_phase4_control.py`.
 
-## Phase 5 — Extension v4
+## Phase 5 — Extension v4 ✅
 
-⬜ Add `host_permissions` for `127.0.0.1:8080`, settings (managerUrl, tokens,
+✅ Add `host_permissions` for `127.0.0.1:8080`, settings (managerUrl, tokens,
    toggles).
-⬜ Auto-POST on capture (clipboard still fires as fallback).
-⬜ `forceCapture` / `getState` runtime messages.
-⬜ Auto-re-capture routine driven by `needs_cookie`.
+✅ Auto-POST on capture (clipboard still fires as fallback).
+✅ `forceCapture` / `getState` runtime messages.
+✅ Auto-re-capture routine driven by `needs_cookie`.
 
 **Gate:** start a download in Chromium → payload auto-POSTs → manager job starts
 with no manual paste. Force a cookie expiry → extension re-captures → job resumes.
+
+**DONE 2026-06-22.** Extension bumped to v4.0.0 (manifest: +`scripting`,
++`alarms`, +`http://127.0.0.1:8080/*` host permission). Capture listener
+UNCHANGED (the hard-won final-host logic is untouched). Added, all additive:
+`maybeAutoPost()` POSTs every capture to `/api/payload` with `X-Capture-Token`
+(clipboard still fires as fallback on any failure); `_meta` carries
+email/user/authuser/archiveId so the manager derives `<account>/<export-ts>/`.
+Content script scrapes the account email from the page DOM (`reportAccountMeta`)
+and handles `recaptureDownload` (re-clicks Download, never types credentials).
+An `alarms` poll hits `/api/control/recapture-pending` every minute and triggers
+a re-capture when a job is in `needs_cookie`. New runtime messages
+`getState`/`setManagerConfig`/`forceCapture`/`setAccountMeta`. Popup gained a
+manager-status line, a Send-now button, an Open-manager link, and an
+auto-send toggle. Manager-side contract verified in
+`manager/tests/test_phase5_v4contract.py` (email→label, recapture-pending token
+gating + pending flag). JS validated with `node --check` (all three files).
 
 ## Phase 6 — webtop container + persistence
 

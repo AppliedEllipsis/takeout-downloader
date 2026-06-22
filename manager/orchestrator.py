@@ -46,11 +46,31 @@ def _payload_meta(payload: "engine.Payload", raw: dict | None) -> dict:
     """
     meta = {}
     raw = raw or {}
-    rmeta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
-    for key in ("email", "user", "authuser", "archive_id"):
-        val = rmeta.get(key) or raw.get(key)
-        if val:
-            meta[key] = val
+    # The v4 extension nests identity under "_meta"; older popup payloads use
+    # "_meta" too, and we also accept a bare "meta" or top-level keys.
+    rmeta = {}
+    for container_key in ("_meta", "meta"):
+        c = raw.get(container_key)
+        if isinstance(c, dict):
+            rmeta = {**c, **rmeta}
+    def _pick(*keys):
+        for k in keys:
+            v = rmeta.get(k) or raw.get(k)
+            if v:
+                return v
+        return None
+    email = _pick("email")
+    if email:
+        meta["email"] = email
+    user = _pick("user")
+    if user:
+        meta["user"] = user
+    authuser = _pick("authuser")
+    if authuser:
+        meta["authuser"] = authuser
+    archive_id = _pick("archive_id", "archiveId")
+    if archive_id:
+        meta["archive_id"] = archive_id
     if getattr(payload, "captured_at", ""):
         meta["captured_at"] = payload.captured_at
     return meta

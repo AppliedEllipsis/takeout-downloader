@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "Takeout Downloader Helper",
-    "version": "3.1.0",
-    "description": "Captures Google Takeout download URLs and copies them as JSON for the Takeout Downloader TUI",
+    "version": "4.0.0",
+    "description": "Captures Google Takeout download URLs, copies them as JSON, and (v4) POSTs them to the local web manager for server-side download + auto-resume",
 
     "minimum_chrome_version": "102",
 
@@ -11,13 +11,16 @@
         "storage",
         "activeTab",
         "notifications",
-        "cookies"
+        "cookies",
+        "scripting",
+        "alarms"
     ],
 
     "host_permissions": [
         "https://takeout.google.com/*",
         "https://takeout-download.usercontent.google.com/*",
-        "https://storage.cloud.google.com/*"
+        "https://storage.cloud.google.com/*",
+        "http://127.0.0.1:8080/*"
     ],
 
     "background": {

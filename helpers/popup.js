@@ -351,6 +351,63 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    // --- v4 manager wiring (additive) ------------------------------------
+    const sendNowBtn = $('sendNowBtn');
+    const managerStatus = $('managerStatus');
+    const autoPost = $('autoPost');
+
+    function refreshManager() {
+        chrome.runtime.sendMessage({ action: 'getState' }, (st) => {
+            if (!st) return;
+            if (autoPost) autoPost.checked = st.autoPost !== false;
+            if (sendNowBtn) sendNowBtn.disabled = !st.hasCapture;
+            if (!managerStatus) return;
+            const p = st.lastPostStatus;
+            if (p && p.ok) {
+                managerStatus.textContent = 'Manager: job ' + (p.jobId || '?') +
+                    ' (' + (p.status || '?') + ')';
+                managerStatus.className = 'status ok';
+            } else if (p && !p.ok) {
+                managerStatus.textContent = 'Manager: ' + (p.error || 'unreachable');
+                managerStatus.className = 'status err';
+            } else {
+                managerStatus.textContent = 'Manager: idle (no send yet)';
+                managerStatus.className = 'status dim';
+            }
+        });
+    }
+
+    if (sendNowBtn) {
+        sendNowBtn.addEventListener('click', () => {
+            setError(null);
+            managerStatus.textContent = 'Manager: sending…';
+            managerStatus.className = 'status dim';
+            chrome.runtime.sendMessage({ action: 'forceCapture' }, (r) => {
+                if (r && r.ok) {
+                    managerStatus.textContent = 'Manager: job ' +
+                        ((r.result && r.result.job_id) || '?') + ' sent';
+                    managerStatus.className = 'status ok';
+                } else {
+                    managerStatus.textContent = 'Manager: ' +
+                        ((r && r.error) || 'failed');
+                    managerStatus.className = 'status err';
+                }
+            });
+        });
+    }
+
+    if (autoPost) {
+        autoPost.addEventListener('change', () => {
+            chrome.runtime.sendMessage({
+                action: 'setManagerConfig',
+                config: { autoPost: autoPost.checked }
+            });
+        });
+    }
+
+    refreshManager();
+    setInterval(refreshManager, 2000);
+
     // Listen for storage changes (auto-refresh after a new capture)
     chrome.storage.onChanged.addListener((changes, area) => {
         if (area === 'local' && (changes.lastCapture || changes.captureCount)) {

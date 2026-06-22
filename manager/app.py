@@ -152,6 +152,16 @@ async def health():
     }
 
 
+# --- recapture signal (extension polls this) ---------------------------------
+# Gated by the CAPTURE token (the extension holds it), not the API token: it is
+# read-only and only reveals whether a fresh cookie is wanted. Lets the v4
+# extension auto-recapture without the broader control token.
+@app.get("/api/control/recapture-pending")
+async def recapture_pending(x_capture_token: str | None = Header(default=None)):
+    _check_capture_token(x_capture_token)
+    pending = [j["job_id"] for j in orch.list_jobs() if j["status"] == J.NEEDS_COOKIE]
+    return {"pending": bool(pending), "job_ids": pending}
+
 # --- control plane (Phase 4) -------------------------------------------------
 # All gated by MANAGER_API_TOKEN (when set). Separate from the capture token so
 # a leaked capture token can only POST payloads, never drive jobs.

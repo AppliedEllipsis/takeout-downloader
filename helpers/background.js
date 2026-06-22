@@ -30,8 +30,18 @@ const DEFAULTS = {
     captureCount: 0,
     lastCapture: null,
     lastError: null,
-    captureTimestamps: []   // rolling buffer of recent capture times (for badge)
+    captureTimestamps: [],   // rolling buffer of recent capture times (for badge)
+    // --- v4 manager settings (see docs/webgui/03-extension-v4.md) ---
+    managerUrl: 'http://127.0.0.1:8080',
+    captureToken: '',        // X-Capture-Token; empty => dev/open manager
+    autoPost: true,          // POST captures to the manager automatically
+    autoRecapture: true,     // re-capture when the manager asks (needs_cookie)
+    accountEmail: null,      // best-effort, scraped from the Takeout page DOM
+    lastPostStatus: null     // { ok, code, jobId, error, at } of the last POST
 };
+
+// v4: keys the manager client + popup may read/write via setManagerConfig.
+const MANAGER_CONFIG_KEYS = ['managerUrl', 'captureToken', 'autoPost', 'autoRecapture'];
 
 // Boot: merge defaults into storage
 chrome.runtime.onInstalled.addListener(() => {
@@ -69,6 +79,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
                 updateBadgeAndIcon();
                 const filename = extractFilename(capture.url);
                 notifyCapture(filename);
+                // v4: also POST to the manager (additive; clipboard path is
+                // untouched). Failures fall back silently to clipboard use.
+                maybeAutoPost(capture);
             });
         } catch (err) {
             chrome.storage.local.set({ lastError: err.message || String(err) });
@@ -189,6 +202,169 @@ function extractFilename(url) {
 }
 
 // ---------------------------------------------------------------------------
+// v4 manager client (additive — never touches the capture listener above)
+// ---------------------------------------------------------------------------
+// On a successful capture we ALSO POST the payload to the local manager so it
+// can drive the download with no human paste. The clipboard path is untouched;
+// if the manager is unreachable the user can still Copy as JSON. See
+// docs/webgui/03-extension-v4.md.
+
+function getManagerSettings() {
+    return new Promise((resolve) => {
+        chrome.storage.local.get(
+            ['managerUrl', 'captureToken', 'autoPost', 'autoRecapture'],
+            (d) => resolve({
+                managerUrl: d.managerUrl || DEFAULTS.managerUrl,
+                captureToken: d.captureToken || '',
+                autoPost: d.autoPost !== false,
+                autoRecapture: d.autoRecapture !== false
+            })
+        );
+    });
+}
+
+// Build the same multi-export payload the popup builds, but headless. We POST
+// the single capture; the manager's engine discovers the rest of the parts.
+// (The popup's "Copy ALL" still produces the richer multi payload for manual
+// use; auto-POST favors reliability over completeness and lets the engine
+// sweep i=0,1,2,... which it already does well.)
+function buildManagerPayload(capture, meta) {
+    const payload = {
+        schema: capture.schema || 1,
+        captured_at: capture.captured_at || new Date().toISOString(),
+        source: 'extension',
+        url: capture.url,
+        method: capture.method || 'GET',
+        headers: capture.headers || {},
+        cookie: capture.cookie || ''
+    };
+    // Attach identity meta so the manager can derive <account>/<export-ts>/.
+    // email is best-effort (scraped by the content script); user/authuser come
+    // from the download URL params.
+    if (meta && (meta.email || meta.user || meta.authuser || meta.archiveId)) {
+        payload._meta = {
+            email: meta.email || null,
+            user: meta.user || null,
+            authuser: meta.authuser || null,
+            archiveId: meta.archiveId || null
+        };
+    }
+    return payload;
+}
+
+async function postToManager(payload) {
+    const s = await getManagerSettings();
+    const headers = { 'Content-Type': 'application/json' };
+    if (s.captureToken) headers['X-Capture-Token'] = s.captureToken;
+    const resp = await fetch(s.managerUrl.replace(/\/$/, '') + '/api/payload', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload)
+    });
+    const text = await resp.text();
+    let body;
+    try { body = JSON.parse(text); } catch (e) { body = { detail: text }; }
+    if (!resp.ok) {
+        const err = new Error(body.detail || ('HTTP ' + resp.status));
+        err.status = resp.status;
+        throw err;
+    }
+    return body;
+}
+
+async function maybeAutoPost(capture) {
+    let s;
+    try { s = await getManagerSettings(); } catch (e) { return; }
+    if (!s.autoPost) return;
+    // Pull identity meta the content script may have stashed.
+    chrome.storage.local.get(['accountMeta'], async (d) => {
+        const meta = d.accountMeta || {};
+        try {
+            const payload = buildManagerPayload(capture, meta);
+            const result = await postToManager(payload);
+            chrome.storage.local.set({
+                lastPostStatus: { ok: true, jobId: result.job_id,
+                                  status: result.status, at: Date.now() }
+            });
+            notifyManager('Sent to manager', 'Job ' + (result.job_id || '?')
+                + ' (' + (result.status || '?') + ')');
+        } catch (e) {
+            chrome.storage.local.set({
+                lastPostStatus: { ok: false, error: e.message || String(e),
+                                  at: Date.now() }
+            });
+            // Non-fatal: the clipboard copy still works as a fallback.
+            notifyManager('Manager unreachable',
+                'Capture kept; use Copy as JSON. (' + (e.message || 'error') + ')');
+        }
+    });
+}
+
+function notifyManager(title, message) {
+    try {
+        chrome.notifications.create('mgr-' + Date.now(), {
+            type: 'basic', iconUrl: 'icon48.png',
+            title, message, priority: 0, silent: true
+        });
+    } catch (e) { /* non-critical */ }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-re-capture heartbeat (v4): poll the manager for needs_cookie jobs and,
+// if found, trigger a fresh capture by re-clicking the most recent export's
+// download in an existing takeout tab. The extension NEVER types credentials;
+// it only re-clicks a download in an already-authenticated session. If that
+// yields no valid cookie, the manager escalates to a human via Telegram/sound.
+// ---------------------------------------------------------------------------
+const RECAPTURE_ALARM = 'takeout-recapture-poll';
+
+chrome.alarms.create(RECAPTURE_ALARM, { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === RECAPTURE_ALARM) pollRecapturePending();
+});
+
+async function pollRecapturePending() {
+    let s;
+    try { s = await getManagerSettings(); } catch (e) { return; }
+    if (!s.autoRecapture) return;
+    try {
+        const headers = {};
+        if (s.captureToken) headers['X-Capture-Token'] = s.captureToken;
+        const resp = await fetch(
+            s.managerUrl.replace(/\/$/, '') + '/api/control/recapture-pending',
+            { headers });
+        if (!resp.ok) return;
+        const body = await resp.json();
+        if (body && body.pending) {
+            await triggerRecapture();
+        }
+    } catch (e) {
+        // manager unreachable; try again next alarm tick
+    }
+}
+
+async function triggerRecapture() {
+    // Find an existing takeout tab (or open one) and ask the content script to
+    // re-click the most recent Download button. A fresh request to the final
+    // host fires the capture listener, which then auto-POSTs the new cookie.
+    try {
+        const tabs = await chrome.tabs.query({ url: 'https://takeout.google.com/*' });
+        let tab = tabs[0];
+        if (!tab) {
+            tab = await chrome.tabs.create({
+                url: 'https://takeout.google.com/manage', active: false });
+            // give the page a moment to load before messaging
+            await new Promise(r => setTimeout(r, 4000));
+        }
+        chrome.tabs.sendMessage(tab.id, { action: 'recaptureDownload' }, () => {
+            void chrome.runtime.lastError;  // swallow if content script not ready
+        });
+    } catch (e) {
+        // non-fatal; manager will escalate to a human if no cookie arrives
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard helper for the popup
 // ---------------------------------------------------------------------------
 // The popup (which has a DOM) does the clipboard write directly. The
@@ -273,6 +449,57 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 badgeFilename: data.badgeFilename !== false  // default true
             });
         });
+        return true;
+    }
+
+    // --- v4 manager handlers (additive) -------------------------------------
+    if (msg.action === 'getState') {
+        chrome.storage.local.get(
+            ['hasCapture', 'captureCount', 'lastPostStatus', 'lastError',
+             'managerUrl', 'captureToken', 'autoPost', 'autoRecapture'],
+            (d) => sendResponse({
+                hasCapture: !!d.hasCapture,
+                captureCount: d.captureCount || 0,
+                lastPostStatus: d.lastPostStatus || null,
+                lastError: d.lastError || null,
+                managerUrl: d.managerUrl || DEFAULTS.managerUrl,
+                captureToken: d.captureToken || '',
+                autoPost: d.autoPost !== false,
+                autoRecapture: d.autoRecapture !== false
+            })
+        );
+        return true;
+    }
+
+    if (msg.action === 'setManagerConfig') {
+        const patch = {};
+        for (const k of MANAGER_CONFIG_KEYS) {
+            if (k in (msg.config || {})) patch[k] = msg.config[k];
+        }
+        chrome.storage.local.set(patch, () => sendResponse({ ok: true, saved: patch }));
+        return true;
+    }
+
+    if (msg.action === 'forceCapture') {
+        // Re-POST the most recent capture to the manager on demand (used by the
+        // popup "Send now" button and by the manager-driven recapture flow).
+        chrome.storage.local.get(['lastCapture'], async (d) => {
+            if (!d.lastCapture) { sendResponse({ ok: false, error: 'no capture' }); return; }
+            try {
+                const result = await postToManager(
+                    buildManagerPayload(d.lastCapture, (await chrome.storage.local.get(['accountMeta'])).accountMeta || {}));
+                sendResponse({ ok: true, result });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message || String(e) });
+            }
+        });
+        return true;
+    }
+
+    if (msg.action === 'setAccountMeta') {
+        // Content script reports scraped identity (email/user/authuser).
+        chrome.storage.local.set({ accountMeta: msg.meta || {} },
+            () => sendResponse({ ok: true }));
         return true;
     }
 });

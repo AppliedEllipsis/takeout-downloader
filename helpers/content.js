@@ -626,6 +626,49 @@
     // -------------------------------------------------------------------------
     // Listen for messages from the popup.
     // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // v4: best-effort account email scrape, so the manager can derive the
+    // <account-label> folder (e.g. braincreation) instead of a gaia id.
+    // Google does NOT expose a friendly username in the download URL — the
+    // user= param is an obfuscated numeric id. The signed-in email is visible
+    // in the account switcher button's aria-label / title on Google pages.
+    // This is read-only DOM scraping; it never leaves the box except inside
+    // the payload meta POSTed to the localhost manager.
+    // ---------------------------------------------------------------------
+    const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
+    function scrapeAccountEmail() {
+        // 1. Account switcher button aria-label often: "Google Account: Name\n(email@gmail.com)"
+        const sel = [
+            'a[aria-label*="@"]', 'a[title*="@"]',
+            '[aria-label*="Google Account"]', 'header [aria-label*="@"]'
+        ];
+        for (const s of sel) {
+            for (const el of document.querySelectorAll(s)) {
+                const hay = (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('title') || '');
+                const m = hay.match(EMAIL_RE);
+                if (m) return m[0].toLowerCase();
+            }
+        }
+        return null;
+    }
+
+    function reportAccountMeta() {
+        try {
+            const email = scrapeAccountEmail();
+            const params = new URLSearchParams(location.search);
+            const meta = {
+                email: email || null,
+                user: params.get('user') || null,
+                authuser: params.get('authuser') || '0'
+            };
+            if (email || meta.user) {
+                chrome.runtime.sendMessage({ action: 'setAccountMeta', meta })
+                    .catch(() => {});
+            }
+        } catch (e) { /* non-critical */ }
+    }
+
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.action === 'contentFetchExports') {
             fetchExportList(msg.url).then(sendResponse);
@@ -633,6 +676,21 @@
         }
         if (msg.action === 'contentScrape') {
             sendResponse({ ok: true, exports: scrapeExports() });
+            return false;
+        }
+        if (msg.action === 'recaptureDownload') {
+            // Manager asked for a fresh cookie. Re-click the most recent
+            // Download button so a new request hits the final host and the
+            // capture listener fires. We do NOT type credentials.
+            try {
+                const btn = document.querySelector(
+                    'a[href*="takeout-download.usercontent.google.com"], ' +
+                    'button[aria-label*="Download" i], a[aria-label*="Download" i]');
+                if (btn) { btn.click(); sendResponse({ ok: true, clicked: true }); }
+                else { sendResponse({ ok: false, error: 'no download button found' }); }
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message || String(e) });
+            }
             return false;
         }
         return false;
@@ -652,7 +710,9 @@
         }
     }
     sendScrape();
+    reportAccountMeta();
     setInterval(sendScrape, 5000);
+    setInterval(reportAccountMeta, 15000);
 
     let scrapeTimer = null;
     const observer = new MutationObserver(() => {

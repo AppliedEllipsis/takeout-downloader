@@ -51,6 +51,12 @@
         <button id="clearBtn" class="secondary" disabled style="margin-top:2px;">🗑 Clear capture</button>
     </div>
 
+    <div class="section" id="managerSection">
+        <div id="managerStatus" class="status dim">Manager: checking…</div>
+        <button id="sendNowBtn" class="success" disabled style="margin-top:4px;">⬆ Send to manager now</button>
+        <a id="openManagerBtn" class="secondary" style="display:block; margin-top:2px; text-align:center; text-decoration:none;" href="http://127.0.0.1:8080/" target="_blank">📊 Open download manager</a>
+    </div>
+
     <details>
         <summary>Preview capture <span id="copyPreview" style="cursor:pointer; color:#a855f7; margin-left:6px;">[copy]</span></summary>
         <pre class="payload" id="preview">No capture yet.</pre>
@@ -59,6 +65,11 @@
     <div class="toggle">
         <input type="checkbox" id="autoCopy">
         <span>Auto-copy JSON when captured</span>
+    </div>
+
+    <div class="toggle">
+        <input type="checkbox" id="autoPost">
+        <span>Auto-send to manager when captured</span>
     </div>
 
     <div class="help">

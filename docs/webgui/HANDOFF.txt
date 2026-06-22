@@ -1,0 +1,294 @@
+# HANDOFF — Takeout Web-Hosted Browser + Download Manager
+
+> You are continuing work started by another model. Read this whole file once,
+> top to bottom, before doing anything. Then start at Step 1.
+> Every file path here is exact. Every edit target is copied verbatim.
+> When in doubt, follow the STOP RULES — do not improvise.
+
+---
+
+## 0. STOP RULES (never break these)
+1. Do exactly ONE step at a time. Run its check before starting the next step.
+2. Before any edit: read the file at the exact lines first, copy oldText
+   character-for-character (including whitespace). Never guess oldText.
+3. Never refactor, rename, or "clean up" anything not named in a step.
+4. Never delete files or run destructive commands unless a step says to.
+5. If a check fails twice, STOP. Write what happened and ask — do not push on.
+6. Do not change anything in the "Don't Touch" list (Section 6).
+7. PATH BUG WARNING: this machine has a tool/bash path divergence. After EVERY
+   file write or edit, confirm the file on disk with a bash `ls -la` / `cat` of
+   the ABSOLUTE path. If a file you "wrote" is not visible to bash at the path
+   you expect, check for a doubled-`d` path (D:\d\_projects\... instead of
+   D:\_projects\...) and move it with bash. See Step 0.
+
+---
+
+## 1. Mission
+We are turning the existing Google Takeout downloader into a web-hosted system:
+a real Chrome browser runs ON the server inside a webtop (KasmVNC) container,
+logged into Google once with a persistent profile. A custom extension captures
+the Takeout "all exports" payload and POSTs it to a local FastAPI "manager"
+service, which drives the existing `takeout_dl.py` engine to download every part
+using server storage/bandwidth. Because browser and downloader share one server
+IP, the IP-bound Takeout cookie is always valid (no SOCKS tunnel). The manager
+shows live progress, notifies over Telegram, exposes a control API for the Pi
+agent, and can replay a saved workflow with no LLM. Full design lives in
+`docs/webgui/`. THIS handoff covers Phase 1 only: the single additive engine
+refactor that everything else depends on.
+
+---
+
+## 2. State Snapshot
+**Done already (do NOT redo):**
+- All 8 planning docs exist and are complete in
+  D:\_projects\takeout_downloader_script\docs\webgui\
+  (README.md, 01-architecture.md, 02-manager-service.md, 03-extension-v4.md,
+  04-decision-trees.md, 05-deployment.md, 06-telegram.md, 07-build-phases.md).
+- Decisions locked: webtop/KasmVNC base; tunnel exposes portal only; persistent
+  profile + manual login + auto-re-capture; extension POSTs to manager; Telegram
+  reuses telegram.token from ~/.pi/agent/auth.json.
+- Output-dir design locked: <STORAGE_ROOT>/google-takeout/<account-label>/<export-ts>/
+  plus a per-run manifest.json. See 02-manager-service.md.
+
+**In progress (pick up here):**
+- Phase 1: add `progress_cb` and `auth_cb` callback params to
+  `download_exports()` in takeout_dl.py, WITHOUT changing download/integrity
+  logic. Defaults None => behave exactly as today.
+
+**Not started yet:**
+- Phases 2-10 (manager service, web UI, control plane, extension v4, webtop
+  container, Cloudflare tunnel, Telegram, repeat-without-LLM, hardening).
+  These are specced in docs/webgui/07-build-phases.md. Do NOT start them in this
+  handoff — Phase 1 only.
+
+---
+
+## 3. Read These First (in order)
+1. D:\_projects\takeout_downloader_script\docs\webgui\07-build-phases.md  (Phase 1 section)
+2. D:\_projects\takeout_downloader_script\docs\webgui\02-manager-service.md  ("Engine integration" section)
+3. D:\_projects\takeout_downloader_script\takeout_dl.py  (lines 830-1000: download_exports)
+
+---
+
+## 4. Do This — Numbered Steps
+
+### Step 0: Confirm the path bug is not biting you
+- File: D:\_projects\takeout_downloader_script\docs\webgui\HANDOFF.txt
+- Action: run
+- Exact change:
+  ```
+  ls -la /d/_projects/takeout_downloader_script/docs/webgui/HANDOFF.txt
+  ```
+- Check: the command prints this file's size (non-zero). If it prints "No such
+  file", you are reading a phantom copy — find the real one with:
+  `ls -la /d/d/_projects/takeout_downloader_script/docs/webgui/ 2>/dev/null`
+- If check fails: the tool/bash path divergence is active. For every file you
+  create below, after writing, run a bash `cat` of the absolute path; if absent,
+  move it from the doubled-`d` location with `mv /d/d/... /d/...`.
+
+### Step 1: Read the engine function before touching it
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: read
+- Exact change:
+  ```
+  read takeout_dl.py offset=837 limit=160
+  ```
+- Check: you can see `def download_exports(...)`, the inner `def _set(idx, **kw)`,
+  and the `except _AuthChallenge as e:` block that sets `auth_info["url"]`.
+- If check fails: the line numbers shifted. Search for `def download_exports`
+  and `def _set` and `auth_info["url"] = exp.url` to find the real locations.
+
+### Step 2: Add the two callback params to the signature
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: edit
+- Exact change (oldText -> newText):
+  ```
+  def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
+                       parallel: int) -> None:
+  ->
+  def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
+                       parallel: int, progress_cb=None, auth_cb=None) -> None:
+  ```
+- Check: `grep -n "def download_exports" takeout_dl.py` shows the new signature
+  with `progress_cb=None, auth_cb=None`.
+- If check fails: see Decision Tree A. Re-read the exact lines, recopy oldText.
+
+### Step 3: Call progress_cb from _set
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: edit
+- Exact change (oldText -> newText):
+  ```
+      def _set(idx, **kw):
+          with lock:
+              p = progress.get(idx)
+              if not p:
+                  return
+              for k, v in kw.items():
+                  setattr(p, k, v)
+  ->
+      def _set(idx, **kw):
+          with lock:
+              p = progress.get(idx)
+              if not p:
+                  return
+              for k, v in kw.items():
+                  setattr(p, k, v)
+              if progress_cb is not None:
+                  try:
+                      progress_cb(p)
+                  except Exception:
+                      pass
+  ```
+- Check: `grep -n "progress_cb(p)" takeout_dl.py` returns one line inside _set.
+- If check fails: confirm the _set body matches verbatim (whitespace is 4-space
+  indents). Recopy oldText from the Step 1 read output.
+
+### Step 4: Call auth_cb when the auth challenge fires
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: edit
+- Exact change (oldText -> newText):
+  ```
+                  except _AuthChallenge as e:
+                      if not auth.is_set():
+                          auth_info["url"] = exp.url
+                          auth_info["body"] = e.body
+                          auth.set()
+                      stop.set()
+                      _set(exp.index, status="auth")
+  ->
+                  except _AuthChallenge as e:
+                      if not auth.is_set():
+                          auth_info["url"] = exp.url
+                          auth_info["body"] = e.body
+                          auth.set()
+                          if auth_cb is not None:
+                              try:
+                                  auth_cb(dict(auth_info))
+                              except Exception:
+                                  pass
+                      stop.set()
+                      _set(exp.index, status="auth")
+  ```
+- Check: `grep -n "auth_cb(dict(auth_info))" takeout_dl.py` returns one line.
+- If check fails: the indentation here is deeper (inside _worker > except). Copy
+  oldText verbatim from the Step 1 read output; do not retype.
+
+### Step 5: Verify the engine still imports and parses
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: run
+- Exact change:
+  ```
+  cd /d/_projects/takeout_downloader_script && python -c "import ast; ast.parse(open('takeout_dl.py').read()); print('SYNTAX OK')"
+  ```
+- Check: prints `SYNTAX OK`. (If `python` is not found, try `python3`.)
+- If check fails: a paste mismatch broke indentation. Re-read the changed
+  regions and fix only the indentation; do not change logic.
+
+### Step 6: Prove default behavior is unchanged (callbacks are opt-in)
+- File: D:\_projects\takeout_downloader_script\takeout_dl.py
+- Action: run
+- Exact change:
+  ```
+  cd /d/_projects/takeout_downloader_script && python -c "import inspect, takeout_dl; sig=inspect.signature(takeout_dl.download_exports); print(sig); assert sig.parameters['progress_cb'].default is None; assert sig.parameters['auth_cb'].default is None; print('DEFAULTS OK')"
+  ```
+- Check: prints the signature and `DEFAULTS OK`. This proves CLI/TUI callers
+  that pass no callbacks behave exactly as before.
+- If check fails: the defaults are not None — re-check Step 2's newText.
+
+### Step 7: Record completion
+- File: D:\_projects\takeout_downloader_script\docs\webgui\07-build-phases.md
+- Action: edit
+- Exact change (oldText -> newText): change the Phase 1 gate marker only.
+  ```
+  ## Phase 1 — Engine callback seam (the only engine change)
+  ->
+  ## Phase 1 — Engine callback seam (the only engine change)   [DONE]
+  ```
+- Check: `grep -n "Phase 1 — Engine callback seam" 07-build-phases.md` shows
+  `[DONE]`.
+- If check fails: the heading text differs slightly; grep for "Engine callback
+  seam" and append `   [DONE]` to that heading line only.
+
+---
+
+## 5. Decision Trees
+> Use these ONLY when a step is ambiguous or a choice comes up.
+
+### Tree A — Editing a file safely
+```
+I need to edit a file.
+├── Did I read the exact lines first?
+│   ├── NO  -> read the file at those lines FIRST, then come back
+│   └── YES -> continue
+├── Is my oldText an EXACT copy from the read output (incl. whitespace)?
+│   ├── NO  -> recopy it verbatim; do not retype from memory
+│   └── YES -> continue
+├── Multiple changes in the same file?
+│   └── Put non-overlapping changes in ONE edit call
+└── Is the change destructive (delete / overwrite working code)?
+    ├── YES -> STOP and ask first
+    └── NO  -> proceed, then run the step's Check
+```
+
+### Tree B — A check failed
+```
+My step's Check did not pass.
+├── Error says "could not find oldText"?
+│   └── re-read the lines, recopy oldText verbatim, retry ONCE
+├── Error is about a missing file / path?
+│   └── confirm the path in Section 3; suspect the doubled-d path bug (Step 0)
+├── Command output differs from "Expected"?
+│   └── re-read the step; change ONLY what the step describes
+└── Still failing after 2 tries?
+    └── STOP. Write the error + what you tried. Ask. Do not continue.
+```
+
+### Tree C — Should I do this thing the step didn't mention?
+```
+I think something extra is needed.
+├── Is it in the numbered steps?
+│   └── YES -> do it when you reach that step, not now
+├── Is it in "Don't Touch" (Section 6)?
+│   └── YES -> do NOT do it
+└── Not mentioned anywhere?
+    └── Do NOT do it on your own. Note it and ask first.
+```
+
+### Tree D — File written but bash can't see it (the path bug)
+```
+I wrote/edited a file and the tool said success.
+├── Does `ls -la <absolute path>` in bash show it?
+│   ├── YES -> good, continue
+│   └── NO  -> check `/d/d/_projects/...` (doubled d)
+│              ├── found there -> `mv` it to the correct `/d/_projects/...`
+│              └── not found   -> STOP and ask
+```
+
+---
+
+## 6. Don't Touch
+- The capture logic in helpers/background.js and helpers/content.js (the
+  webRequest listener on takeout-download.usercontent.google.com). It is correct
+  and hard-won; extension changes belong to Phase 5, not now.
+- The download/integrity logic inside `_stream_one` (PK magic-byte check, Range
+  resume, ZIP end-of-central-directory check). Phase 1 only ADDS callbacks; it
+  must not alter how bytes are fetched or validated.
+- `validate_output_dir`, `parse_payload`, `validate_cookie` — do not modify.
+- /d/AI/FramePack and the older /d/d/d/_projects test artifacts — not part of
+  this project; leave them alone.
+- Anything under docs/webgui/ other than the Phase 1 marker in 07-build-phases.md.
+
+---
+
+## 7. If You Get Stuck
+1. Re-read Section 1 (Mission) and Section 2 (State Snapshot).
+2. Find your situation in the Decision Trees (Section 5).
+3. Re-read the current step — change only what it names.
+4. If a check fails twice: STOP, write the exact error and what you tried,
+   and ask. Never guess a path, an edit target, or "what was probably meant."
+
+## 8. When Phase 1 is done
+Report: "Phase 1 complete — download_exports has progress_cb/auth_cb, defaults
+None, syntax + defaults checks pass." Then the next work is Phase 2 (manager
+service core), specced in docs/webgui/02-manager-service.md and
+docs/webgui/07-build-phases.md. Do NOT start Phase 2 without the user's go-ahead.

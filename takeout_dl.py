@@ -835,8 +835,17 @@ class _AuthChallenge(Exception):
 
 
 def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
-                     parallel: int) -> None:
+                     parallel: int, progress_cb=None, auth_cb=None) -> None:
     """Internal threaded downloader (no aria2c).
+
+    progress_cb / auth_cb are OPTIONAL observation hooks (added for the web
+    manager; see docs/webgui/02-manager-service.md). When both are None the
+    function behaves EXACTLY as before — no behavior change for the CLI/TUI.
+      - progress_cb(part): called with a COPY of a PartProgress whenever a
+        part's state changes. Never holds the internal lock while calling.
+      - auth_cb(info): called once, on the first auth challenge, with a copy
+        of {"url", "body"}. The download/integrity/resume logic is unchanged;
+        this is a notification only.
 
     Every response's first bytes are inspected before the output file is
     opened for writing, so Google's HTML sign-in page can NEVER be saved as
@@ -868,12 +877,20 @@ def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
     retry_wait = 5.0
 
     def _set(idx, **kw):
+        snapshot = None
         with lock:
             p = progress.get(idx)
             if not p:
                 return
             for k, v in kw.items():
                 setattr(p, k, v)
+            if progress_cb is not None:
+                snapshot = PartProgress(**vars(p))
+        if snapshot is not None:
+            try:
+                progress_cb(snapshot)
+            except Exception:
+                log.debug("progress_cb raised", exc_info=True)
 
     def _stream_one(exp, session):
         dest = output_dir / exp.filename
@@ -972,12 +989,19 @@ def download_exports(exports: list[Export], payload: Payload, output_dir: Path,
                 try:
                     _stream_one(exp, session)
                 except _AuthChallenge as e:
+                    first_auth = False
                     if not auth.is_set():
                         auth_info["url"] = exp.url
                         auth_info["body"] = e.body
                         auth.set()
+                        first_auth = True
                     stop.set()
                     _set(exp.index, status="auth")
+                    if first_auth and auth_cb is not None:
+                        try:
+                            auth_cb(dict(auth_info))
+                        except Exception:
+                            log.debug("auth_cb raised", exc_info=True)
                 except Exception as e:
                     log.warning("part %03d failed: %r", exp.index, e)
                     _set(exp.index, status="error")

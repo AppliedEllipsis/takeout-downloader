@@ -17,15 +17,27 @@ master checklist that drives the actual build (and guides weaker models).
 **Gate:** a written note in this folder confirming the two hook points exist and
 the storage/clone paths are correct on the server.
 
-## Phase 1 — Engine callback seam (the only engine change)
+## Phase 1 — Engine callback seam (the only engine change) ✅
 
-⬜ Add optional `progress_cb` and `auth_cb` params to `download_exports()`.
-⬜ Call `progress_cb(part)` from `_set()`; call `auth_cb(auth_info)` on challenge.
-⬜ Defaults `None` → identical CLI/TUI behavior.
-⬜ Unit test: run a tiny fake export set, assert callbacks fire and that with
+✅ Add optional `progress_cb` and `auth_cb` params to `download_exports()`.
+✅ Call `progress_cb(part)` from `_set()`; call `auth_cb(auth_info)` on challenge.
+✅ Defaults `None` → identical CLI/TUI behavior.
+✅ Unit test: run a tiny fake export set, assert callbacks fire and that with
    `progress_cb=None` output is byte-identical to today.
 
 **Gate:** existing CLI download still works unchanged; callbacks observed in test.
+
+**DONE 2026-06-22.** Implemented in `takeout_dl.py`:
+- `download_exports(..., progress_cb=None, auth_cb=None)` — both optional.
+- `progress_cb` called from `_set()` with a `PartProgress` copy, never under the
+  lock (snapshot taken inside lock, callback fired outside). Exceptions in the
+  callback are swallowed (logged at debug) so a bad observer can't break a download.
+- `auth_cb` called exactly once on the first auth challenge (guarded by the
+  existing cross-thread `auth.set()`), with a copy of `{"url", "body"}`.
+- Verified: with callbacks `None`, downloads produce byte-identical valid zips
+  (3/3 test parts). With callbacks set, 9 progress events observed across
+  active→done. auth_cb fires once on an HTML-login challenge, no fake zip is
+  written, and `AuthError` still propagates. `py_compile` clean.
 
 ## Phase 2 — Manager service core (localhost only)
 

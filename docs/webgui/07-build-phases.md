@@ -125,16 +125,34 @@ auto-send toggle. Manager-side contract verified in
 `manager/tests/test_phase5_v4contract.py` (email→label, recapture-pending token
 gating + pending flag). JS validated with `node --check` (all three files).
 
-## Phase 6 — webtop container + persistence
+## Phase 6 — webtop container + persistence ✅
 
-⬜ Compose service from `linuxserver/webtop` (KasmVNC, audio, `/config` volume).
-⬜ Chromium launched with `--remote-debugging-port=9222` (localhost).
-⬜ Manager runs alongside (same container init or sibling), storage mounted.
-⬜ Seed profile: extension loaded, bookmarks, pinned action, default tabs.
+✅ Compose service from `linuxserver/webtop` (KasmVNC, audio, `/config` volume).
+✅ Chromium launched with `--remote-debugging-port=9222` (localhost).
+✅ Manager runs alongside (same container init or sibling), storage mounted.
+✅ Seed profile: extension loaded, bookmarks, pinned action, default tabs.
 
 **Gate:** open the KasmVNC portal locally (before tunnel), log into Google,
 confirm profile + extension + bookmarks persist across a container restart, and
 that audio reaches the browser tab.
+
+**DONE 2026-06-22 (infra authored; runtime gate is server-side).** Files:
+- `webgui/Dockerfile.webtop` — `lscr.io/linuxserver/webtop:ubuntu-kde` base +
+  chromium + a `/opt/manager-venv` Python venv (manager deps installed from
+  `manager/requirements.txt`).
+- `webgui/init_custom.sh` (`/custom-cont-init.d`) — writes the chromium launcher
+  (CDP on 127.0.0.1:9222, `--load-extension=/work/helpers`, opens Takeout +
+  manager tabs), an autostart `.desktop`, seeds bookmarks + the extension's
+  `managerUrl`/`captureToken` into the profile on first boot.
+- `webgui/manager-service.sh` (`/custom-services.d`) — s6-supervised uvicorn
+  running `manager.app:app` from the bind-mounted `/work` (auto-restart =
+  crash recovery).
+- `docker-compose.webgui.yml` — webgui + cloudflared services. **8080 and 9222
+  bind 127.0.0.1 only** (verified); `/opt` rbind+rslave for JuiceFS submounts;
+  `/config` persistent profile; shm 2gb; `/dev/dri` passthrough.
+- `webgui/profile-seed/` (Bookmarks, managed-policy.json, README) + `.env.example`.
+- The runtime gate (log into Google, confirm persistence + audio) can only be
+  exercised on the server with Docker; YAML/JSON/shell all syntax-validated locally.
 
 ## Phase 7 — Cloudflare tunnel (portal only)
 

@@ -1,0 +1,27 @@
+# Cloudflare tunnel — PORTAL ONLY.
+#
+# This config exposes ONLY the KasmVNC portal (127.0.0.1:3000). There is NO
+# ingress rule for the manager (8080) or Chromium CDP (9222), so they are
+# unreachable from the internet even if someone guesses the hostname. Reach
+# those over SSH:  ssh -L 8080:127.0.0.1:8080 -L 9222:127.0.0.1:9222 user@server
+#
+# Two ways to run the tunnel:
+#   A) Token mode (simplest): set CLOUDFLARE_TUNNEL_TOKEN in .env and the
+#      compose `command: tunnel --no-autoupdate run` uses it. This file is then
+#      optional (the dashboard holds the ingress mapping). Point the dashboard
+#      public hostname at http://127.0.0.1:3000.
+#   B) Config mode (this file): replace <TUNNEL_ID> + credentials, and change
+#      the compose command to:
+#        tunnel --config /etc/cloudflared/config.yml run
+#
+# After the tunnel is up, GATE IT with Cloudflare Access (email/SSO) — the
+# browser is logged into your Google account, so the portal must not be open.
+# See docs/webgui/05-deployment.md ("Cloudflare Access").
+
+tunnel: <TUNNEL_ID>
+credentials-file: /etc/cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: takeout.example.com      # <-- your hostname
+    service: http://127.0.0.1:3000     # KasmVNC portal ONLY
+  - service: http_status:404           # refuse everything else

@@ -1,0 +1,63 @@
+# Takeout web-hosted browser + manager.
+#
+# Base: linuxserver/webtop (KasmVNC desktop in the browser, with audio).
+# We add: Python + the manager's deps, Chromium launch wiring, and the
+# profile-seed copied in by init_custom.sh on first boot.
+#
+# Design + rationale: docs/webgui/05-deployment.md (Phase 6).
+#
+# The webtop image runs an s6 init; custom setup goes in
+# /custom-cont-init.d/ (run once at container start, as root) and the
+# manager is launched as a long-running service from /custom-services.d/.
+#
+# We deliberately do NOT bake the app source into the image — it is
+# bind-mounted at /work (engine + manager + helpers) so a `git pull` on the
+# host updates the running code with no rebuild, exactly like the existing
+# takeout-cli image.
+
+FROM lscr.io/linuxserver/webtop:ubuntu-kde
+
+# --- system deps -------------------------------------------------------------
+# chromium: the browser we host (the webtop ships a browser but we pin
+#   chromium for the --load-extension + --remote-debugging-port flags).
+# python3 + venv + pip: run the FastAPI manager.
+# Note: webtop is Ubuntu-based; chromium installs as a deb (not snap) here.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium-browser \
+        python3 \
+        python3-venv \
+        python3-pip \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    || (echo "chromium-browser deb unavailable; trying 'chromium'" && \
+        apt-get update && apt-get install -y --no-install-recommends chromium && \
+        rm -rf /var/lib/apt/lists/*)
+
+# --- manager python deps -----------------------------------------------------
+# Installed into a venv at /opt/manager-venv so they don't collide with the
+# system python the desktop uses. requirements pinned (fastapi+starlette compat,
+# see docs/webgui/08-decisions-log.md).
+COPY manager/requirements.txt /tmp/manager-requirements.txt
+RUN python3 -m venv /opt/manager-venv \
+    && /opt/manager-venv/bin/pip install --no-cache-dir -U pip \
+    && /opt/manager-venv/bin/pip install --no-cache-dir -r /tmp/manager-requirements.txt
+
+# --- init + service hooks ----------------------------------------------------
+# 99-takeout-init: first-boot profile seeding (bookmarks, managed-storage
+#   policy with the manager URL/token, default tabs). Idempotent.
+COPY webgui/init_custom.sh /custom-cont-init.d/99-takeout-init
+# The manager long-running service (s6 supervises + restarts it).
+COPY webgui/manager-service.sh /custom-services.d/takeout-manager
+RUN chmod +x /custom-cont-init.d/99-takeout-init /custom-services.d/takeout-manager
+
+# Manager listens here (localhost only; never published to 0.0.0.0 — the
+# compose file binds it to 127.0.0.1 on the host).
+ENV MANAGER_HOST=127.0.0.1 \
+    MANAGER_PORT=8080 \
+    STORAGE_ROOT=/opt \
+    PYTHONUNBUFFERED=1
+
+# KasmVNC portal (3000/3001), manager (8080), CDP (9222). EXPOSE is
+# documentation only; the compose file controls host publishing.
+EXPOSE 3000 3001 8080 9222

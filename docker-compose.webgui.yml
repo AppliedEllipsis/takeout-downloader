@@ -1,0 +1,85 @@
+# Takeout web-hosted browser + download manager.
+#
+# ONE webtop container hosts Chromium (logged into Google, extension v4 loaded,
+# CDP on 127.0.0.1:9222) AND runs the FastAPI manager (127.0.0.1:8080). A
+# sidecar cloudflared shares the container network namespace and exposes ONLY
+# the KasmVNC portal (:3000) to the internet.
+#
+# Security posture (docs/webgui/01-architecture.md, 05-deployment.md):
+#   - 3000 KasmVNC portal  -> cloudflared -> public, gate with Cloudflare Access
+#   - 8080 manager UI+API  -> 127.0.0.1 only (SSH-forward for the Pi agent)
+#   - 9222 Chromium CDP    -> 127.0.0.1 only (SSH-forward for the Pi agent)
+# The manager + CDP are NEVER exposed by the tunnel. A Google-logged-in browser
+# is account-equivalent, so its control plane stays on localhost.
+#
+# Run:
+#   cp webgui/.env.example .env   # fill tokens
+#   docker compose -f docker-compose.webgui.yml up -d
+#
+# Update code (engine/manager/extension are bind-mounted at /work):
+#   git pull && docker compose -f docker-compose.webgui.yml restart webgui
+# Rebuild only when Dockerfile.webtop / system deps change:
+#   docker compose -f docker-compose.webgui.yml build webgui
+
+services:
+  webgui:
+    build:
+      context: .
+      dockerfile: webgui/Dockerfile.webtop
+    image: takeout-webgui:latest
+    container_name: takeout-webgui
+    security_opt:
+      - seccomp:unconfined          # Chromium sandbox under KasmVNC
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: ${TZ:-Etc/UTC}
+      TITLE: "Takeout Browser"
+      # Manager binds localhost INSIDE the container; the host port mapping
+      # below pins it to 127.0.0.1 on the server too.
+      MANAGER_HOST: "127.0.0.1"
+      MANAGER_PORT: "8080"
+      STORAGE_ROOT: ${STORAGE_ROOT:-/opt}
+      MANAGER_API_TOKEN: ${MANAGER_API_TOKEN:-}
+      MANAGER_CAPTURE_TOKEN: ${MANAGER_CAPTURE_TOKEN:-}
+      MANAGER_PUBLIC_URL: ${MANAGER_PUBLIC_URL:-http://127.0.0.1:8080}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-true}
+    volumes:
+      - ./config:/config            # PERSISTENT: browser profile + KasmVNC creds
+      - .:/work                     # live source (engine + manager + extension)
+      - type: bind
+        source: ${STORAGE_ROOT:-/opt}
+        target: ${STORAGE_ROOT:-/opt}
+        bind:
+          propagation: rslave
+          recursive: enabled        # JuiceFS/encfs submounts visible in-container
+    devices:
+      - /dev/dri:/dev/dri           # GPU passthrough (KasmVNC perf); remove if absent
+    shm_size: "2gb"                 # prevent Chromium tab crashes
+    ports:
+      - "127.0.0.1:3000:3000"       # KasmVNC HTTP portal  -> cloudflared attaches
+      - "127.0.0.1:8080:8080"       # manager UI+API       -> SSH-forward only
+      - "127.0.0.1:9222:9222"       # Chromium CDP         -> SSH-forward only
+    restart: unless-stopped
+
+  # Cloudflare tunnel. Shares webgui's network namespace so it can reach the
+  # portal on 127.0.0.1:3000 without publishing any extra host port.
+  # Provide a tunnel token in .env (CLOUDFLARE_TUNNEL_TOKEN) OR mount a
+  # credentials file + config.yml (see webgui/cloudflared/config.yml).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: takeout-tunnel
+    network_mode: "service:webgui"
+    depends_on:
+      - webgui
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    volumes:
+      - ./webgui/cloudflared:/etc/cloudflared:ro
+    restart: unless-stopped

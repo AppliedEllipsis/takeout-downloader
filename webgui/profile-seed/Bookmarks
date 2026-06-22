@@ -1,0 +1,52 @@
+{
+  "checksum": "",
+  "roots": {
+    "bookmark_bar": {
+      "children": [
+        {
+          "date_added": "13350000000000000",
+          "name": "Takeout",
+          "type": "url",
+          "url": "https://takeout.google.com/"
+        },
+        {
+          "date_added": "13350000000000000",
+          "name": "Manage exports",
+          "type": "url",
+          "url": "https://takeout.google.com/settings/takeout/downloads"
+        },
+        {
+          "date_added": "13350000000000000",
+          "name": "Download Manager",
+          "type": "url",
+          "url": "http://127.0.0.1:8080/"
+        },
+        {
+          "date_added": "13350000000000000",
+          "name": "Recipes",
+          "type": "url",
+          "url": "http://127.0.0.1:8080/#recipes"
+        }
+      ],
+      "date_added": "13350000000000000",
+      "date_modified": "0",
+      "name": "Bookmarks bar",
+      "type": "folder"
+    },
+    "other": {
+      "children": [],
+      "date_added": "13350000000000000",
+      "date_modified": "0",
+      "name": "Other bookmarks",
+      "type": "folder"
+    },
+    "synced": {
+      "children": [],
+      "date_added": "13350000000000000",
+      "date_modified": "0",
+      "name": "Mobile bookmarks",
+      "type": "folder"
+    }
+  },
+  "version": 1
+}

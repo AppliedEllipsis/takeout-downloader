@@ -123,7 +123,23 @@ class Manifest:
     # -- finalize -------------------------------------------------------------
     def finalize(self, job, completed: bool) -> None:
         with self._lock:
-            files = self._data.get("files", {})
+            # Reconcile the files list from the job's AUTHORITATIVE parts dict.
+            # record_part() writes incrementally during the run, but under
+            # parallel completion a terminal callback can be missed; the job's
+            # parts dict is the source of truth, so we rebuild from it here.
+            job_parts = getattr(job, "parts", {}) or {}
+            files = self._data.setdefault("files", {})
+            for idx, part in job_parts.items():
+                files[str(idx)] = {
+                    "index": part.get("index", idx),
+                    "filename": part.get("filename"),
+                    "size": part.get("size"),
+                    "sha256": part.get("sha256"),
+                    "started_at": part.get("started_at"),
+                    "completed_at": part.get("completed_at"),
+                    "zip_valid": part.get("zip_valid"),
+                    "status": part.get("status"),
+                }
             self._data["completed_at"] = _now() if completed else None
             self._data["parts_done"] = sum(
                 1 for f in files.values() if f.get("status") == "done")

@@ -1,7 +1,11 @@
 # Web-Hosted Takeout Browser + Download Manager — Planning Index
 
-Status: **PLANNING ONLY**. No code written yet. This folder is the design
-authority. Build steps come later, driven by these docs.
+Status: **IMPLEMENTED (Phases 1-10)**. This folder is the design authority; the
+code in `manager/`, `helpers/` (v4), `webgui/`, and the `takeout_dl.py` callback
+seam was built from it. Phases 1-5, 8, 9 are verified by offline tests in
+`manager/tests/`; phases 6-7 (webtop container + Cloudflare tunnel) are authored
+infra whose runtime gate is server-side. See `07-build-phases.md` for the
+per-phase status and `09-smoke-test.md` for the end-to-end server runbook.
 
 ## The one-paragraph idea
 
@@ -55,6 +59,8 @@ goal: capture a workflow once, then **repeat it without an LLM**.
 | [`05-deployment.md`](./05-deployment.md) | Server build, compose, Cloudflare tunnel, security hardening | Operator |
 | [`06-telegram.md`](./06-telegram.md) | Telegram bot wiring, commands, config keys | Implementer |
 | [`07-build-phases.md`](./07-build-phases.md) | Ordered build phases with acceptance gates | Implementer |
+| [`08-decisions-log.md`](./08-decisions-log.md) | Build-time decisions (the "why" companion to the code) | Anyone |
+| [`09-smoke-test.md`](./09-smoke-test.md) | Server deploy + end-to-end smoke-test runbook | Operator |
 
 ## Existing assets this builds on
 

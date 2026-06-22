@@ -15,6 +15,17 @@ is auto-sent anywhere.
 > for the full workflow and **[`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md)**
 > for auth/cookie failures.
 
+> 🌐 **Web-hosted browser + download manager (new).** Instead of the SOCKS
+> tunnel + local proxied Chrome, you can run a real Chrome **on the server**
+> inside a webtop (KasmVNC) container reached over a Cloudflare tunnel. Because
+> the browser and the downloader share one server IP, the IP-bound cookie is
+> always valid — no tunnel dance. A custom extension POSTs captures to a local
+> FastAPI **manager** that drives the engine, shows live progress, alerts over
+> Telegram, and can replay a workflow with no LLM. Output lands in dated
+> per-account folders (`<account>/<export-ts>/`) with a `manifest.json`. See
+> **[`docs/webgui/README.md`](./docs/webgui/README.md)** for the full design and
+> **[`docs/webgui/09-smoke-test.md`](./docs/webgui/09-smoke-test.md)** to deploy.
+
 ## How it works
 
 ```

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -28,6 +29,7 @@ from . import jobs as J
 from . import notify as N
 from .recipes import RecipeStore, CdpTrigger
 
+log = logging.getLogger("manager.app")
 cfg = get_config()
 orch = get_orchestrator()
 app = FastAPI(title="Takeout Manager", version="0.1.0")
@@ -65,8 +67,31 @@ def _telegram_sink(kind: str, summary: dict) -> None:
 
 orch.subscribe(_telegram_sink)
 
+def _security_self_check() -> list[str]:
+    """Return a list of security warnings. Empty list == hardened.
+
+    The dangerous case is binding beyond localhost WITHOUT tokens: that exposes a
+    browser logged into the user's Google account to anyone who can reach the
+    port. By design (docs/webgui/01-architecture.md) the manager binds 127.0.0.1
+    and is reached only via SSH forward; this check is a loud backstop if someone
+    overrides MANAGER_HOST.
+    """
+    warnings = []
+    non_local = cfg.host not in ("127.0.0.1", "localhost", "::1")
+    if non_local and not cfg.capture_token:
+        warnings.append(
+            f"manager bound to {cfg.host} with NO MANAGER_CAPTURE_TOKEN "
+            "-> anyone reachable can POST payloads. Set a token or bind 127.0.0.1.")
+    if non_local and not cfg.api_token:
+        warnings.append(
+            f"manager bound to {cfg.host} with NO MANAGER_API_TOKEN "
+            "-> control plane is open. Set a token or bind 127.0.0.1.")
+    return warnings
+
 @app.on_event("startup")
 async def _startup():
+    for w in _security_self_check():
+        log.warning("SECURITY: %s", w)
     # Recover persisted jobs so they're visible after a restart.
     try:
         orch.recover()

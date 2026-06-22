@@ -58,3 +58,53 @@ settled choices.
   POST /api/payload) and `MANAGER_API_TOKEN` (control plane). In Phase 2 the
   control plane is read-only; tokens are enforced in Phase 4. Empty token =
   open surface (dev only), logged as a warning.
+
+---
+
+## Phase 8 — Telegram (2026-06-22)
+
+- **stdlib only.** `notify.py` uses `urllib` for the Bot API (sendMessage,
+  getUpdates) so it adds no dependency. The notifier is a no-op when token/chat
+  id are unset, so the manager runs fully without Telegram.
+- **Job-snapshot-in, text-out.** `send_event(kind, job_dict)` formats from a
+  plain dict, so it's testable offline (no engine import). Verified by
+  monkeypatching `_api_call`.
+- **Confirm flow fix.** `/run` and `/recapture` are destructive, so they arm a
+  pending-confirm and require `/yes`. The first implementation re-armed forever
+  because `/yes` re-dispatched the command, which then re-armed. Fixed with a
+  `_confirmed` marker that the re-dispatch sets and clears in a `finally`.
+- **Chat-scoped authz.** `_chat_ok()` accepts only the configured chat id;
+  refactored to take a raw id OR an update/message dict so the poll loop and the
+  test share one path.
+
+---
+
+## Phase 9 — Repeat-without-LLM (2026-06-22)
+
+- **CDP trigger injected, not hardcoded.** `RecipeStore` takes a `trigger`
+  callable. Production uses `CdpTrigger` (drives the hosted Chromium over
+  DevTools Protocol to re-open Takeout). Tests pass a fake trigger, so replay
+  logic is verified without a browser. With no trigger, `run()` is a safe no-op.
+- **Recipes auto-recorded on completion.** The event sink records a recipe from
+  the completed job snapshot, so a successful first run becomes replayable with
+  no extra step. Identity meta is carried so a replay re-derives the dated dir.
+
+---
+
+## Phase 10 — Hardening & docs (2026-06-22)
+
+- **Manifest race fix (caught by the full re-run).** `record_part()` is called
+  per-part from the progress callback; under parallel completion the
+  read-modify-write of the files dict lost an entry intermittently (Phase 2 test
+  flapped: 2 of 3 files in the manifest). Fixed by making `finalize()` the
+  authoritative reconciler: it rebuilds the files list from the job's `parts`
+  dict (the source of truth, which was always correct) rather than trusting the
+  incremental writes. Re-ran Phase 2 ×3 + full suite: stable. Lesson: incremental
+  side-writes from a parallel callback need a final reconcile pass.
+- **Security self-check at startup.** If `MANAGER_HOST` is overridden to a
+  non-localhost bind without a capture token, the manager logs a loud SECURITY
+  warning. By design it binds 127.0.0.1 and is reached via SSH forward; this is
+  the backstop if someone changes that.
+- **Secrets hygiene.** `.gitignore` covers `.env`/`.env.*`; only `.env.example`
+  (placeholders) is tracked. Tokens are generated with `openssl rand -hex 32`
+  and live in the server `.env` (mode 600), never in the image or git.

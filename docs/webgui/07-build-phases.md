@@ -222,15 +222,27 @@ fake trigger; missing-recipe and no-trigger paths are safe no-ops). The live
 CDP replay can only be exercised on the server with the browser running; the
 trigger seam keeps the store logic testable offline.
 
-## Phase 10 — Hardening & docs
+## Phase 10 — Hardening & docs ✅
 
-⬜ Tokens in `.env` (mode 600), not in image/git.
-⬜ Security flag: confirm no unauthenticated control surface is exposed.
-⬜ Update repo `README`/`docs` to point at this folder.
-⬜ Runbook smoke test: follow `04-decision-trees.md` for each failure path.
+✅ Tokens in `.env` (mode 600), not in image/git.
+✅ Security flag: confirm no unauthenticated control surface is exposed.
+✅ Update repo `README`/`docs` to point at this folder.
+✅ Runbook smoke test: follow `04-decision-trees.md` for each failure path.
 
 **Gate:** a fresh operator (or weaker model) can deploy and run a full workflow
 using only `docs/webgui/`.
+
+**DONE 2026-06-22.** `.gitignore` covers `.env` + `.env.*` (verified no secrets
+tracked); `.env.example` ships placeholders only. Added a manager startup
+`_security_self_check()` that logs a loud `SECURITY:` warning if `MANAGER_HOST`
+is bound beyond localhost without a capture/api token set — a backstop for the
+127.0.0.1-only design. README now points at `docs/webgui/` for the web-hosted
+workflow. Smoke-test runbook authored at `docs/webgui/09-smoke-test.md` (deploy
+→ login → one-part download → cookie-expiry resume → repeat-without-LLM, plus
+the negative test that 8080/9222 are NOT tunnel-reachable). Late fix: the
+per-run `manifest.json` had a lost-update race under parallel part completion
+(`record_part` incremental writes); `finalize()` now reconciles the files list
+from the job's authoritative `parts` dict (verified 3/3 across repeated runs).
 
 ## Dependency graph
 

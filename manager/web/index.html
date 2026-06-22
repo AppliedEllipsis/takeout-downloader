@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Takeout Manager</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <h1>Takeout Download Manager</h1>
+  <div id="health" class="health" title="manager health">…</div>
+</header>
+
+<main>
+  <section id="jobs-panel">
+    <h2>Jobs</h2>
+    <div id="jobs-list" class="jobs-list">
+      <p class="dim" id="no-jobs">No jobs yet. Capture a Takeout export in the browser to start one.</p>
+    </div>
+  </section>
+
+  <section id="detail-panel" hidden>
+    <div class="detail-head">
+      <h2 id="detail-title">—</h2>
+      <span id="detail-status" class="badge">—</span>
+      <div class="spacer"></div>
+      <button data-act="pause" class="btn">Pause</button>
+      <button data-act="resume" class="btn">Resume</button>
+      <button data-act="recapture" class="btn">Re-capture cookie</button>
+      <button data-act="cancel" class="btn danger">Cancel</button>
+    </div>
+
+    <div id="needs-cookie-banner" class="banner warn" hidden>
+      🔑 Cookie expired. Waiting for a fresh capture from the browser extension.
+      The session re-captures automatically; if it can't, log in via the portal.
+    </div>
+
+    <div class="totals" id="detail-totals"></div>
+    <div class="progress-big"><div id="overall-bar" class="bar"></div></div>
+
+    <table class="parts">
+      <thead>
+        <tr><th>#</th><th>File</th><th>Size</th><th>Progress</th><th>Status</th></tr>
+      </thead>
+      <tbody id="parts-body"></tbody>
+    </table>
+
+    <details class="logbox">
+      <summary>Engine log (tail)</summary>
+      <pre id="log-tail" class="log">…</pre>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <span class="dim">Localhost manager · view inside the hosted browser or over an SSH forward.</span>
+</footer>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

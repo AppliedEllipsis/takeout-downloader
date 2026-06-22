@@ -1,0 +1,89 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel2: #1f232c;
+  --fg: #e6e8eb;
+  --dim: #8b929e;
+  --accent: #4f8cff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --border: #2a2f3a;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+header, footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+footer { border-top: 1px solid var(--border); border-bottom: none; }
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+main { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px 20px; align-items: start; }
+.dim { color: var(--dim); }
+.spacer { flex: 1; }
+
+.health { margin-left: auto; font-size: 12px; padding: 4px 10px; border-radius: 12px; background: var(--panel2); }
+.health.ok { color: var(--ok); }
+.health.bad { color: var(--err); }
+
+.jobs-list { display: flex; flex-direction: column; gap: 8px; }
+.job-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; cursor: pointer; transition: border-color .15s;
+}
+.job-card:hover { border-color: var(--accent); }
+.job-card.active { border-color: var(--accent); }
+.job-card .jc-top { display: flex; justify-content: space-between; gap: 8px; }
+.job-card .jc-name { font-weight: 600; word-break: break-all; }
+.job-card .jc-sub { font-size: 12px; color: var(--dim); margin-top: 4px; }
+
+.badge { padding: 2px 9px; border-radius: 10px; font-size: 12px; background: var(--panel2); text-transform: capitalize; white-space: nowrap; }
+.badge.downloading { color: var(--accent); }
+.badge.complete { color: var(--ok); }
+.badge.needs_cookie { color: var(--warn); }
+.badge.error { color: var(--err); }
+.badge.paused, .badge.queued, .badge.idle { color: var(--dim); }
+
+#detail-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.detail-head h2 { margin: 0; color: var(--fg); text-transform: none; letter-spacing: 0; font-size: 16px; word-break: break-all; }
+
+.btn { background: var(--panel2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+.btn:hover { border-color: var(--accent); }
+.btn.danger:hover { border-color: var(--err); color: var(--err); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.banner { padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+.banner.warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
+
+.totals { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; font-size: 13px; }
+.totals b { color: var(--fg); }
+
+.progress-big { height: 10px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin-bottom: 16px; }
+.progress-big .bar { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+
+table.parts { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.parts th, table.parts td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+table.parts th { color: var(--dim); font-weight: 500; }
+.minibar { height: 6px; width: 120px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+.minibar > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+td .st-done { color: var(--ok); }
+td .st-active { color: var(--accent); }
+td .st-error, td .st-auth { color: var(--err); }
+td .st-queued { color: var(--dim); }
+
+.logbox { margin-top: 16px; }
+.logbox summary { cursor: pointer; color: var(--dim); }
+.log { background: #0a0c10; border: 1px solid var(--border); border-radius: 6px; padding: 10px; max-height: 240px; overflow: auto; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; }
+
+@media (max-width: 760px) { main { grid-template-columns: 1fr; } }

@@ -64,12 +64,19 @@ starlette 1.0. See `08-decisions-log.md`.
 
 ## Phase 3 — Progress web UI
 
-⬜ Static UI at `/`: jobs list, per-job parts table, live bars over SSE.
-⬜ Cookie-age indicator + `needs_cookie` banner.
-⬜ Buttons wired to control endpoints (pause/resume/recapture).
+✅ Static UI at `/`: jobs list, per-job parts table, live bars over SSE.
+✅ Cookie-age indicator + `needs_cookie` banner.
+✅ Buttons wired to control endpoints (pause/resume/recapture).
 
 **Gate:** open `http://127.0.0.1:8080` in the hosted Chrome; watch a live
 download; pause/resume works.
+
+**DONE 2026-06-22.** Single-page UI in `manager/web/` (index.html + app.css +
+app.js), served at `/` and `/ui/`. Jobs list (left), per-job parts table with
+live per-part progress bars driven by the SSE `/api/jobs/{id}/events` stream,
+overall totals header, cookie-age indicator, and a `needs_cookie` banner. Control
+buttons (pause/resume/cancel/recapture) call the Phase 4 endpoints. Verified the
+UI assets + endpoints serve via TestClient.
 
 ## Phase 4 — Control plane + diagnose
 

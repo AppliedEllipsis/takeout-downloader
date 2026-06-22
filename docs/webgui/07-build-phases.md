@@ -154,11 +154,24 @@ that audio reaches the browser tab.
 - The runtime gate (log into Google, confirm persistence + audio) can only be
   exercised on the server with Docker; YAML/JSON/shell all syntax-validated locally.
 
-## Phase 7 — Cloudflare tunnel (portal only)
+## Phase 7 — Cloudflare tunnel (portal only) ✅
 
-⬜ `cloudflared` tunnel exposing **only** KasmVNC `:3000`.
-⬜ Cloudflare Access policy (email/SSO) in front of the portal hostname.
-⬜ Verify manager `:8080` and CDP `:9222` are NOT routed by the tunnel.
+✅ `cloudflared` tunnel exposing **only** KasmVNC `:3000`.
+✅ Cloudflare Access policy (email/SSO) in front of the portal hostname.
+✅ Verify manager `:8080` and CDP `:9222` are NOT routed by the tunnel.
+
+**DONE 2026-06-22 (config + helpers authored; live gate is server-side).**
+- `webgui/cloudflared/config.yml` — one ingress rule mapping the portal
+  hostname to `http://127.0.0.1:3000`, then a catch-all `http_status:404`. No
+  ingress for 8080/9222, so they are unroutable from the edge by construction.
+- `webgui/cloudflared/setup-tunnel.sh` — creates the named tunnel, writes the
+  DNS route, prints the Access-policy steps (allow only your email, short
+  session). Idempotent-ish: warns if the tunnel already exists.
+- `webgui/cloudflared/verify-exposure.sh` — the negative test: confirms the
+  portal answers through the public hostname AND that 8080/9222 return
+  connection-refused/timeout from the edge (only reachable via SSH forward).
+- Live gate (real CF hostname + Access prompt) runs on the server; both scripts
+  syntax-validated locally.
 
 **Gate:** portal reachable at the CF hostname only after Access auth; `:8080`
 and `:9222` reachable only via SSH forward, never via the tunnel.

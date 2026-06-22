@@ -1,0 +1,134 @@
+# 07 — Build Phases
+
+Ordered phases with acceptance gates. Each phase is independently shippable and
+testable. Do not start a phase until the previous gate passes. This is the
+master checklist that drives the actual build (and guides weaker models).
+
+> Status legend: ⬜ not started · 🔶 in progress · ✅ done
+
+## Phase 0 — Prep & reference (no server changes)
+
+⬜ Confirm engine seam is feasible: read `download_exports()` and locate the
+   `_set()` and `_AuthChallenge` points where `progress_cb`/`auth_cb` hook in.
+⬜ Confirm server paths: storage root (`/opt/storage.*/google-takeout`), repo
+   clone (`/opt/storage.local_1/projects/takeout-downloader`).
+⬜ Confirm webtop image + GPU/audio support on the target server.
+
+**Gate:** a written note in this folder confirming the two hook points exist and
+the storage/clone paths are correct on the server.
+
+## Phase 1 — Engine callback seam (the only engine change)
+
+⬜ Add optional `progress_cb` and `auth_cb` params to `download_exports()`.
+⬜ Call `progress_cb(part)` from `_set()`; call `auth_cb(auth_info)` on challenge.
+⬜ Defaults `None` → identical CLI/TUI behavior.
+⬜ Unit test: run a tiny fake export set, assert callbacks fire and that with
+   `progress_cb=None` output is byte-identical to today.
+
+**Gate:** existing CLI download still works unchanged; callbacks observed in test.
+
+## Phase 2 — Manager service core (localhost only)
+
+⬜ `manager/` package: `app.py`, `jobs.py`, `engine_bridge.py`.
+⬜ `POST /api/payload` → validate, create job, run engine in a worker thread.
+⬜ `GET /api/jobs`, `GET /api/jobs/{id}`, SSE `/events`, `/log`.
+⬜ Job state persisted to `<outdir>/.manager_state.json`; recover on restart.
+⬜ `validate_output_dir` enforced on every path.
+
+**Gate:** POST a real captured payload (from the existing v3 extension, manual)
+→ download runs, progress visible via `GET /api/jobs/{id}`, resumes after a
+manager restart.
+
+## Phase 3 — Progress web UI
+
+⬜ Static UI at `/`: jobs list, per-job parts table, live bars over SSE.
+⬜ Cookie-age indicator + `needs_cookie` banner.
+⬜ Buttons wired to control endpoints (pause/resume/recapture).
+
+**Gate:** open `http://127.0.0.1:8080` in the hosted Chrome; watch a live
+download; pause/resume works.
+
+## Phase 4 — Control plane + diagnose
+
+⬜ `/api/control/*` (start/pause/resume/cancel/recapture) behind
+   `MANAGER_API_TOKEN`.
+⬜ `/api/control/health` and `/api/control/diagnose` with the reason codes from
+   `04-decision-trees.md`.
+⬜ Capture token (`MANAGER_CAPTURE_TOKEN`) separate from the control token.
+
+**Gate:** each reason code can be provoked in a test and returns the documented
+recommended action.
+
+## Phase 5 — Extension v4
+
+⬜ Add `host_permissions` for `127.0.0.1:8080`, settings (managerUrl, tokens,
+   toggles).
+⬜ Auto-POST on capture (clipboard still fires as fallback).
+⬜ `forceCapture` / `getState` runtime messages.
+⬜ Auto-re-capture routine driven by `needs_cookie`.
+
+**Gate:** start a download in Chromium → payload auto-POSTs → manager job starts
+with no manual paste. Force a cookie expiry → extension re-captures → job resumes.
+
+## Phase 6 — webtop container + persistence
+
+⬜ Compose service from `linuxserver/webtop` (KasmVNC, audio, `/config` volume).
+⬜ Chromium launched with `--remote-debugging-port=9222` (localhost).
+⬜ Manager runs alongside (same container init or sibling), storage mounted.
+⬜ Seed profile: extension loaded, bookmarks, pinned action, default tabs.
+
+**Gate:** open the KasmVNC portal locally (before tunnel), log into Google,
+confirm profile + extension + bookmarks persist across a container restart, and
+that audio reaches the browser tab.
+
+## Phase 7 — Cloudflare tunnel (portal only)
+
+⬜ `cloudflared` tunnel exposing **only** KasmVNC `:3000`.
+⬜ Cloudflare Access policy (email/SSO) in front of the portal hostname.
+⬜ Verify manager `:8080` and CDP `:9222` are NOT routed by the tunnel.
+
+**Gate:** portal reachable at the CF hostname only after Access auth; `:8080`
+and `:9222` reachable only via SSH forward, never via the tunnel.
+
+## Phase 8 — Telegram
+
+⬜ `manager/notify.py` + chat-id capture helper.
+⬜ State-change events, then rate-limited progress.
+⬜ Command long-poll (`/status`, `/health`, then control commands + confirms).
+
+**Gate:** a real download posts started/progress/complete to your channel;
+`/status` and `/recapture` work from Telegram.
+
+## Phase 9 — Repeat-without-LLM
+
+⬜ Record a completed run as a recipe (`<root>/google-takeout/.recipes/<name>.json`).
+⬜ `POST /api/recipes/{name}/run` replays: re-open Takeout, trigger export +
+   capture via the extension automation, feed engine — no model.
+⬜ Optional `schedule {cron}`.
+
+**Gate:** with no LLM/agent attached, trigger `/run <name>` (Telegram or API)
+and watch a fresh export download end to end.
+
+## Phase 10 — Hardening & docs
+
+⬜ Tokens in `.env` (mode 600), not in image/git.
+⬜ Security flag: confirm no unauthenticated control surface is exposed.
+⬜ Update repo `README`/`docs` to point at this folder.
+⬜ Runbook smoke test: follow `04-decision-trees.md` for each failure path.
+
+**Gate:** a fresh operator (or weaker model) can deploy and run a full workflow
+using only `docs/webgui/`.
+
+## Dependency graph
+
+```
+P0 ─► P1 ─► P2 ─► P3 ─► P4 ─► P5 ─┐
+                 └─────────────────┼─► P6 ─► P7
+                                   │         └─► P8
+                                   └─► P9 (needs P5 + P6)
+                                            └─► P10
+```
+
+Phases 1-4 are pure local dev (no server). Phases 6-7 are server/infra. Phase 5
+(extension) can proceed in parallel with 6 once the manager API (P2/P4) is
+stable.

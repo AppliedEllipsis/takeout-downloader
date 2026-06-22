@@ -199,15 +199,28 @@ poller; error events are enriched with the diagnose reason code. Verified offlin
 in `manager/tests/test_phase8_telegram.py` (API call monkeypatched). The live
 gate (real channel) is server-side.
 
-## Phase 9 — Repeat-without-LLM
+## Phase 9 — Repeat-without-LLM ✅
 
-⬜ Record a completed run as a recipe (`<root>/google-takeout/.recipes/<name>.json`).
-⬜ `POST /api/recipes/{name}/run` replays: re-open Takeout, trigger export +
+✅ Record a completed run as a recipe (`<root>/google-takeout/.recipes/<name>.json`).
+✅ `POST /api/recipes/{name}/run` replays: re-open Takeout, trigger export +
    capture via the extension automation, feed engine — no model.
-⬜ Optional `schedule {cron}`.
+✅ Optional `schedule {cron}`.
 
 **Gate:** with no LLM/agent attached, trigger `/run <name>` (Telegram or API)
 and watch a fresh export download end to end.
+
+**DONE 2026-06-22.** `manager/recipes.py`: `RecipeStore` persists one JSON per
+recipe under `<takeout_root>/.recipes/`. A recipe is auto-recorded on job
+`complete` (account label, parallelism, part/byte totals, identity meta). `run()`
+invokes a pluggable replay trigger; the production `CdpTrigger` drives the hosted
+Chromium over CDP (`:9222`) to reopen Takeout so the extension auto-captures a
+fresh export — no LLM in the loop. HTTP: `GET /api/recipes`,
+`POST /api/recipes/{name}/run`, `/schedule`, `DELETE`. Telegram `/recipes` +
+`/run <name>` front the same store. Verified in
+`manager/tests/test_phase9_recipes.py` (record → persist → reload → replay via a
+fake trigger; missing-recipe and no-trigger paths are safe no-ops). The live
+CDP replay can only be exercised on the server with the browser running; the
+trigger seam keeps the store logic testable offline.
 
 ## Phase 10 — Hardening & docs
 

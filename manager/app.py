@@ -26,6 +26,7 @@ from .config import get_config
 from .orchestrator import get_orchestrator
 from . import jobs as J
 from . import notify as N
+from .recipes import RecipeStore, CdpTrigger
 
 cfg = get_config()
 orch = get_orchestrator()
@@ -38,7 +39,11 @@ _notifier = N.TelegramNotifier(
     enabled=cfg.telegram_enabled,
     progress_interval=cfg.telegram_progress_interval,
 )
-_poller = N.CommandPoller(_notifier, orch)
+# Recipe store (repeat-without-LLM). The CDP trigger drives the hosted Chromium
+# to re-open Takeout + re-trigger an export; unreachable CDP just means the
+# recipe is marked due and a human/agent can finish it (no crash).
+_recipes = RecipeStore(cfg.recipes_dir(), trigger=CdpTrigger())
+_poller = N.CommandPoller(_notifier, orch, recipes=_recipes)
 
 # Bridge orchestrator events -> Telegram. Subscriber must never raise.
 def _telegram_sink(kind: str, summary: dict) -> None:
@@ -46,6 +51,14 @@ def _telegram_sink(kind: str, summary: dict) -> None:
         if kind == "error":
             d = orch.diagnose(summary.get("job_id")) or {}
             summary = {**summary, "reason": d.get("reason")}
+        if kind == "complete":
+            # Record the completed run as a replayable recipe (no-LLM repeat).
+            try:
+                job = orch.get_job(summary.get("job_id"))
+                if job is not None:
+                    _recipes.record_from_job(job.snapshot())
+            except Exception:  # noqa: BLE001
+                pass
         _notifier.send_event(kind, summary)
     except Exception:  # noqa: BLE001
         pass
@@ -250,6 +263,40 @@ async def control_diagnose(job_id: str,
     if d is None:
         raise HTTPException(status_code=404, detail="no such job")
     return d
+
+# --- recipes (Phase 9: repeat-without-LLM) ----------------------------------
+@app.get("/api/recipes")
+async def recipes_list():
+    return {"recipes": _recipes.list_recipes()}
+
+@app.post("/api/recipes/{name}/run")
+async def recipes_run(name: str,
+                      x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    if _recipes.get(name) is None:
+        raise HTTPException(status_code=404, detail="no such recipe")
+    ok = _recipes.run(name)
+    return {"ok": ok, "name": name,
+            "note": None if ok else "recipe found but CDP trigger unavailable"}
+
+@app.post("/api/recipes/{name}/schedule")
+async def recipes_schedule(name: str, request: Request,
+                           x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    body = await _json_body(request)
+    ok = _recipes.set_schedule(name, body.get("cron"))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such recipe")
+    return {"ok": True, "name": name, "cron": body.get("cron")}
+
+@app.delete("/api/recipes/{name}")
+async def recipes_delete(name: str,
+                         x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    ok = _recipes.delete(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such recipe")
+    return {"ok": True}
 
 async def _json_body(request: Request) -> dict:
     try:

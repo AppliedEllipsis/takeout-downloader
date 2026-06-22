@@ -176,14 +176,28 @@ that audio reaches the browser tab.
 **Gate:** portal reachable at the CF hostname only after Access auth; `:8080`
 and `:9222` reachable only via SSH forward, never via the tunnel.
 
-## Phase 8 — Telegram
+## Phase 8 — Telegram ✅
 
-⬜ `manager/notify.py` + chat-id capture helper.
-⬜ State-change events, then rate-limited progress.
-⬜ Command long-poll (`/status`, `/health`, then control commands + confirms).
+✅ `manager/notify.py` + chat-id capture helper.
+✅ State-change events, then rate-limited progress.
+✅ Command long-poll (`/status`, `/health`, then control commands + confirms).
 
 **Gate:** a real download posts started/progress/complete to your channel;
 `/status` and `/recapture` work from Telegram.
+
+**DONE 2026-06-22.** `manager/notify.py` (stdlib urllib only — no new deps):
+`TelegramNotifier` (no-op unless token+chat_id+enabled) with `send()` and
+`send_event()` formatting the started/milestone/needs_cookie/login_needed/error/
+complete/resumed messages from the doc table; milestones rate-limited to
+`TELEGRAM_PROGRESS_INTERVAL` and mutable via `/mute`. `CommandPoller` long-polls
+`getUpdates`, rejects any chat but `TELEGRAM_CHAT_ID` (`_chat_ok`), and dispatches
+`/status /jobs /health /diagnose /pause /resume /recapture /recipes /run /mute
+/unmute` 1:1 onto the orchestrator control methods; destructive commands
+(`/recapture`, `/run`) require a `/yes` confirm. `--capture-chat-id` CLI helper.
+Wired into `app.py` startup as an orchestrator event subscriber + background
+poller; error events are enriched with the diagnose reason code. Verified offline
+in `manager/tests/test_phase8_telegram.py` (API call monkeypatched). The live
+gate (real channel) is server-side.
 
 ## Phase 9 — Repeat-without-LLM
 

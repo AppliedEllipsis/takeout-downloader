@@ -25,10 +25,47 @@ from fastapi.staticfiles import StaticFiles
 from .config import get_config
 from .orchestrator import get_orchestrator
 from . import jobs as J
+from . import notify as N
 
 cfg = get_config()
 orch = get_orchestrator()
 app = FastAPI(title="Takeout Manager", version="0.1.0")
+
+# --- Telegram notifier + command poller (no-op if unconfigured) -------------
+_notifier = N.TelegramNotifier(
+    token=cfg.telegram_token,
+    chat_id=cfg.telegram_chat_id,
+    enabled=cfg.telegram_enabled,
+    progress_interval=cfg.telegram_progress_interval,
+)
+_poller = N.CommandPoller(_notifier, orch)
+
+# Bridge orchestrator events -> Telegram. Subscriber must never raise.
+def _telegram_sink(kind: str, summary: dict) -> None:
+    try:
+        if kind == "error":
+            d = orch.diagnose(summary.get("job_id")) or {}
+            summary = {**summary, "reason": d.get("reason")}
+        _notifier.send_event(kind, summary)
+    except Exception:  # noqa: BLE001
+        pass
+
+orch.subscribe(_telegram_sink)
+
+@app.on_event("startup")
+async def _startup():
+    # Recover persisted jobs so they're visible after a restart.
+    try:
+        orch.recover()
+    except Exception:  # noqa: BLE001
+        pass
+    _poller.start()
+    if _notifier.enabled:
+        _notifier.send("\U0001F7E2 Takeout manager online.")
+
+@app.on_event("shutdown")
+async def _shutdown():
+    _poller.stop()
 
 
 # --- auth helpers ------------------------------------------------------------

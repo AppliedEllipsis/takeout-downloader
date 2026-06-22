@@ -80,14 +80,23 @@ UI assets + endpoints serve via TestClient.
 
 ## Phase 4 — Control plane + diagnose
 
-⬜ `/api/control/*` (start/pause/resume/cancel/recapture) behind
+✅ `/api/control/*` (start/pause/resume/cancel/recapture) behind
    `MANAGER_API_TOKEN`.
-⬜ `/api/control/health` and `/api/control/diagnose` with the reason codes from
+✅ `/api/control/health` and `/api/control/diagnose` with the reason codes from
    `04-decision-trees.md`.
-⬜ Capture token (`MANAGER_CAPTURE_TOKEN`) separate from the control token.
+✅ Capture token (`MANAGER_CAPTURE_TOKEN`) separate from the control token.
 
 **Gate:** each reason code can be provoked in a test and returns the documented
 recommended action.
+
+**DONE 2026-06-22.** Control endpoints in `manager/app.py` gated by
+`MANAGER_API_TOKEN` (X-Api-Token header); `/api/payload` independently gated by
+`MANAGER_CAPTURE_TOKEN` (X-Capture-Token). `manager/diagnose.py` maps live job
+state to the exact reason-code set (cookie_expired, auth_loop, disk_full,
+network_stall, zip_validation_failed, browser_down, manager_down, ok) with
+section refs + recommended actions. recapture_count escalates cookie_expired ->
+auth_loop after 2 cycles. `/api/control/health` reports disk free + cookie age.
+Verified in `manager/tests/test_phase4_control.py`.
 
 ## Phase 5 — Extension v4
 

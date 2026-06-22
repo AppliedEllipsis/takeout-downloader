@@ -133,15 +133,83 @@ def _sse(event: str, data: dict) -> str:
 # --- health ------------------------------------------------------------------
 @app.get("/api/control/health")
 async def health():
+    import shutil
     jobs = orch.list_jobs()
     active = [j for j in jobs if j["status"] in (J.DOWNLOADING, J.NEEDS_COOKIE)]
+    try:
+        du = shutil.disk_usage(str(cfg.storage_root))
+        disk = {"free": du.free, "total": du.total}
+    except OSError:
+        disk = {"free": -1, "total": -1}
     return {
         "ok": True,
         "jobs_total": len(jobs),
         "jobs_active": len(active),
         "storage_root": str(cfg.takeout_root),
+        "disk": disk,
+        "capture_token_set": bool(cfg.capture_token),
+        "api_token_set": bool(cfg.api_token),
     }
 
+
+# --- control plane (Phase 4) -------------------------------------------------
+# All gated by MANAGER_API_TOKEN (when set). Separate from the capture token so
+# a leaked capture token can only POST payloads, never drive jobs.
+@app.post("/api/control/pause")
+async def control_pause(request: Request,
+                        x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    body = await _json_body(request)
+    ok = orch.pause(body.get("job_id", ""))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such job / cannot pause")
+    return {"ok": True}
+
+@app.post("/api/control/resume")
+async def control_resume(request: Request,
+                         x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    body = await _json_body(request)
+    ok = orch.resume(body.get("job_id", ""))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such job / cannot resume")
+    return {"ok": True}
+
+@app.post("/api/control/cancel")
+async def control_cancel(request: Request,
+                         x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    body = await _json_body(request)
+    ok = orch.cancel(body.get("job_id", ""))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such job")
+    return {"ok": True}
+
+@app.post("/api/control/recapture")
+async def control_recapture(request: Request,
+                            x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    body = await _json_body(request)
+    ok = orch.request_recapture(body.get("job_id", ""))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such job")
+    return {"ok": True}
+
+@app.get("/api/control/diagnose")
+async def control_diagnose(job_id: str,
+                           x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    d = orch.diagnose(job_id)
+    if d is None:
+        raise HTTPException(status_code=404, detail="no such job")
+    return d
+
+async def _json_body(request: Request) -> dict:
+    try:
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        return json.loads(raw) if raw.strip() else {}
+    except (ValueError, UnicodeDecodeError):
+        return {}
 
 # --- static UI (Phase 3 fills web/) -----------------------------------------
 _web_dir = Path(__file__).parent / "web"

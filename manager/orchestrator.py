@@ -63,6 +63,10 @@ class Orchestrator:
         self._runners: dict[str, JobRunner] = {}
         self._lock = threading.Lock()
         self._event_subs: list[Callable[[str, dict], None]] = []
+        # job_id -> count of needs_cookie->resume cycles (feeds auth_loop detection)
+        self._recapture_count: dict[str, int] = {}
+        # job_id -> monotonic ts of last byte progress (feeds network_stall detection)
+        self._last_progress: dict[str, float] = {}
 
     # -- event fan-out --------------------------------------------------------
     def subscribe(self, cb: Callable[[str, dict], None]) -> Callable[[], None]:
@@ -79,6 +83,10 @@ class Orchestrator:
 
     def _emit(self, kind: str, job: J.Job) -> None:
         summary = job.summary()
+        # Track byte-progress freshness for stall detection.
+        if summary.get("totals", {}).get("bytes_done"):
+            import time as _t
+            self._last_progress[job.job_id] = _t.monotonic()
         for cb in list(self._event_subs):
             try:
                 cb(kind, summary)
@@ -125,6 +133,8 @@ class Orchestrator:
                 existing.meta.update(meta)
                 if runner is not None:
                     runner.set_payload(payload)
+                    self._recapture_count[existing.job_id] = \
+                        self._recapture_count.get(existing.job_id, 0) + 1
                     self._emit("resumed", existing)
                     return {"job_id": existing.job_id, "status": existing.status,
                             "resumed": True}
@@ -183,6 +193,25 @@ class Orchestrator:
             return True
         return False
 
+    def resume(self, job_id: str) -> bool:
+        """Resume a paused job. The runner thread re-discovers + continues from
+        partials with the last payload it holds. A truly expired cookie will
+        re-enter needs_cookie immediately, which is correct."""
+        job = self._jobs.get(job_id)
+        runner = self._runners.get(job_id)
+        if not job or not runner:
+            return False
+        if job.status not in (J.PAUSED, J.NEEDS_COOKIE, J.ERROR):
+            return False
+        job.set_status(J.QUEUED)
+        job.persist()
+        if not runner.is_alive():
+            runner._stop.clear()
+            runner.start()
+        runner._fresh_cookie.set()
+        self._emit("resumed", job)
+        return True
+
     def request_recapture(self, job_id: str) -> bool:
         """Flip a job into needs_cookie so the extension/UI re-captures."""
         job = self._jobs.get(job_id)
@@ -192,6 +221,15 @@ class Orchestrator:
         job.persist()
         self._emit("needs_cookie", job)
         return True
+
+    def diagnose(self, job_id: str) -> Optional[dict]:
+        job = self._jobs.get(job_id)
+        if not job:
+            return None
+        from . import diagnose as Dg
+        return Dg.diagnose(job,
+                           recapture_count=self._recapture_count.get(job_id, 0),
+                           last_progress_ts=self._last_progress.get(job_id))
 
     # -- recovery -------------------------------------------------------------
     def recover(self) -> int:

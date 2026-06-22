@@ -39,17 +39,28 @@ the storage/clone paths are correct on the server.
   active→done. auth_cb fires once on an HTML-login challenge, no fake zip is
   written, and `AuthError` still propagates. `py_compile` clean.
 
-## Phase 2 — Manager service core (localhost only)
+## Phase 2 — Manager service core (localhost only) ✅
 
-⬜ `manager/` package: `app.py`, `jobs.py`, `engine_bridge.py`.
-⬜ `POST /api/payload` → validate, create job, run engine in a worker thread.
-⬜ `GET /api/jobs`, `GET /api/jobs/{id}`, SSE `/events`, `/log`.
-⬜ Job state persisted to `<outdir>/.manager_state.json`; recover on restart.
-⬜ `validate_output_dir` enforced on every path.
+✅ `manager/` package: `app.py`, `jobs.py`, `engine_bridge.py` (+ `config.py`,
+   `derive.py`, `manifest.py`, `orchestrator.py`, `__main__.py`).
+✅ `POST /api/payload` → validate, derive dated dir, create job, run engine in a
+   worker thread.
+✅ `GET /api/jobs`, `GET /api/jobs/{id}`, SSE `/events`, `/log`.
+✅ Job state persisted to `<outdir>/.manager_state.json`; `recover()` on restart.
+✅ `validate_output_dir` enforced on every derived path.
+✅ Dated output dir `<root>/google-takeout/<account>/<export-ts>/` + per-run
+   `manifest.json` (sizes + per-file times + zip_valid).
 
 **Gate:** POST a real captured payload (from the existing v3 extension, manual)
 → download runs, progress visible via `GET /api/jobs/{id}`, resumes after a
 manager restart.
+
+**DONE 2026-06-22.** e2e test (`manager/tests/test_e2e_phase2.py`) drives a fake
+Takeout server end to end: payload POST → dated dir
+`braincreation/2026-06-16-04-01-04` → 3 valid zips → manifest with sizes+times.
+Runs in an isolated `.venv-manager` (fastapi 0.118 + starlette 0.48, pinned in
+`manager/requirements.txt`) because the global anaconda env had an incompatible
+starlette 1.0. See `08-decisions-log.md`.
 
 ## Phase 3 — Progress web UI
 

@@ -1,0 +1,7 @@
+# Manager service dependencies (Phase 2+).
+# Pinned to a compatible FastAPI/Starlette pair — fastapi 0.118 requires
+# starlette <0.49, so do NOT let starlette float to 1.x.
+fastapi==0.118.0
+starlette==0.48.0
+uvicorn==0.37.0
+requests>=2.31.0

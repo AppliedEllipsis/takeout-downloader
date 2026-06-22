@@ -117,3 +117,7 @@ downloads/*.log
 .commit_scratch/
 # Windows null device — never commit
 nul
+
+# Manager service local venv (Phase 2+)
+.venv-manager/
+manager/**/__pycache__/

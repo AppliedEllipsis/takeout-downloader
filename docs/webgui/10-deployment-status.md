@@ -16,7 +16,7 @@ record — distinct from `05-deployment.md` (the plan) and `09-smoke-test.md`
 |---|---|---|
 | webtop container | **running**, self-healing | `takeout-webgui` |
 | Manager (FastAPI) | **healthy** | `127.0.0.1:8080` (in-container) |
-| Chromium + CDP | **running**, auto-launch | `127.0.0.1:9222` (in-container) |
+| Chromium + CDP | **running**, auto-launch, stable (2 tabs) | `127.0.0.1:9222` (in-container) |
 | Extension v4 | **loaded** (id `dgbbpdjpfeeaiheekoclkkkbipkikejl`) | unpacked from `/work/helpers` |
 | KasmVNC portal | **running, auth-gated** | `127.0.0.1:3000` (in-container) |
 | Cloudflare tunnel | **running** (zero-config quick tunnel) | `takeout-tunnel` |
@@ -212,6 +212,15 @@ surface. All are fixed and committed.
 7. **Telegram token lives in `~/.pi/agent/auth.json`** (`telegram.token`), not
    the env. The `--capture-chat-id` helper now resolves the token from pi auth
    automatically. (Telegram still deferred/disabled.)
+8. **Chromium tab explosion (opened ~70 tabs, climbing).** Two compounding
+   causes: (a) the s6 service did `exec chromium <urls>`, but when an instance
+   already owned the persistent profile the new process *delegated* its URLs to
+   it and **exited 0** → s6 respawned the service → +2 tabs every cycle, forever;
+   (b) `--restore-last-session` made the growing pile persist across launches.
+   Fix: the chromium service is now a **supervision loop** that launches only
+   when no chromium is alive and never exits (so s6 sees it continuously up and
+   never respawns a second instance), and `--restore-last-session` was removed
+   from the launcher. Verified: exactly 2 tabs, stable across time, same PID.
 
 ---
 

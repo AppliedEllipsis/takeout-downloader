@@ -26,18 +26,32 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-# Clear a stale SingletonLock from a previous container. Chromium writes this
-# symlink as <host>-<pid>; after a container recreate that pid is gone but the
-# lock remains and blocks every new launch. Safe to remove when no chromium runs.
-if ! pgrep -x chromium >/dev/null 2>&1; then
-    rm -f "$PROFILE_DIR/SingletonLock" \
-          "$PROFILE_DIR/SingletonCookie" \
-          "$PROFILE_DIR/SingletonSocket" 2>/dev/null || true
-fi
-
 # Give Plasma a moment to finish bringing up the panel/compositor.
 sleep 3
 
-# Launch as the desktop user with the session display. exec so s6 supervises
-# the real chromium process and restarts it on exit.
-exec s6-setuidgid abc env DISPLAY=:1 HOME=/config /usr/local/bin/takeout-chromium
+# Supervision LOOP (not exec). This is the critical fix for the tab-pile bug:
+#
+#   The old version did `exec chromium URL1 URL2`. When a chromium already owns
+#   the persistent profile, a second invocation does NOT start a new browser —
+#   it hands its URLs to the running instance and EXITS 0. s6 then saw the
+#   service "exit", restarted it, and it opened the two tabs AGAIN. Repeat
+#   forever => hundreds of Takeout tabs.
+#
+#   Instead we loop here and the script itself stays alive (s6 sees one
+#   long-running, healthy service). We launch chromium ONLY when none is
+#   running, and only then clear the stale single-process locks. A real crash
+#   (chromium gone) is detected on the next tick and relaunched — self-healing
+#   without ever delegating-and-piling.
+while true; do
+    if ! pgrep -x chromium >/dev/null 2>&1; then
+        # No chromium alive: safe to clear a stale lock from a dead instance
+        # (after a container recreate the pid in SingletonLock is gone).
+        rm -f "$PROFILE_DIR/SingletonLock" \
+              "$PROFILE_DIR/SingletonCookie" \
+              "$PROFILE_DIR/SingletonSocket" 2>/dev/null || true
+        # Launch in the background; the loop (not s6) owns the lifecycle.
+        s6-setuidgid abc env DISPLAY=:1 HOME=/config \
+            /usr/local/bin/takeout-chromium >/dev/null 2>&1 &
+    fi
+    sleep 10
+done

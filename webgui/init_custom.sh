@@ -42,7 +42,6 @@ exec "\$CHROME" \\
   --load-extension=/work/helpers \\
   --no-first-run \\
   --no-default-browser-check \\
-  --restore-last-session \\
   --disable-features=TranslateUI \\
   --start-maximized \\
   https://takeout.google.com/ "$MANAGER_URL/" "\$@"

@@ -63,7 +63,8 @@ class Job:
 
     # -- mutation -------------------------------------------------------------
     def set_status(self, status: str, error: Optional[str] = None) -> None:
-        assert status in ALL_STATUSES, f"bad status {status}"
+        if status not in ALL_STATUSES:
+            raise ValueError(f"bad status {status}")
         with self.lock:
             self.status = status
             if error is not None:

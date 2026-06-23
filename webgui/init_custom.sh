@@ -42,6 +42,7 @@ chmod +x /usr/local/bin/takeout-chromium
 
 # Autostart entry for the KDE/openbox session the webtop runs.
 mkdir -p /config/.config/autostart
+if [ ! -f /config/.config/autostart/takeout-chromium.desktop ]; then
 cat > /config/.config/autostart/takeout-chromium.desktop <<EOF
 [Desktop Entry]
 Type=Application
@@ -50,8 +51,10 @@ Exec=/usr/local/bin/takeout-chromium
 X-GNOME-Autostart-enabled=true
 Terminal=false
 EOF
+fi
 
 # Desktop shortcut for a manual relaunch if the user closes the window.
+if [ ! -f /config/Desktop/Takeout-Browser.desktop ]; then
 cat > /config/Desktop/Takeout-Browser.desktop <<EOF
 [Desktop Entry]
 Version=1.0
@@ -63,6 +66,7 @@ Icon=chromium
 Terminal=false
 Categories=Network;
 EOF
+fi
 
 # --- 2. Bookmarks (only if the profile has none yet) -------------------------
 # Chrome reads Default/Bookmarks (JSON). We seed it once; after that the user's
@@ -86,7 +90,7 @@ cat > "$POLICY_DIR/takeout-manager.json" <<EOF
 {
   "3rdparty": {
     "extensions": {
-      "takeout-downloader-helper": {
+      "dgbbpdjpfeeaiheekoclkkkbipkikejl": {
         "managerUrl": "$MANAGER_URL",
         "captureToken": "$CAPTURE_TOKEN",
         "autoPost": true,

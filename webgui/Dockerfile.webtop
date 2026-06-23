@@ -15,24 +15,30 @@
 # host updates the running code with no rebuild, exactly like the existing
 # takeout-cli image.
 
-FROM lscr.io/linuxserver/webtop:ubuntu-kde
+# Debian base (NOT ubuntu): on Ubuntu, `chromium`/`chromium-browser` are snap
+# transitional packages that pull snapd and do not run in a container. Debian
+# ships a REAL chromium .deb, so the browser actually launches with our
+# --load-extension + --remote-debugging-port flags. (Verified rationale in the
+# pre-deploy infra review; see docs/webgui/08-decisions-log.md.)
+FROM lscr.io/linuxserver/webtop:debian-kde
 
 # --- system deps -------------------------------------------------------------
-# chromium: the browser we host (the webtop ships a browser but we pin
-#   chromium for the --load-extension + --remote-debugging-port flags).
+# chromium: the browser we host (real deb on Debian).
 # python3 + venv + pip: run the FastAPI manager.
-# Note: webtop is Ubuntu-based; chromium installs as a deb (not snap) here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium-browser \
+        chromium \
         python3 \
         python3-venv \
         python3-pip \
         curl \
         ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    || (echo "chromium-browser deb unavailable; trying 'chromium'" && \
-        apt-get update && apt-get install -y --no-install-recommends chromium && \
-        rm -rf /var/lib/apt/lists/*)
+    && rm -rf /var/lib/apt/lists/*
+
+# Fail the build early if chromium did not resolve to a real binary (guards
+# against a future base-image change silently breaking the browser).
+RUN command -v chromium >/dev/null 2>&1 \
+    || ln -s "$(command -v chromium-browser 2>/dev/null || true)" /usr/local/bin/chromium \
+    || (echo "FATAL: no chromium binary on PATH" && exit 1)
 
 # --- manager python deps -----------------------------------------------------
 # Installed into a venv at /opt/manager-venv so they don't collide with the

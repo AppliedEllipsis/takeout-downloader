@@ -1,7 +1,7 @@
 {
   "3rdparty": {
     "extensions": {
-      "REPLACE_WITH_EXTENSION_ID": {
+      "dgbbpdjpfeeaiheekoclkkkbipkikejl": {
         "managerUrl": "http://127.0.0.1:8080",
         "captureToken": "REPLACE_WITH_CAPTURE_TOKEN",
         "autoPost": true,

@@ -145,33 +145,52 @@ class Orchestrator:
         meta["export_ts"] = d.export_ts
         meta["export_raw"] = d.export_raw
 
+        resumed_job = None
         with self._lock:
             # Resume path: a job for THIS output dir already waiting for a cookie.
             existing = self._find_job_for_dir(out_dir)
             if existing is not None:
+                # A recovered job may have no runner yet — build one so resume
+                # actually works (and we don't fall through to a duplicate job).
                 runner = self._runners.get(existing.job_id)
+                if runner is None:
+                    runner = self._make_runner(existing)
                 existing.meta.update(meta)
-                if runner is not None:
-                    runner.set_payload(payload)
-                    self._recapture_count[existing.job_id] = \
-                        self._recapture_count.get(existing.job_id, 0) + 1
-                    self._emit("resumed", existing)
-                    return {"job_id": existing.job_id, "status": existing.status,
-                            "resumed": True}
+                runner.set_payload(payload)
+                self._recapture_count[existing.job_id] = \
+                    self._recapture_count.get(existing.job_id, 0) + 1
+                resumed_job = existing
+            else:
+                # New job.
+                job_id = f"{_compact_now()}-{d.account_label}"
+                job = J.Job(job_id=job_id, workflow=d.account_label, output_dir=out_dir,
+                            parallel=self.cfg.parallel, max_exports=self.cfg.max_exports,
+                            meta=meta)
+                self._jobs[job_id] = job
+                runner = self._make_runner(job)
 
-            # New job.
-            job_id = f"{_compact_now()}-{d.account_label}"
-            job = J.Job(job_id=job_id, workflow=d.account_label, output_dir=out_dir,
-                        parallel=self.cfg.parallel, max_exports=self.cfg.max_exports,
-                        meta=meta)
-            self._jobs[job_id] = job
-            runner = JobRunner(job, on_event=lambda kind, j: self._emit(kind, j),
-                               on_auth=lambda j: self._emit("needs_cookie", j))
-            self._runners[job_id] = runner
+        # Emit + start OUTSIDE the lock: _emit -> Telegram can do a blocking
+        # network POST, which must never be held under the global lock.
+        if resumed_job is not None:
+            r = self._runners[resumed_job.job_id]
+            if not r.is_alive():
+                r._stop.clear()
+                r.start()
+            self._emit("resumed", resumed_job)
+            return {"job_id": resumed_job.job_id, "status": resumed_job.status,
+                    "resumed": True}
 
         runner.set_payload(payload)
         runner.start()
-        return {"job_id": job_id, "status": job.status, "resumed": False}
+        return {"job_id": job.job_id, "status": job.status, "resumed": False}
+
+    def _make_runner(self, job: J.Job) -> JobRunner:
+        """Create + register a JobRunner for a job. Single source of the event
+        wiring so recover() and accept_payload() stay consistent."""
+        runner = JobRunner(job, on_event=lambda kind, j: self._emit(kind, j),
+                           on_auth=lambda j: self._emit("needs_cookie", j))
+        self._runners[job.job_id] = runner
+        return runner
 
     def _find_job_for_dir(self, out_dir: Path) -> Optional[J.Job]:
         for job in self._jobs.values():
@@ -269,6 +288,11 @@ class Orchestrator:
                     if job.status not in (J.COMPLETE, J.ERROR):
                         job.status = J.NEEDS_COOKIE
                     self._jobs[job.job_id] = job
+                    # Build a runner so resume/pause/recapture work and a fresh
+                    # payload resumes THIS job instead of spawning a duplicate.
+                    # (Completed/errored jobs need no runner.)
+                    if job.status not in (J.COMPLETE, J.ERROR):
+                        self._make_runner(job)
                     found += 1
         return found
 

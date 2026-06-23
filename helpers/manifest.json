@@ -2,6 +2,8 @@
     "manifest_version": 3,
     "name": "Takeout Downloader Helper",
     "version": "4.0.0",
+    "_comment_key": "Pins a deterministic extension ID (dgbbpdjpfeeaiheekoclkkkbipkikejl) so the webtop managed-storage policy can target it. Keypair: webgui/extension-key/key.pem (gitignored). See docs/webgui/08-decisions-log.md.",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApJtooXIntZ44G6GAFfx+3vltd5iYA7urluq7c1U/9fP2/OvWPIwVhpYkciPbvVsq71uemN22Uh1aCZrkimHx3PFryj6a+NJsr31TPdx6tlgyekQCNtModFu9Q4V6ArgcUi1QoUiJ31KKah3HiX/TEdWDJ16d4kcCCZb3M3gAO39VVh5VR/G4t9q7neP3+2RnC8hM6lw0gqgL4DHBGYj83WLapxEAVf6LFrRg93N9zDOl3/FgpTYQIUjU4OlKowGd7VsuuymcGJWre6RLhzJqg3LqA0B6tvn0VZLywWaTnBEej8vebaB38hUFp1M0bHyl9k0frY7Y5dssJ8w3JlXsTwIDAQAB",
     "description": "Captures Google Takeout download URLs, copies them as JSON, and (v4) POSTs them to the local web manager for server-side download + auto-resume",
 
     "minimum_chrome_version": "102",

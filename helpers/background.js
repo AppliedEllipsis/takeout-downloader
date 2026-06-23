@@ -239,15 +239,23 @@ function buildManagerPayload(capture, meta) {
         cookie: capture.cookie || ''
     };
     // Attach identity meta so the manager can derive <account>/<export-ts>/.
-    // email is best-effort (scraped by the content script); user/authuser come
-    // from the download URL params.
-    if (meta && (meta.email || meta.user || meta.authuser || meta.archiveId)) {
-        payload._meta = {
-            email: meta.email || null,
-            user: meta.user || null,
-            authuser: meta.authuser || null,
-            archiveId: meta.archiveId || null
-        };
+    // CRITICAL: user/authuser/j live on the DOWNLOAD url (capture.url), NOT on
+    // the takeout.google.com page url. Parse them from capture.url; the scraped
+    // email (meta.email) is the best human-readable label and supplements them.
+    let urlUser = null, urlAuthuser = null, urlArchive = null;
+    try {
+        const qs = new URL(capture.url).searchParams;
+        urlUser = qs.get('user');
+        urlAuthuser = qs.get('authuser');
+        urlArchive = qs.get('j');
+    } catch (e) { /* malformed url; fall back to scraped meta */ }
+    const m = meta || {};
+    const email = m.email || null;
+    const user = urlUser || m.user || null;
+    const authuser = urlAuthuser || m.authuser || null;
+    const archiveId = urlArchive || m.archiveId || null;
+    if (email || user || authuser || archiveId) {
+        payload._meta = { email, user, authuser, archiveId };
     }
     return payload;
 }
@@ -488,8 +496,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             try {
                 const result = await postToManager(
                     buildManagerPayload(d.lastCapture, (await chrome.storage.local.get(['accountMeta'])).accountMeta || {}));
+                chrome.storage.local.set({
+                    lastPostStatus: { ok: true, jobId: result.job_id,
+                                      status: result.status, at: Date.now() }
+                });
                 sendResponse({ ok: true, result });
             } catch (e) {
+                chrome.storage.local.set({
+                    lastPostStatus: { ok: false, error: e.message || String(e),
+                                      at: Date.now() }
+                });
                 sendResponse({ ok: false, error: e.message || String(e) });
             }
         });

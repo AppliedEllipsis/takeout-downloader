@@ -108,3 +108,46 @@ settled choices.
 - **Secrets hygiene.** `.gitignore` covers `.env`/`.env.*`; only `.env.example`
   (placeholders) is tracked. Tokens are generated with `openssl rand -hex 32`
   and live in the server `.env` (mode 600), never in the image or git.
+
+---
+
+## Post-build review fixes (2026-06-22)
+
+Three parallel review subagents (same model) audited the manager Python, the
+extension v4 JS, and the deployment infra. Findings triaged and addressed:
+
+**Fixed (IMPORTANT):**
+- **Lock held across a blocking network call.** `accept_payload`'s resume path
+  called `_emit()` (→ Telegram `urllib` POST, 10s timeout) while holding the
+  global orchestrator lock, stalling every other thread. Restructured so all
+  mutation happens under the lock, then `_emit`/`start` run after releasing it.
+- **Zombie jobs after restart.** `recover()` registered jobs in `_jobs` but
+  never built a `JobRunner`. Pause/resume/recapture 404'd, and a fresh payload
+  for a recovered dir fell through to create a DUPLICATE job. Added `_make_runner()`
+  (single source of runner wiring) and call it in both `recover()` and the
+  resume branch. Regression test: `manager/tests/test_review_fixes.py`.
+- **Extension read identity from the wrong source.** `buildManagerPayload` took
+  `user`/`authuser`/`archiveId` from `accountMeta` (scraped off the page URL,
+  which lacks `user=`). Now parsed from `capture.url` (the download URL, which
+  carries the real `user`/`authuser`/`j=` params), with scraped email as the
+  friendly-label supplement. This is what makes the `gaia-<id>` folder fallback
+  actually work.
+- **Chromium install was a snap shim.** On the Ubuntu webtop base both
+  `chromium` and `chromium-browser` are snap transitional packages that don't
+  run in-container. Switched `Dockerfile.webtop` to the **Debian** webtop base
+  (`webtop:debian-kde`) where `chromium` is a real `.deb`.
+
+**Fixed (MINOR):** `Job.set_status` `assert`→explicit `ValueError` (survives
+`python -O`); `forceCapture` now persists `lastPostStatus`; pinned a
+deterministic extension `key` in the manifest so the ID is stable
+(`dgbbpdjpfeeaiheekoclkkkbipkikejl`) and keyed the managed-storage policy on the
+real ID instead of a name; guarded the `.desktop`/launcher writes so manual
+edits survive a reboot.
+
+**Decided, documented (not changed):**
+- **Read routes are intentionally open** (`/api/jobs`, `/events`, `/log`,
+  `GET /api/recipes`). The manager binds 127.0.0.1 only and is reached via SSH
+  forward; snapshots carry account email/gaia-id/paths but **never the cookie**
+  (verified). Write/control routes are all token-gated. If the threat model
+  tightens, gate reads behind the API token too — the helper `_check_api_token`
+  is already there.

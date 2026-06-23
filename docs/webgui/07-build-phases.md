@@ -8,11 +8,11 @@ master checklist that drives the actual build (and guides weaker models).
 
 ## Phase 0 — Prep & reference (no server changes)
 
-⬜ Confirm engine seam is feasible: read `download_exports()` and locate the
+✅ Confirm engine seam is feasible: read `download_exports()` and locate the
    `_set()` and `_AuthChallenge` points where `progress_cb`/`auth_cb` hook in.
-⬜ Confirm server paths: storage root (`/opt/storage.*/google-takeout`), repo
+🔶 Confirm server paths: storage root (`/opt/storage.*/google-takeout`), repo
    clone (`/opt/storage.local_1/projects/takeout-downloader`).
-⬜ Confirm webtop image + GPU/audio support on the target server.
+🔶 Confirm webtop image + GPU/audio support on the target server. (BLOCKED: needs SSH access to 188.245.169.166 — currently publickey/password denied.)
 
 **Gate:** a written note in this folder confirming the two hook points exist and
 the storage/clone paths are correct on the server.

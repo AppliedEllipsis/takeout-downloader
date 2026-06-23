@@ -29,6 +29,12 @@ cat > /usr/local/bin/takeout-chromium <<EOF
 #!/bin/bash
 # Resolve the chromium binary (deb package name varies).
 CHROME=\$(command -v chromium-browser || command -v chromium || echo chromium)
+# Clear a stale SingletonLock left by a previous container instance. The lock
+# is a symlink "<host>-<pid>"; after a container recreate that pid is gone but
+# the link persists and blocks every launch. Remove it if no chromium is live.
+if [ -e $PROFILE_DIR/SingletonLock ] && ! pgrep -x chromium >/dev/null 2>&1; then
+  rm -f $PROFILE_DIR/SingletonLock $PROFILE_DIR/SingletonCookie $PROFILE_DIR/SingletonSocket
+fi
 exec "\$CHROME" \\
   --user-data-dir=$PROFILE_DIR \\
   --remote-debugging-address=127.0.0.1 \\

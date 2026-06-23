@@ -76,15 +76,18 @@ services:
   # portal on 127.0.0.1:3000 without publishing any extra host port.
   # Provide a tunnel token in .env (CLOUDFLARE_TUNNEL_TOKEN) OR mount a
   # credentials file + config.yml (see webgui/cloudflared/config.yml).
+  # ZERO-CONFIG (trycloudflare) mode: no token, no Cloudflare account. cloudflared
+  # dials out and prints a random https://<name>.trycloudflare.com URL that maps
+  # to the portal on 127.0.0.1:3000. The portal is gated by KasmVNC basic auth
+  # (CUSTOM_USER/PASSWORD), so a leaked URL still hits a login wall.
+  # NOTE: a quick tunnel has NO Cloudflare Access layer — the portal password is
+  # the only gate. For a stable hostname + Access SSO, switch back to token mode
+  # (TUNNEL_TOKEN + webgui/cloudflared/config.yml).
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: takeout-tunnel
     network_mode: "service:webgui"
     depends_on:
       - webgui
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    volumes:
-      - ./webgui/cloudflared:/etc/cloudflared:ro
+    command: tunnel --no-autoupdate --url http://127.0.0.1:3000
     restart: unless-stopped

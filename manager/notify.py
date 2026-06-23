@@ -33,6 +33,32 @@ log = logging.getLogger("manager.notify")
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
+def resolve_token(explicit: str = "") -> str:
+    """Resolve the Telegram bot token from, in order:
+      1. an explicit value (CLI --token / env TELEGRAM_TOKEN),
+      2. ~/.pi/agent/auth.json -> telegram.token (the design's source of truth).
+    Returns "" if none found. Reading pi auth here means the operator never has
+    to copy the token into the manager .env by hand (docs/webgui/06-telegram.md).
+    """
+    if explicit:
+        return explicit.strip()
+    import os
+    env = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    if env:
+        return env
+    # Fall back to pi auth.json.
+    auth = os.path.join(os.path.expanduser("~"), ".pi", "agent", "auth.json")
+    try:
+        with open(auth, encoding="utf-8") as fh:
+            data = json.load(fh)
+        tok = ((data.get("telegram") or {}).get("token") or "").strip()
+        if tok:
+            return tok
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def _human_size(n: int) -> int | str:
     if not n or n < 0:
         return "0 B"
@@ -346,14 +372,21 @@ if __name__ == "__main__":
     p.add_argument("--capture-chat-id", action="store_true",
                    help="print the chat id from the latest message to the bot")
     p.add_argument("--hello", action="store_true", help="send a test message")
-    p.add_argument("--token", default=os.environ.get("TELEGRAM_TOKEN", ""))
+    p.add_argument("--token", default="")
     p.add_argument("--chat-id", default=os.environ.get("TELEGRAM_CHAT_ID", ""))
     a = p.parse_args()
 
+    # Resolve the token: explicit flag > TELEGRAM_TOKEN env > pi auth.json.
+    token = a.token or resolve_token()
+    if not token:
+        print("No token. Pass --token, set TELEGRAM_TOKEN, or add telegram.token "
+              "to ~/.pi/agent/auth.json.")
+        raise SystemExit(1)
+
     if a.capture_chat_id:
-        capture_chat_id(a.token)
+        capture_chat_id(token)
     elif a.hello:
-        n = TelegramNotifier(a.token, a.chat_id, enabled=True)
+        n = TelegramNotifier(token, a.chat_id, enabled=True)
         print("sent" if n.send("✅ Takeout manager: hello") else "send failed")
     else:
         p.print_help()

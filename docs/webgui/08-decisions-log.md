@@ -151,3 +151,27 @@ edits survive a reboot.
   (verified). Write/control routes are all token-gated. If the threat model
   tightens, gate reads behind the API token too — the helper `_check_api_token`
   is already there.
+
+---
+
+## Build verification (2026-06-23)
+
+Actually built and ran the Docker images locally (not just syntax-checked):
+
+- **`takeout-dl`** (lean engine image, `Dockerfile.takeout_dl`) — builds clean.
+- **`takeout-webgui`** (`webgui/Dockerfile.webtop`, Debian webtop base) — builds
+  clean. Verified the review fix in-image:
+  - `chromium` resolves to `/usr/bin/chromium`, a **real binary** (Chromium
+    149, Debian trixie), `--version` executes, and there is **no snap** anywhere
+    — confirming the Ubuntu→Debian base switch fixed the snap-shim risk the
+    deploy review flagged.
+  - Manager venv at `/opt/manager-venv` imports `manager.app` (22 routes) and
+    serves `GET /api/control/health` (200) bound to 127.0.0.1 inside the
+    container.
+  - `init_custom.sh` + `manager-service.sh` land in the s6 dirs
+    (`/custom-cont-init.d`, `/custom-services.d`), executable, pass `bash -n`.
+- **Not yet exercised** (needs the server / a real Google session): KasmVNC
+  portal + audio, GPU passthrough, the full capture→download→resume cycle, and
+  the Cloudflare tunnel. These are the Phase 6/7 runtime gates in
+  `09-smoke-test.md`. SSH to the server is currently rejected
+  (`Permission denied (publickey,password)`), so server-side steps are blocked.

@@ -38,6 +38,11 @@ services:
       PGID: "1000"
       TZ: ${TZ:-Etc/UTC}
       TITLE: "Takeout Browser"
+      # KasmVNC portal basic-auth (nginx .htpasswd). The portal controls a
+      # browser holding the Google session, so it MUST require login before the
+      # Cloudflare tunnel exposes it. CUSTOM_USER/PASSWORD come from webgui/.env.
+      CUSTOM_USER: ${CUSTOM_USER:-takeout}
+      PASSWORD: ${PASSWORD:-}
       # Manager binds localhost INSIDE the container; the host port mapping
       # below pins it to 127.0.0.1 on the server too.
       MANAGER_HOST: "127.0.0.1"

@@ -55,7 +55,12 @@ RUN python3 -m venv /opt/manager-venv \
 COPY webgui/init_custom.sh /custom-cont-init.d/99-takeout-init
 # The manager long-running service (s6 supervises + restarts it).
 COPY webgui/manager-service.sh /custom-services.d/takeout-manager
-RUN chmod +x /custom-cont-init.d/99-takeout-init /custom-services.d/takeout-manager
+# Chromium launcher service: deterministic boot (KDE XDG autostart is
+# unreliable in-container); waits for X, clears stale locks, runs as user abc.
+COPY webgui/chromium-service.sh /custom-services.d/takeout-chromium
+RUN chmod +x /custom-cont-init.d/99-takeout-init \
+        /custom-services.d/takeout-manager \
+        /custom-services.d/takeout-chromium
 
 # Manager listens here (localhost only; never published to 0.0.0.0 — the
 # compose file binds it to 127.0.0.1 on the host).

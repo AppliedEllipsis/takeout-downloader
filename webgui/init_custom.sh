@@ -49,18 +49,11 @@ exec "\$CHROME" \\
 EOF
 chmod +x /usr/local/bin/takeout-chromium
 
-# Autostart entry for the KDE/openbox session the webtop runs.
-mkdir -p /config/.config/autostart
-if [ ! -f /config/.config/autostart/takeout-chromium.desktop ]; then
-cat > /config/.config/autostart/takeout-chromium.desktop <<EOF
-[Desktop Entry]
-Type=Application
-Name=Takeout Browser
-Exec=/usr/local/bin/takeout-chromium
-X-GNOME-Autostart-enabled=true
-Terminal=false
-EOF
-fi
+# Chromium is launched by the dedicated s6 service (/custom-services.d/
+# takeout-chromium), NOT an XDG autostart entry: this image runs KDE Plasma and
+# ~/.config/autostart is not honored reliably on container boot. The service
+# waits for the X display, clears any stale SingletonLock, and supervises
+# chromium so a closed window/crash self-heals.
 
 # Desktop shortcut for a manual relaunch if the user closes the window.
 if [ ! -f /config/Desktop/Takeout-Browser.desktop ]; then

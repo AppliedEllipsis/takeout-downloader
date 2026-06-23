@@ -228,3 +228,39 @@ left enabled per request. All findings below are from the live deploy.
   (`CLOUDFLARE_TUNNEL_TOKEN` empty, cloudflared not started).
 - **Telegram**: `TELEGRAM_ENABLED=false` until a chat_id is captured.
 - The live capture→download→resume cycle (needs the Google login first).
+
+## Live deployment + zero-config tunnel (2026-06-23)
+
+The system is deployed and running on the server (188.245.169.166), reached via
+a zero-config Cloudflare quick tunnel.
+
+### Portal auth (TEMPORARY credential — CHANGE THIS)
+- The KasmVNC portal is gated by nginx basic auth (linuxserver webtop
+  `CUSTOM_USER` + `PASSWORD`).
+- **Current credentials: `takeout` / `passw0rd` — TEMPORARY, set on request.**
+  Change before any real use: edit `PASSWORD` in `webgui/.env` on the server and
+  `docker compose -f docker-compose.webgui.yml --env-file webgui/.env up -d --force-recreate webgui`.
+- Stored as an apr1 hash in `/etc/nginx/.htpasswd` inside the container; the
+  plaintext lives only in `webgui/.env` (mode 600, gitignored).
+
+### Tunnel: zero-config quick tunnel (no Cloudflare account)
+- `cloudflared tunnel --url http://127.0.0.1:3000` (compose `cloudflared`
+  service). Emits a random `*.trycloudflare.com` hostname on each start — it is
+  NOT stable across restarts. Re-read it from `docker logs takeout-tunnel`.
+- There is NO Cloudflare Access layer in this mode (that needs a CF account +
+  named tunnel). The basic-auth password is therefore the ONLY gate — which is
+  why a password is mandatory before the tunnel is opened.
+
+### Exposure verification (all PASS, tested via the public URL)
+- portal, no creds -> 401; with creds -> 200.
+- manager API (`/api/control/health`) via tunnel -> 401 (nginx), never manager JSON.
+- manager UI path via tunnel -> 404.
+- CDP (`/json/version`) via tunnel -> 404 (not proxied).
+- Host bindings remain `127.0.0.1:3000/8080/9222` only — manager + CDP never
+  bind 0.0.0.0. The tunnel only ever sees the auth-gated portal on 3000.
+
+### Telegram: deferred
+- Skipped for now. `TELEGRAM_ENABLED=false`; manager runs fully without it.
+- Token resolves from `~/.pi/agent/auth.json` (bot @Pi_Lip_bot) when re-enabled;
+  `python -m manager.notify --capture-chat-id` needs the bot to have received a
+  message first (DM it, or add it as a channel admin and post once).

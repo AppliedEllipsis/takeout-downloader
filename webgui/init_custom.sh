@@ -1,5 +1,8 @@
-#!/bin/bash
+#!/usr/bin/with-contenv bash
 # First-boot setup for the Takeout webtop, run once by the s6 init as root.
+# with-contenv shebang: s6-overlay runs custom init/services with a CLEAN env;
+# this wrapper injects the container environment (STORAGE_ROOT, MANAGER_*,
+# TELEGRAM_*) so the manager + profile seeding see the compose-provided values.
 # Idempotent: every block guards on a marker so a container restart is cheap.
 #
 # Responsibilities:

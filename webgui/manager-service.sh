@@ -1,5 +1,9 @@
-#!/bin/bash
+#!/usr/bin/with-contenv bash
 # Long-running manager service, supervised by the webtop's s6 init.
+# NOTE: the `with-contenv` shebang is REQUIRED — s6-overlay runs custom
+# services with a clean environment, so a plain `#!/bin/bash` would NOT see
+# STORAGE_ROOT / MANAGER_* / TELEGRAM_* (they'd silently fall back to defaults
+# and tokens would be empty). with-contenv imports the container env first.
 # s6 restarts this script if it exits, giving us the "manager crash ->
 # auto restart" behavior from docs/webgui/01-architecture.md (failure isolation).
 #

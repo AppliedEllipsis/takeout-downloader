@@ -175,3 +175,56 @@ Actually built and ran the Docker images locally (not just syntax-checked):
   the Cloudflare tunnel. These are the Phase 6/7 runtime gates in
   `09-smoke-test.md`. SSH to the server is currently rejected
   (`Permission denied (publickey,password)`), so server-side steps are blocked.
+
+---
+
+## Deployment to server (2026-06-23)
+
+Deployed to `ellipsis@188.245.169.166` (Hetzner, Ubuntu 24.04, KDE-Plasma webtop).
+Key-based SSH installed (dedicated `takeout_deploy` ed25519 key); password auth
+left enabled per request. All findings below are from the live deploy.
+
+- **Disk crisis fixed first.** Root fs was 100% full (508 MB free / 75 GB). Cause
+  was NOT the project: `/var/log/juicefs.log` had grown to 22 GB unbounded since
+  May. Truncated in place (`: >`, keeps the inode so JuiceFS keeps writing, no
+  restart) → 22 GB reclaimed. Installed `/etc/logrotate.d/juicefs`
+  (daily, maxsize 500M, rotate 7, compress, **copytruncate** since JuiceFS holds
+  the fd open, **su root root** because /var/log perms are non-standard).
+- **Dedicated env file.** The root `.env` belongs to another project (a CLI
+  takeout export). Pointed compose `env_file:` at `webgui/.env` (mode 600,
+  gitignored) and run compose with `--env-file webgui/.env` so the
+  `environment:` `${VAR}` interpolation also reads it. STORAGE_ROOT set to
+  `/opt/storage.jfs002` so archives land on the 1 PB JuiceFS mount, NOT the
+  75 GB root disk.
+- **s6 `with-contenv` shebang is mandatory.** Custom services/init scripts run
+  with a clean env under s6-overlay; `#!/bin/bash` meant the manager saw no
+  STORAGE_ROOT/tokens (health showed `/opt` + tokens unset). Fixed both
+  `manager-service.sh` and `init_custom.sh` to `#!/usr/bin/with-contenv bash`.
+- **Chromium launched via an s6 service, not XDG autostart.** This webtop runs
+  KDE Plasma; `~/.config/autostart/*.desktop` is not honored reliably on
+  container boot. Added `webgui/chromium-service.sh` (waits for X display :1,
+  clears stale Singleton* locks, launches as user `abc` via `s6-setuidgid`).
+  s6 restarts it on exit (closed window/crash self-heals). Removed the redundant
+  XDG autostart block from init.
+- **Stale SingletonLock on recreate.** Chromium writes `SingletonLock ->
+  <host>-<pid>`; after `docker compose up --force-recreate` that pid is gone but
+  the symlink remains and blocks every new launch. The chromium service removes
+  the stale locks when no chromium is running — verified self-healing across
+  repeated force-recreates.
+
+### Verified live (server, no manual intervention after recreate)
+- Both images build on the server. `chromium` is a real Debian binary
+  (Chrome 149, trixie), not a snap shim.
+- Manager: health 200, `storage_root=/opt/storage.jfs002/google-takeout`,
+  1.12 PB free, both tokens set. Web UI 200.
+- Chromium: 39 procs, CDP 200 on 127.0.0.1:9222, both tabs open
+  (takeout.google.com + manager). Extension loaded with the pinned ID
+  `dgbbpdjpfeeaiheekoclkkkbipkikejl` (confirms manifest `key` + managed policy).
+- KasmVNC portal: 200 on 3000. Host ports 3000/8080/9222 all bound 127.0.0.1.
+
+### Still requires a human (cannot be automated)
+- **Google login** in the portal (one-time, interactive — 2FA).
+- **Cloudflare tunnel**: needs a real tunnel token/hostname + Access policy
+  (`CLOUDFLARE_TUNNEL_TOKEN` empty, cloudflared not started).
+- **Telegram**: `TELEGRAM_ENABLED=false` until a chat_id is captured.
+- The live capture→download→resume cycle (needs the Google login first).

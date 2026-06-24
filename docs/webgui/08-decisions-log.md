@@ -285,3 +285,13 @@ a zero-config Cloudflare quick tunnel.
   `docker compose restart webgui` (shares the tunnel's netns → CF 1033 + new
   quick-tunnel URL). `config/` (KasmVNC profile = live Google session) is now
   gitignored.
+
+### Operations runbook
+- **Recovery & daily procedures:** documented in `12-operations-runbook.md`.
+  Covers start/stop, manager reload without killing the tunnel, extension
+  reload over CDP, Chrome stability workarounds, cookie-refresh resume flow,
+  progress monitoring, and zip verification.
+- **Chrome stability:** on this VirtIO-GPU container, Chromium ~149 crashes on
+  heavy pages after prolonged uptime. Mitigations: `--disable-gpu` in the
+  launcher, container restart, profile clearing. Still an open issue — may
+  need a Chromium version upgrade or the profile to be seeded fresh.

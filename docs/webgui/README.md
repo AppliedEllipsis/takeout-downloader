@@ -83,3 +83,4 @@ goal: capture a workflow once, then **repeat it without an LLM**.
   rewrite it.
 
 - `11-session-changes.md` — post-Phase-10 changes (paste box, labels, job deletion, cache-busting, CDP extension reload).
+- `12-operations-runbook.md` — daily operations, recovery, and monitoring

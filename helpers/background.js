@@ -251,11 +251,12 @@ function buildManagerPayload(capture, meta) {
     } catch (e) { /* malformed url; fall back to scraped meta */ }
     const m = meta || {};
     const email = m.email || null;
+    const label = m.label || null;
     const user = urlUser || m.user || null;
     const authuser = urlAuthuser || m.authuser || null;
     const archiveId = urlArchive || m.archiveId || null;
-    if (email || user || authuser || archiveId) {
-        payload._meta = { email, user, authuser, archiveId };
+    if (email || label || user || authuser || archiveId) {
+        payload._meta = { email, label, user, authuser, archiveId };
     }
     return payload;
 }

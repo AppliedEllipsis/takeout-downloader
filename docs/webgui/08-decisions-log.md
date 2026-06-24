@@ -264,3 +264,24 @@ a zero-config Cloudflare quick tunnel.
 - Token resolves from `~/.pi/agent/auth.json` (bot @Pi_Lip_bot) when re-enabled;
   `python -m manager.notify --capture-chat-id` needs the bot to have received a
   message first (DM it, or add it as a channel admin and post once).
+
+
+### Post-Phase-10 live-session changes (see 11-session-changes.md)
+- **Manual paste box** added to the manager UI so a job can be started without
+  the extension; the page self-injects the capture token (localhost-only).
+- **Account label**: derivation now falls back to URL `user=` and a DOM-scraped
+  display name (e.g. `braincreation`); precedence is override → email → scraped
+  label → `gaia-<user>` → `unknown-account`.
+- **Job deletion**: `DELETE /api/jobs/{id}` + Remove button (keeps files on
+  disk, drops the record). Fixed a pre-existing bug where UI control buttons
+  sent no api token and silently 401'd.
+- **Cache-busting**: HTML served `no-store`; assets get `?v=<manager-start>` so
+  a plain reload picks up new JS/CSS after a restart.
+- **Extension auto-reload over CDP**: `webgui/reload-extension.sh` +
+  `cdp_reload_ext.py` reload the extension by ID via `chrome.developerPrivate`
+  and report real manifest errors. CDP (:9222) stays loopback-only, never tunneled.
+- **manifest.json**: removed non-standard `_comment_key` (MV3 load warning).
+- **Ops**: reload the manager via SIGKILL + s6 respawn, NEVER
+  `docker compose restart webgui` (shares the tunnel's netns → CF 1033 + new
+  quick-tunnel URL). `config/` (KasmVNC profile = live Google session) is now
+  gitignored.

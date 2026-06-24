@@ -121,3 +121,6 @@ nul
 # Manager service local venv (Phase 2+)
 .venv-manager/
 manager/**/__pycache__/
+
+# Hosted-browser profile (KasmVNC /config): live Google session — NEVER commit
+config/

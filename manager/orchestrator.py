@@ -59,13 +59,34 @@ def _payload_meta(payload: "engine.Payload", raw: dict | None) -> dict:
             if v:
                 return v
         return None
+    # URL fallback: Google bakes ?user=<gaia>&authuser=<n> into every part URL.
+    # The _meta/meta blocks often omit these (see unknown-account fallback), so
+    # parse them off the first export URL when the meta blocks don't carry them.
+    def _from_urls(param: str):
+        from urllib.parse import urlparse, parse_qs
+        for e in getattr(payload, "exports", []) or []:
+            url = getattr(e, "url", "") or ""
+            if not url:
+                continue
+            vals = parse_qs(urlparse(url).query).get(param)
+            if vals and vals[0]:
+                return vals[0]
+        url = getattr(payload, "url", "") or ""
+        if url:
+            vals = parse_qs(urlparse(url).query).get(param)
+            if vals and vals[0]:
+                return vals[0]
+        return None
     email = _pick("email")
     if email:
         meta["email"] = email
-    user = _pick("user")
+    label = _pick("label")
+    if label:
+        meta["label"] = label
+    user = _pick("user") or _from_urls("user")
     if user:
         meta["user"] = user
-    authuser = _pick("authuser")
+    authuser = _pick("authuser") or _from_urls("authuser")
     if authuser:
         meta["authuser"] = authuser
     archive_id = _pick("archive_id", "archiveId")
@@ -231,6 +252,34 @@ class Orchestrator:
             self._emit("error", job)
             return True
         return False
+
+
+    def delete_job(self, job_id: str) -> bool:
+        """Remove a finished/failed job from the registry and forget its
+        persisted state so a restart won't resurrect it. Refuses while the job
+        is actively downloading/queued (cancel it first). Downloaded files are
+        kept on disk; only the .manager_state.json bookkeeping file is removed."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return False
+            if job.status in (J.DOWNLOADING, J.QUEUED):
+                return False
+            runner = self._runners.get(job_id)
+            if runner:
+                runner.stop()
+            try:
+                sp = J.state_path(job.output_dir)
+                if sp.exists():
+                    sp.unlink()
+            except OSError:
+                pass
+            self._jobs.pop(job_id, None)
+            self._runners.pop(job_id, None)
+            self._recapture_count.pop(job_id, None)
+            self._last_progress.pop(job_id, None)
+        self._emit("deleted", job)
+        return True
 
     def resume(self, job_id: str) -> bool:
         """Resume a paused job. The runner thread re-discovers + continues from

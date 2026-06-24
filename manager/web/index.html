@@ -13,6 +13,19 @@
 </header>
 
 <main>
+  <section id="paste-panel">
+    <h2>Paste a payload</h2>
+    <p class="dim">Paste the extension's "Copy all" JSON (schema 2). Starts a download job directly — no extension POST needed.</p>
+    <div class="paste-row">
+      <input type="text" id="paste-label" placeholder="optional label (e.g. photos-2026)">
+    </div>
+    <textarea id="paste-json" rows="6" placeholder='{ "schema": 2, "exports": [ ... ], "cookie": "..." }'></textarea>
+    <div class="paste-row">
+      <button id="paste-submit" class="btn">Start download</button>
+      <span id="paste-status" class="dim"></span>
+    </div>
+  </section>
+
   <section id="jobs-panel">
     <h2>Jobs</h2>
     <div id="jobs-list" class="jobs-list">

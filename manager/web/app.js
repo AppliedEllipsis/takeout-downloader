@@ -82,7 +82,8 @@ function renderDetail(job) {
       <span class="spacer"></span>
       <button class="btn" data-act="pause" ${job.status !== "downloading" ? "disabled" : ""}>Pause</button>
       <button class="btn" data-act="recapture">Re-capture cookie</button>
-      <button class="btn danger" data-act="cancel">Cancel</button>
+      <button class="btn danger" data-act="cancel" ${job.status === "downloading" || job.status === "queued" ? "" : "disabled"}>Cancel</button>
+      <button class="btn danger" data-act="delete" ${job.status === "downloading" || job.status === "queued" ? "disabled" : ""}>Remove</button>
     </div>
     ${needsCookie ? '<div class="banner warn">Cookie expired. Re-capture in the browser (the extension auto-re-captures if enabled). The job resumes from partials automatically.</div>' : ""}
     ${job.last_error ? `<div class="banner warn">${job.last_error}</div>` : ""}
@@ -117,7 +118,30 @@ function rowFor(p) {
   </tr>`;
 }
 
+function apiToken() {
+  const m = document.querySelector('meta[name="api-token"]');
+  return m ? m.getAttribute("content") : "";
+}
+
 async function doControl(act, jobId) {
+  const headers = { "Content-Type": "application/json" };
+  const tok = apiToken();
+  if (tok) headers["X-Api-Token"] = tok;
+  if (act === "delete") {
+    if (!confirm("Remove this job from the list? Downloaded files are kept on disk; only the job record is removed.")) return;
+    try {
+      await api(`/api/jobs/${jobId}`, { method: "DELETE", headers });
+      if (selectedJob === jobId) {
+        selectedJob = null;
+        if (evtSource) { evtSource.close(); evtSource = null; }
+        $("#detail-panel").innerHTML = '<p class="dim">Select a job.</p>';
+      }
+      refreshJobs();
+    } catch (e) {
+      alert(`remove failed: ${e.message}`);
+    }
+    return;
+  }
   const map = {
     pause: ["/api/control/pause", "POST"],
     cancel: ["/api/control/cancel", "POST"],
@@ -129,9 +153,10 @@ async function doControl(act, jobId) {
   try {
     await api(path, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ job_id: jobId }),
     });
+    refreshJobs();
   } catch (e) {
     alert(`${act} failed: ${e.message}`);
   }
@@ -141,3 +166,46 @@ refreshHealth();
 refreshJobs();
 setInterval(refreshHealth, 5000);
 setInterval(refreshJobs, 4000);
+
+
+// --- Paste-payload box ------------------------------------------------------
+function captureToken() {
+  const m = document.querySelector('meta[name="capture-token"]');
+  return m ? m.getAttribute("content") : "";
+}
+
+async function submitPaste() {
+  const btn = $("#paste-submit");
+  const statusEl = $("#paste-status");
+  const raw = $("#paste-json").value.trim();
+  const label = $("#paste-label").value.trim();
+  if (!raw) { statusEl.textContent = "Nothing to submit."; return; }
+  let path = "/api/payload";
+  if (label) path += "?label=" + encodeURIComponent(label);
+  const headers = { "Content-Type": "application/json" };
+  const tok = captureToken();
+  if (tok) headers["X-Capture-Token"] = tok;
+  btn.disabled = true;
+  statusEl.textContent = "Submitting\u2026";
+  try {
+    const r = await fetch(path, { method: "POST", headers, body: raw });
+    const txt = await r.text();
+    if (!r.ok) throw new Error(r.status + " " + txt);
+    let job;
+    try { job = JSON.parse(txt); } catch { job = null; }
+    statusEl.textContent = "Started" + (job && job.job_id ? " job " + job.job_id : "") + ".";
+    $("#paste-json").value = "";
+    $("#paste-label").value = "";
+    refreshJobs();
+    if (job && job.job_id) selectJob(job.job_id);
+  } catch (e) {
+    statusEl.textContent = "Failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const b = document.getElementById("paste-submit");
+  if (b) b.addEventListener("click", submitPaste);
+});

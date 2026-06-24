@@ -57,6 +57,12 @@ def account_label(meta: dict | None, override: str | None = None) -> str:
     s = sanitize_label(email)
     if s:
         return s
+    # Human-readable display name / handle scraped from the account switcher
+    # (e.g. "braincreation") when there is no real @email.
+    label = meta.get("label") or ""
+    s = sanitize_label(label)
+    if s:
+        return s
     gaia = str(meta.get("user") or meta.get("authuser") or "").strip()
     gaia = re.sub(r"[^A-Za-z0-9]", "", gaia)
     if gaia:

@@ -653,16 +653,48 @@
         return null;
     }
 
+    // The signed-in human-readable label. Google's account switcher renders
+    // an aria-label like "Google Account: braincreation\n(braincreation@gmail.com)".
+    // When there is no real @email (e.g. a Workspace handle), the NAME after
+    // "Google Account:" and before the email/paren is the best label.
+    function scrapeAccountLabel() {
+        const sel = [
+            '[aria-label*="Google Account"]', 'a[aria-label*="Account:"]',
+            'a[aria-label*="@"]', 'a[title*="@"]', 'header [aria-label*="@"]'
+        ];
+        for (const s of sel) {
+            for (const el of document.querySelectorAll(s)) {
+                const hay = (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('title') || '');
+                // Pull the chunk after "Google Account:" up to a newline,
+                // open-paren, or the email itself.
+                const m = hay.match(/Google Account:\s*([^\n(]+)/i);
+                if (m) {
+                    let name = m[1].trim();
+                    // If the captured chunk IS an email, leave it for the email path.
+                    if (EMAIL_RE.test(name)) {
+                        name = name.replace(EMAIL_RE, '').trim();
+                    }
+                    name = name.replace(/[(),]/g, '').trim();
+                    if (name) return name;
+                }
+            }
+        }
+        return null;
+    }
+
     function reportAccountMeta() {
         try {
             const email = scrapeAccountEmail();
+            const label = scrapeAccountLabel();
             const params = new URLSearchParams(location.search);
             const meta = {
                 email: email || null,
+                label: label || null,
                 user: params.get('user') || null,
                 authuser: params.get('authuser') || '0'
             };
-            if (email || meta.user) {
+            if (email || label || meta.user) {
                 chrome.runtime.sendMessage({ action: 'setAccountMeta', meta })
                     .catch(() => {});
             }

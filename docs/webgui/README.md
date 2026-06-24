@@ -81,3 +81,5 @@ goal: capture a workflow once, then **repeat it without an LLM**.
 - No public, unauthenticated control of the browser or manager.
 - No change to the engine's core download/integrity logic — we wrap it, not
   rewrite it.
+
+- `11-session-changes.md` — post-Phase-10 changes (paste box, labels, job deletion, cache-busting, CDP extension reload).

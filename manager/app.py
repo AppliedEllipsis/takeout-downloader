@@ -145,6 +145,15 @@ async def get_job(job_id: str):
     return job.snapshot()
 
 
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str,
+                     x_api_token: str | None = Header(default=None)):
+    _check_api_token(x_api_token)
+    ok = orch.delete_job(job_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail="job not found or still active")
+    return {"ok": True}
+
 @app.get("/api/jobs/{job_id}/log")
 async def get_job_log(job_id: str, lines: int = 200):
     job = orch.get_job(job_id)
@@ -336,9 +345,28 @@ if _web_dir.exists():
     app.mount("/ui", StaticFiles(directory=str(_web_dir), html=True), name="ui")
 
 
+# Asset cache-buster: changes every manager start so a normal browser reload
+# always re-fetches app.js/app.css instead of needing a hard refresh.
+import time as _time
+_ASSET_VERSION = str(int(_time.time()))
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     idx = _web_dir / "index.html"
     if idx.exists():
-        return HTMLResponse(idx.read_text(encoding="utf-8"))
+        html = idx.read_text(encoding="utf-8")
+        # Inject the capture token so the in-page paste box can POST /api/payload
+        # without the operator typing it. Safe: this page is localhost-only.
+        token = cfg.capture_token or ""
+        api_token = cfg.api_token or ""
+        inject = ('<meta name="capture-token" content="%s">\n'
+                  '<meta name="api-token" content="%s">') % (token, api_token)
+        html = html.replace("</head>", inject + "\n</head>", 1)
+        # Cache-bust versioned assets so a plain reload picks up new JS/CSS.
+        html = html.replace('href="/ui/app.css"',
+                            'href="/ui/app.css?v=%s"' % _ASSET_VERSION)
+        html = html.replace('src="/ui/app.js"',
+                            'src="/ui/app.js?v=%s"' % _ASSET_VERSION)
+        # The HTML itself is dynamic (tokens + version) — never cache it.
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
     return HTMLResponse("<h1>Takeout Manager</h1><p>UI not built yet (Phase 3).</p>")

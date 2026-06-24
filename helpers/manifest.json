@@ -34,6 +34,14 @@
             "matches": [
                 "https://takeout.google.com/*"
             ],
+            "js": ["page-spy.js"],
+            "world": "MAIN",
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "https://takeout.google.com/*"
+            ],
             "js": ["content.js"],
             "run_at": "document_idle"
         }

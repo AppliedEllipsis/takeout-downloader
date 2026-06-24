@@ -81,170 +81,6 @@
         globals: null
     };
 
-    function injectPageSpy() {
-        if (document.getElementById('takeout-helper-spy')) return;
-        const script = document.createElement('script');
-        script.id = 'takeout-helper-spy';
-        script.textContent = `
-(function() {
-    'use strict';
-    const SOURCE = 'takeout-downloader-spy';
-    function post(type, data) {
-        window.postMessage({ source: SOURCE, type: type, data: data, href: location.href }, '*');
-    }
-    function scanText(text) {
-        if (typeof text !== 'string') return [];
-        const re = /https:\\/\\/takeout-download\\.usercontent\\.google\\.com\\/download\\/takeout-[^"'\\s<>]+\\.zip(?:\\?[^"'\\s<>]*)?/g;
-        return Array.from(new Set(text.match(re) || []));
-    }
-    function scanObject(obj) {
-        try {
-            const str = JSON.stringify(obj);
-            return scanText(str);
-        } catch (e) { return []; }
-    }
-    function reportUrl(url) {
-        if (url && (url.includes('takeout-download.usercontent.google.com') || url.includes('manage/archive') || url.includes('TakeoutApiUi'))) {
-            post('url', { url: url, time: Date.now() });
-        }
-    }
-    function reportResponse(url, text, obj) {
-        const fromText = scanText(text);
-        const fromObj = obj ? scanObject(obj) : [];
-        const all = Array.from(new Set(fromText.concat(fromObj)));
-        if (all.length > 0) {
-            post('urls', { urls: all, sourceUrl: url, time: Date.now() });
-        }
-    }
-
-    function reportFilenames(url, text) {
-        if (!url || !text) return;
-        if (!url.includes('/_/TakeoutUi/data/batchexecute') && !url.includes('rpcids=lFYxZd')) return;
-        const matches = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
-        if (matches && matches.length > 0) {
-            const unique = Array.from(new Set(matches));
-            post('filenames', { filenames: unique, sourceUrl: url, time: Date.now() });
-        }
-    }
-
-    // Patch fetch
-    const origFetch = window.fetch;
-    window.fetch = function(...args) {
-        let url = '';
-        if (args[0]) {
-            url = (typeof args[0] === 'string') ? args[0] : (args[0].url || String(args[0]));
-        }
-        reportUrl(url);
-        return origFetch.apply(this, args).then(async (resp) => {
-            try {
-                const clone = resp.clone();
-                const ctype = (clone.headers.get('content-type') || '').toLowerCase();
-                if (ctype.includes('json')) {
-                    const obj = await clone.json().catch(() => null);
-                    reportResponse(url, '', obj);
-                } else if (ctype.includes('html') || ctype.includes('text') || ctype.includes('javascript')) {
-                    const text = await clone.text().catch(() => '');
-                    reportFilenames(url, text);
-                    reportResponse(url, text, null);
-                }
-            } catch (e) {}
-            return resp;
-        });
-    };
-
-    function reportFilenamesFromText(url, text) {
-        if (!url || !text) return;
-        if (!url.includes('/_/TakeoutUi/data/batchexecute') && !url.includes('rpcids=lFYxZd')) return;
-        const matches = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
-        if (matches && matches.length > 0) {
-            const unique = Array.from(new Set(matches));
-            post('filenames', { filenames: unique, sourceUrl: url, time: Date.now() });
-        }
-    }
-
-    // Patch XHR
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    let lastXhrUrl = '';
-    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        lastXhrUrl = url;
-        reportUrl(url);
-        return origOpen.call(this, method, url, ...rest);
-    };
-    XMLHttpRequest.prototype.send = function(...args) {
-        const self = this;
-        const url = lastXhrUrl;
-        function onReady() {
-            if (self.readyState === 4) {
-                try {
-                    const ctype = (self.getResponseHeader('content-type') || '').toLowerCase();
-                    if (ctype.includes('json')) {
-                        const obj = JSON.parse(self.responseText);
-                        reportResponse(url, '', obj);
-                    } else {
-                        reportFilenamesFromText(url, self.responseText || '');
-                        reportResponse(url, self.responseText || '', null);
-                    }
-                } catch (e) {}
-            }
-        }
-        self.addEventListener('readystatechange', onReady);
-        return origSend.call(this, ...args);
-    };
-
-    // Try to read globals the page might expose
-    function readGlobals() {
-        const candidates = ['WIZ_global_data', '_takeout', 'takeout', 'googlesite', 'AF_initDataChunkQueue'];
-        const out = {};
-        for (const k of candidates) {
-            if (k in window) {
-                try {
-                    const val = window[k];
-                    if (k === 'AF_initDataChunkQueue' && Array.isArray(val)) {
-                        // Extract filenames from init data chunks
-                        const filenames = [];
-                        for (const chunk of val) {
-                            try {
-                                const s = JSON.stringify(chunk);
-                                const m = s.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
-                                if (m) for (const f of m) filenames.push(f);
-                            } catch (e) {}
-                        }
-                        if (filenames.length > 0) {
-                            post('filenames', { filenames: Array.from(new Set(filenames)), sourceUrl: 'AF_initDataChunkQueue', time: Date.now() });
-                        }
-                        out[k] = 'array[' + val.length + ']';
-                    } else {
-                        out[k] = JSON.parse(JSON.stringify(val));
-                    }
-                } catch (e) { out[k] = 'unserializable'; }
-            }
-        }
-        return out;
-    }
-
-    // Also scan script[class^="ds:"] tags for embedded takeout data
-    function scanDsScripts() {
-        const scripts = document.querySelectorAll('script[class^="ds:"]');
-        const filenames = [];
-        for (const s of scripts) {
-            const text = s.textContent || '';
-            const m = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
-            if (m) for (const f of m) filenames.push(f);
-        }
-        if (filenames.length > 0) {
-            post('filenames', { filenames: Array.from(new Set(filenames)), sourceUrl: 'ds-scripts', time: Date.now() });
-        }
-    }
-
-    post('globals', { globals: readGlobals(), href: location.href });
-    setTimeout(scanDsScripts, 100);
-    setTimeout(scanDsScripts, 1000);
-})();
-        `;
-        (document.head || document.documentElement).appendChild(script);
-        script.onload = () => script.remove();
-    }
 
     window.addEventListener('message', (event) => {
         if (!event.data || event.data.source !== 'takeout-downloader-spy') return;
@@ -265,12 +101,12 @@
     });
 
     // Inject spy as soon as possible, and again on URL changes (SPA nav).
-    injectPageSpy();
+    // injectPageSpy();  // DISABLED: caused Chrome SIGKILL on takeout.google.com after login (CSP violation blocking inline script injection)
     let lastHref = location.href;
     setInterval(() => {
         if (location.href !== lastHref) {
             lastHref = location.href;
-            injectPageSpy();
+            // injectPageSpy(); // DISABLED
         }
     }, 1000);
 
@@ -743,15 +579,17 @@
     }
     sendScrape();
     reportAccountMeta();
-    setInterval(sendScrape, 5000);
+    // setInterval(sendScrape, 5000); // DISABLED: heavy DOM scan
     setInterval(reportAccountMeta, 15000);
 
     let scrapeTimer = null;
+    /* DISABLED: heavy DOM scanning can hang renderer on large Takeout page
     const observer = new MutationObserver(() => {
         if (scrapeTimer) clearTimeout(scrapeTimer);
         scrapeTimer = setTimeout(sendScrape, 1000);
     });
     if (document.body) {
         observer.observe(document.body, { childList: true, subtree: true });
-    }
+    } */
+    // DISABLED
 })();

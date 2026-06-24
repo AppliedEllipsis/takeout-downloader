@@ -53,7 +53,33 @@
         </div>
     </div>
 
-    <h3>What this extension does</h3>
+    
+    <h3>Manager</h3>
+    <div class="section">
+        <div class="row">
+            <input type="checkbox" id="autoPost" checked>
+            <label for="autoPost" style="margin:0;cursor:pointer;"><strong>Auto-POST captures to the manager</strong></label>
+        </div>
+        <div class="help">Every capture is automatically sent to the web manager. Requires the URL and token below.</div>
+    </div>
+    <div class="section">
+        <div class="row">
+            <input type="checkbox" id="autoRecapture" checked>
+            <label for="autoRecapture" style="margin:0;cursor:pointer;"><strong>Auto-recapture on cookie expiry</strong></label>
+        </div>
+        <div class="help">When the manager signals a stale cookie, the extension re-captures and re-POSTs automatically.</div>
+    </div>
+    <div class="section">
+        <label for="managerUrl">Manager URL</label>
+        <input type="text" id="managerUrl" placeholder="http://127.0.0.1:8080" style="width:100%;box-sizing:border-box;padding:6px;background:#2d2d3f;color:#f8fafc;border:1px solid #3d3d5c;border-radius:4px;font-family:monospace;font-size:13px;">
+        <div class="help">Base URL of the web manager.</div>
+    </div>
+    <div class="section">
+        <label for="captureToken">Capture Token</label>
+        <input type="text" id="captureToken" placeholder="(empty = no token)" style="width:100%;box-sizing:border-box;padding:6px;background:#2d2d3f;color:#f8fafc;border:1px solid #3d3d5c;border-radius:4px;font-family:monospace;font-size:13px;">
+        <div class="help">MANAGER_CAPTURE_TOKEN from webgui/.env. The paste box in the manager UI carries the token automatically; set this only if auto-POST is needed.</div>
+    </div>
+<h3>What this extension does</h3>
     <div class="help">
         Watches network requests to <code>takeout.google.com</code>,
         <code>takeout-download.usercontent.google.com</code>, and

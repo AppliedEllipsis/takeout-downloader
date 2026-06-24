@@ -43,10 +43,30 @@ class Manifest:
         p = manifest_path(self.output_dir)
         if p.exists():
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
+                data = json.loads(p.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
-                pass
-        return {"files": {}}
+                data = {}
+        else:
+            data = {}
+        # Normalize 'files' to the internal dict[str, row] shape. On disk it
+        # is a LIST (from _serializable); loading it as-is left a list, which
+        # crashed _serializable's int(key) sort. Re-key by the row's index.
+        files = data.get("files")
+        norm = {}
+        if isinstance(files, dict):
+            for k, v in files.items():
+                if isinstance(v, dict):
+                    idx = v.get("index", k)
+                    norm[str(idx)] = v
+        elif isinstance(files, list):
+            for v in files:
+                if isinstance(v, dict):
+                    idx = v.get("index")
+                    if idx is None:
+                        continue
+                    norm[str(idx)] = v
+        data["files"] = norm
+        return data
 
     def _save(self) -> None:
         p = manifest_path(self.output_dir)
@@ -67,7 +87,14 @@ class Manifest:
         """Files are kept as an index->row dict internally; emit a sorted list."""
         out = dict(self._data)
         files = self._data.get("files", {})
-        out["files"] = [files[k] for k in sorted(files, key=lambda x: int(x))]
+        # Defensive: tolerate any malformed keys (non-int) by sorting on a
+        # safe fallback so a corrupted manifest never crashes a job.
+        def _key(k):
+            try:
+                return int(k)
+            except (TypeError, ValueError):
+                return 0
+        out["files"] = [files[k] for k in sorted(files, key=_key)]
         return out
 
     # -- header ---------------------------------------------------------------

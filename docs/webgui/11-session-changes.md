@@ -149,3 +149,31 @@ bound to the container loopback only and is NOT proxied through the tunnel
   submit within a minute or two; a stale cookie makes the engine correctly flip
   the job to `needs_cookie` with zero bytes written (it refuses to save the HTML
   login page as a `.zip`).
+
+---
+
+## 7. Live job monitor
+
+**Why:** confirm a download is actually flowing (bytes + speed) without eyeballing
+docker logs or the manager UI.
+
+**What:** `monitor_job.py` (repo root) — polls `GET /api/jobs` every 5s over SSH
+and prints a one-line status (status, parts, bytes/total, %, speed, last_error).
+Exits when the job reaches `complete` or `error`.
+
+**Use (from a laptop with SSH access to the server alias `takeout-server`):**
+```bash
+python3 monitor_job.py        # Linux/macOS/git-bash
+python monitor_job.py         # if python3 is aliased
+# Windows PowerShell (python3 often not on PATH):
+C:\Users\User\anaconda3\python.exe monitor_job.py
+```
+Example output:
+```
+00:42:26  downloading   1/62 parts  53.1 GB/2.8 TB    1.9%  388 MB/s
+00:42:33  downloading   1/62 parts  55.2 GB/2.8 TB    1.9%  388 MB/s
+```
+
+**Dependencies:** the `takeout-server` SSH host alias (in `~/.ssh/config`) and
+`docker` reachable on that host. No manager-side change required — it reads the
+public job API (localhost curl inside the container, no token needed for reads).

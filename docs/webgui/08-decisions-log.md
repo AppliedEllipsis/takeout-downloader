@@ -295,3 +295,14 @@ a zero-config Cloudflare quick tunnel.
   heavy pages after prolonged uptime. Mitigations: `--disable-gpu` in the
   launcher, container restart, profile clearing. Still an open issue — may
   need a Chromium version upgrade or the profile to be seeded fresh.
+
+## Disk-full root cause + repo migration (session 13)
+
+Chrome SIGKILL/Trace-trap crashes root-caused to /dev/sda1 at 100%. Unbounded
+selkies container logs were a major contributor — added json-file log rotation
+(10m x3) to both services. Repo relocated off the full disk to
+/mnt/local_cache_crypt/_projects/takeout-downloader (300G LUKS local) via fresh
+clone (old .git corrupted by disk-full). Two compose gotchas: (1) MUST start with
+--env-file webgui/.env or ${STORAGE_ROOT} falls back to /opt and shadows the
+manager venv (exit 127) + blanks tokens; (2) STORAGE_ROOT now also in root .env.
+See 13-migration-diskfull.md.

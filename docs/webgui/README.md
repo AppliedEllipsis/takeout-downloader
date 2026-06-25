@@ -84,3 +84,4 @@ goal: capture a workflow once, then **repeat it without an LLM**.
 
 - `11-session-changes.md` — post-Phase-10 changes (paste box, labels, job deletion, cache-busting, CDP extension reload).
 - `12-operations-runbook.md` — daily operations, recovery, and monitoring
+- `13-migration-diskfull.md` — disk-full root cause, repo migration to LUKS disk, compose env-file gotchas.

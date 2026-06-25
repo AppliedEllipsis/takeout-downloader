@@ -70,6 +70,11 @@ services:
       - "127.0.0.1:3000:3000"       # KasmVNC HTTP portal  -> cloudflared attaches
       - "127.0.0.1:8080:8080"       # manager UI+API       -> SSH-forward only
       - "127.0.0.1:9222:9222"       # Chromium CDP         -> SSH-forward only
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   # Cloudflare tunnel. Shares webgui's network namespace so it can reach the
@@ -90,4 +95,9 @@ services:
     depends_on:
       - webgui
     command: tunnel --no-autoupdate --url http://127.0.0.1:3000
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped

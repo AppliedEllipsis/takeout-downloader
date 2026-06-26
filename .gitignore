@@ -124,3 +124,21 @@ manager/**/__pycache__/
 
 # Hosted-browser profile (KasmVNC /config): live Google session — NEVER commit
 config/
+
+# Stray root-level doc drafts — canonical copies live in docs/webgui/
+/11-session-changes.md
+/12-operations-runbook.md
+/13-migration-diskfull.md
+/14-resume-cookies-multiaccount.md
+/15-status-panel-archives-startmd.md
+
+# Build-time / recovery tooling with hardcoded paths — not part of the package
+/patch_*.py
+/diag_job.py
+/introspect_job.py
+/monitor_job.py
+/open_ext_reload.py
+/cdp_reload_ext.py
+/read_storage.py
+/set_token.py
+/verify_zips.py

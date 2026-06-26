@@ -306,3 +306,17 @@ clone (old .git corrupted by disk-full). Two compose gotchas: (1) MUST start wit
 --env-file webgui/.env or ${STORAGE_ROOT} falls back to /opt and shadows the
 manager venv (exit 127) + blanks tokens; (2) STORAGE_ROOT now also in root .env.
 See 13-migration-diskfull.md.
+
+### Resume cookie/livelock + multi-account (see 14-resume-cookies-multiaccount.md)
+- Takeout download cookie dies in ~1-2 min when IDLE; the manager re-discovery
+  sweep (63 one-byte probes over JuiceFS) burned it before downloads started ->
+  livelock. Fixed: cache exports, skip re-discovery on resume (engine_bridge).
+- Stored lastCapture cookie expires fast; the LIVE Chrome cookie jar (CDP
+  Storage.getCookies, ~3.5KB, 27 google cookies) is the freshest source and
+  returns HTTP 206 resumable where lastCapture returns 302->login.
+- Resume now matches on stable archive_id (j= URL param), not label-derived
+  output dir, so a label change (gaia-NNN -> braincreation) cannot orphan a job.
+- Filename scheme differs between payload-exports run (-part-NN) and sweep run
+  (-13-NN); reconcile by index+size before resuming or it re-downloads all.
+- Recovery escape hatch: pull live jar via CDP, fire 4 parallel curl -C - Range
+  resumes direct to disk, bypassing the manager pre-pass entirely.

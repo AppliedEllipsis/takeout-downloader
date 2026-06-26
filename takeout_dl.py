@@ -330,10 +330,18 @@ def probe_export(url: str, headers: dict, cookie: str, timeout: tuple = (10, 30)
         ctype = resp.headers.get("content-type", "")
         if final_host.endswith("accounts.google.com") or "accounts.google.com" in resp.url:
             raise AuthError(f"Redirected to Google sign-in ({final_host})")
-        if "text/html" in ctype:
-            raise AuthError(f"Server returned HTML (content-type={ctype})")
         if resp.status_code in (401, 403):
             raise AuthError(f"HTTP {resp.status_code}")
+        if "text/html" in ctype:
+            # HTML WITHOUT a sign-in redirect (checked above) is NOT an auth
+            # failure -- it is Google's end-of-range response for a part index
+            # past the last real part. Return it as an invalid probe (size 0,
+            # no filename) so the sweep's 2-consecutive-invalid logic stops
+            # cleanly instead of aborting the whole job. A genuinely dead cookie
+            # surfaces as the accounts.google.com redirect or 401/403 above, or
+            # (if it fails from i=0) as the "no exports discovered" RuntimeError.
+            log.debug("probe i: HTML response (end-of-range), ct=%s", ctype)
+            return resp.status_code, 0, ""
 
         cd = resp.headers.get("content-disposition", "")
         filename = ""

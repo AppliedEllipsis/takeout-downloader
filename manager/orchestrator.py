@@ -168,8 +168,13 @@ class Orchestrator:
 
         resumed_job = None
         with self._lock:
-            # Resume path: a job for THIS output dir already waiting for a cookie.
-            existing = self._find_job_for_dir(out_dir)
+            # Resume path: prefer the STABLE archive_id (the j= param is identical
+            # across captures of the same export, even if the account label — and
+            # thus the output dir — changed). Fall back to the output dir for
+            # legacy jobs that have no archive_id recorded.
+            existing = self._find_job_for_archive(meta.get("archive_id"))
+            if existing is None:
+                existing = self._find_job_for_dir(out_dir)
             if existing is not None:
                 # A recovered job may have no runner yet — build one so resume
                 # actually works (and we don't fall through to a duplicate job).
@@ -212,6 +217,16 @@ class Orchestrator:
                            on_auth=lambda j: self._emit("needs_cookie", j))
         self._runners[job.job_id] = runner
         return runner
+
+    def _find_job_for_archive(self, archive_id) -> Optional[J.Job]:
+        """Find a resumable job for THIS export by its stable archive_id."""
+        if not archive_id:
+            return None
+        for job in self._jobs.values():
+            if (job.meta or {}).get("archive_id") == archive_id and job.status in (
+                    J.NEEDS_COOKIE, J.PAUSED, J.DOWNLOADING, J.QUEUED):
+                return job
+        return None
 
     def _find_job_for_dir(self, out_dir: Path) -> Optional[J.Job]:
         for job in self._jobs.values():

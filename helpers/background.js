@@ -520,3 +520,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return true;
     }
 });
+
+// ---------------------------------------------------------------------------
+// Auto-cancel Chrome's native Takeout download.
+// ---------------------------------------------------------------------------
+// When the user clicks "Download" on a part to make the cookie-bearing request
+// fire (so we can capture it), Chrome ALSO starts its own download of that
+// 50GB+ part into the container's disk. The manager downloads server-side, so
+// the browser copy is pure waste and was a contributor to the disk-full crash.
+// We cancel + erase it the instant it appears. Gated by a setting (default on);
+// matches the same final-host patterns we capture from.
+chrome.downloads.onCreated.addListener((item) => {
+    try {
+        const url = (item.finalUrl || item.url || '').toLowerCase();
+        if (!url) return;
+        if (!FINAL_HOST_PATTERNS.some(p => url.includes(p))) return;
+        chrome.storage.local.get(['autoCancelDownloads'], (d) => {
+            // Default ON: only skip if explicitly disabled.
+            if (d.autoCancelDownloads === false) return;
+            chrome.downloads.cancel(item.id, () => {
+                // Remove the cancelled entry from the downloads shelf/list.
+                chrome.downloads.erase({ id: item.id }, () => {});
+            });
+        });
+    } catch (e) { /* non-critical */ }
+});

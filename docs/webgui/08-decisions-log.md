@@ -320,3 +320,25 @@ See 13-migration-diskfull.md.
   (-13-NN); reconcile by index+size before resuming or it re-downloads all.
 - Recovery escape hatch: pull live jar via CDP, fire 4 parallel curl -C - Range
   resumes direct to disk, bypassing the manager pre-pass entirely.
+
+## Live status panel + /opt/archives relocation + start.md (session 15)
+
+Extension v4.1 live status panel: popup polls background getManagerJobs (which
+fetches /api/jobs + job detail + log tail with the capture token), renders
+per-part progress, heartbeat/stall warning, errors, and a log tail. See
+15-status-panel-archives-startmd.md.
+
+New-account save path moved to /opt/archives/google-takeout/{account}/{export-ts}
+via STORAGE_ROOT=/opt/archives + TAKEOUT_SUBDIR=google-takeout. GOTCHA: the
+originally-planned STORAGE_ROOT=/opt would bind-mount host /opt over the image
+baked-in /opt/manager-venv and kill the manager (exit 127) — same venv-shadow
+trap as doc 13. Fix: narrower STORAGE_ROOT=/opt/archives + a SECOND read-only
+bind mount for the legacy /opt/storage.jfs002 tree so both stay visible.
+Manager runs as root in-container, so /opt/archives (root:root 755) is writable
+as-is.
+
+start.md: operator guide for a lesser LLM (server SSH alias, container names,
+ports, tunnel, full new-account onboarding, cookie-cadence + live-jar recovery,
+JuiceFS verify-cost warning). Verified commands against real code before commit;
+fixed a wrong endpoint — pause is POST /api/control/pause with job_id in the
+BODY, not a path route.

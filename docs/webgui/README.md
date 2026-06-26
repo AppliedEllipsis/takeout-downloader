@@ -86,3 +86,4 @@ goal: capture a workflow once, then **repeat it without an LLM**.
 - `12-operations-runbook.md` — daily operations, recovery, and monitoring
 - `13-migration-diskfull.md` — disk-full root cause, repo migration to LUKS disk, compose env-file gotchas.
 - `14-resume-cookies-multiaccount.md` — resume internals, live-cookie-jar recovery procedure, multi-account onboarding.
+- `15-status-panel-archives-startmd.md` — extension v4.1 status panel, /opt/archives relocation (venv-shadow gotcha), start.md operator guide.

@@ -48,6 +48,7 @@ services:
       MANAGER_HOST: "127.0.0.1"
       MANAGER_PORT: "8080"
       STORAGE_ROOT: ${STORAGE_ROOT:-/opt}
+      TAKEOUT_SUBDIR: ${TAKEOUT_SUBDIR:-google-takeout}
       MANAGER_API_TOKEN: ${MANAGER_API_TOKEN:-}
       MANAGER_CAPTURE_TOKEN: ${MANAGER_CAPTURE_TOKEN:-}
       MANAGER_PUBLIC_URL: ${MANAGER_PUBLIC_URL:-http://127.0.0.1:8080}
@@ -63,6 +64,13 @@ services:
         bind:
           propagation: rslave
           recursive: enabled        # JuiceFS/encfs submounts visible in-container
+      - type: bind                    # LEGACY: completed 3.08TB tree (read-only)
+        source: /opt/storage.jfs002
+        target: /opt/storage.jfs002
+        read_only: true
+        bind:
+          propagation: rslave
+          recursive: enabled
     devices:
       - /dev/dri:/dev/dri           # GPU passthrough (KasmVNC perf); remove if absent
     shm_size: "2gb"                 # prevent Chromium tab crashes

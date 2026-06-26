@@ -89,7 +89,7 @@ def _payload_meta(payload: "engine.Payload", raw: dict | None) -> dict:
     authuser = _pick("authuser") or _from_urls("authuser")
     if authuser:
         meta["authuser"] = authuser
-    archive_id = _pick("archive_id", "archiveId")
+    archive_id = _pick("archive_id", "archiveId") or _from_urls("j")
     if archive_id:
         meta["archive_id"] = archive_id
     if getattr(payload, "captured_at", ""):

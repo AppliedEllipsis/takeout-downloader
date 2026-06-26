@@ -105,9 +105,14 @@ class JobRunner:
                     self._fresh_cookie.clear()
                     continue
 
-                # (re)discover exports with the current cookie.
+                # Discover exports ONCE. On a cookie-refresh resume the list is
+                # already cached -- re-sweeping 60+ parts (each a 1-byte probe)
+                # burns the whole short-lived Takeout cookie BEFORE any real
+                # download starts, which livelocks the resume. Reuse the cached
+                # list so the fresh cookie is spent on bytes, not re-probing.
                 try:
-                    self._exports = engine.discover_exports(payload, self.job.max_exports)
+                    if not self._exports:
+                        self._exports = engine.discover_exports(payload, self.job.max_exports)
                 except engine.AuthError:
                     self._enter_needs_cookie("discovery auth failure")
                     if not self._wait_for_cookie():

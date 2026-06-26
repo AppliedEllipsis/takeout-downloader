@@ -57,6 +57,24 @@
         <a id="openManagerBtn" class="secondary" style="display:block; margin-top:2px; text-align:center; text-decoration:none;" href="http://127.0.0.1:8080/" target="_blank">📊 Open download manager</a>
     </div>
 
+    <div class="section" id="statusPanel" style="display:none;">
+        <div id="jobHead" class="status dim" style="margin-bottom:4px;"></div>
+        <div id="jobBar" style="height:8px; background:#2d2d3f; border-radius:4px; overflow:hidden; margin-bottom:4px;">
+            <div id="jobBarFill" style="height:100%; width:0%; background:#22c55e; transition:width .4s;"></div>
+        </div>
+        <div id="jobMeta" class="help" style="margin-bottom:4px;"></div>
+        <div id="jobHeartbeat" class="help" style="margin-bottom:4px;"></div>
+        <div id="jobErr" class="status err" style="display:none; margin-bottom:4px;"></div>
+        <details id="partsDetails" style="margin-bottom:4px;">
+            <summary>Parts <span id="partsSummary" class="help"></span></summary>
+            <div id="partsList" style="max-height:160px; overflow:auto; font-size:10px; font-family:ui-monospace,monospace; margin-top:4px;"></div>
+        </details>
+        <details>
+            <summary>Live log <span id="logHint" class="help">(last 40 lines)</span></summary>
+            <pre class="payload" id="jobLog" style="max-height:140px;">No log yet.</pre>
+        </details>
+    </div>
+
     <details>
         <summary>Preview capture <span id="copyPreview" style="cursor:pointer; color:#a855f7; margin-left:6px;">[copy]</span></summary>
         <pre class="payload" id="preview">No capture yet.</pre>

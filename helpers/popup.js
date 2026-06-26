@@ -417,4 +417,87 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Refresh every 2s while popup is open so age stays accurate
     setInterval(refresh, 2000);
+
+    // --- v4.1 live status panel -------------------------------------------
+    // Polls the manager for the active job and renders per-part progress,
+    // heartbeat (time since last update), errors, and a live log tail.
+    const sp = {
+        panel: document.getElementById("statusPanel"), head: document.getElementById("jobHead"), barFill: document.getElementById("jobBarFill"),
+        meta: document.getElementById("jobMeta"), heartbeat: document.getElementById("jobHeartbeat"), err: document.getElementById("jobErr"),
+        partsSummary: document.getElementById("partsSummary"), partsList: document.getElementById("partsList"), log: document.getElementById("jobLog")
+    };
+    function fmtBytes(n) {
+        n = n || 0;
+        if (n >= 1e12) return (n/1e12).toFixed(2)+' TB';
+        if (n >= 1e9) return (n/1e9).toFixed(1)+' GB';
+        if (n >= 1e6) return (n/1e6).toFixed(0)+' MB';
+        if (n >= 1e3) return (n/1e3).toFixed(0)+' KB';
+        return n+' B';
+    }
+    function statusColor(st) {
+        if (st === 'complete') return 'ok';
+        if (st === 'error') return 'err';
+        if (st === 'needs_cookie' || st === 'paused') return 'warn';
+        return 'dim';
+    }
+    function renderStatusPanel(resp) {
+        if (!resp || !resp.ok || !resp.jobs || resp.jobs.length === 0) {
+            if (sp.panel) sp.panel.style.display = 'none';
+            return;
+        }
+        sp.panel.style.display = 'block';
+        const job = resp.jobs[0];
+        const d = resp.detail || job;
+        const t = d.totals || job.totals || {};
+        const st = d.status || job.status || '?';
+        const pct = t.bytes_total ? Math.min(100, (t.bytes_done / t.bytes_total) * 100) : 0;
+        sp.head.textContent = (d.workflow || job.workflow || 'job') + ' — ' + st;
+        sp.head.className = 'status ' + statusColor(st);
+        sp.barFill.style.width = pct.toFixed(1) + '%';
+        sp.barFill.style.background = st === 'error' ? '#ef4444' : (st === 'complete' ? '#22c55e' : '#a855f7');
+        const spd = t.speed_bps ? (' • ' + fmtBytes(t.speed_bps) + '/s') : '';
+        sp.meta.textContent = (t.parts_done||0) + '/' + (t.parts_total||0) + ' parts • ' +
+            fmtBytes(t.bytes_done) + ' / ' + fmtBytes(t.bytes_total) + ' (' + pct.toFixed(1) + '%)' + spd;
+        // Heartbeat: seconds since last update
+        const upd = d.updated_at || job.updated_at;
+        if (upd) {
+            const age = Math.max(0, Math.round((Date.now() - Date.parse(upd)) / 1000));
+            const stale = age > 30;
+            sp.heartbeat.textContent = '♥ last update ' + (age < 60 ? age+'s' : Math.round(age/60)+'m') + ' ago' +
+                (stale && (st==='downloading') ? ' ⚠ stalled?' : '');
+            sp.heartbeat.style.color = (stale && st==='downloading') ? '#f59e0b' : '#94a3b8';
+        } else {
+            sp.heartbeat.textContent = '';
+        }
+        // Error
+        const errMsg = d.last_error || job.last_error;
+        if (errMsg) { sp.err.style.display='block'; sp.err.textContent = '⚠ ' + errMsg; }
+        else { sp.err.style.display='none'; }
+        // Per-part list
+        const parts = d.parts || [];
+        if (parts.length) {
+            const done = parts.filter(p=>p.status==='done').length;
+            const active = parts.filter(p=>p.status==='active').length;
+            const auth = parts.filter(p=>p.status==='auth').length;
+            sp.partsSummary.textContent = '('+done+' done, '+active+' active' + (auth?(', '+auth+' auth'):'') + ')';
+            sp.partsList.innerHTML = parts.map(p => {
+                const ppct = p.size ? Math.min(100,(p.done/p.size)*100) : 0;
+                const icon = p.status==='done'?'✓':(p.status==='active'?'▼':(p.status==='auth'?'🔑':(p.status==='error'?'✗':'·')));
+                const col = p.status==='done'?'#22c55e':(p.status==='active'?'#a855f7':(p.status==='error'||p.status==='auth'?'#f59e0b':'#64748b'));
+                const sp2 = p.speed ? (' '+fmtBytes(p.speed)+'/s') : '';
+                return '<div style="color:'+col+'">'+icon+' i='+String(p.index).padStart(2,'0')+' '+
+                    ppct.toFixed(0).padStart(3)+'% '+fmtBytes(p.done)+'/'+fmtBytes(p.size)+sp2+'</div>';
+            }).join('');
+        }
+        // Log tail
+        if (resp.log) { sp.log.textContent = resp.log; sp.log.scrollTop = sp.log.scrollHeight; }
+    }
+    function pollStatus() {
+        chrome.runtime.sendMessage({ action: 'getManagerJobs' }, (resp) => {
+            if (chrome.runtime.lastError) return;
+            renderStatusPanel(resp);
+        });
+    }
+    pollStatus();
+    setInterval(pollStatus, 2000);
 });

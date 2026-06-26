@@ -513,6 +513,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return true;
     }
 
+    if (msg.action === 'getManagerJobs') {
+        // Fetch live job status from the manager for the popup status panel.
+        // Returns the jobs list plus, for the most-recent job, its full
+        // snapshot (per-part progress) and a tail of its log.
+        (async () => {
+            try {
+                const s = await getManagerSettings();
+                const base = s.managerUrl.replace(/\/$/, '');
+                const headers = {};
+                if (s.captureToken) headers['X-Capture-Token'] = s.captureToken;
+                const jr = await fetch(base + '/api/jobs', { headers });
+                if (!jr.ok) { sendResponse({ ok: false, error: 'jobs ' + jr.status }); return; }
+                const jobs = (await jr.json()).jobs || [];
+                let detail = null, log = null;
+                if (jobs.length > 0) {
+                    const jid = jobs[0].job_id;
+                    try {
+                        const dr = await fetch(base + '/api/jobs/' + encodeURIComponent(jid), { headers });
+                        if (dr.ok) detail = await dr.json();
+                    } catch (e) { /* detail optional */ }
+                    try {
+                        const lr = await fetch(base + '/api/jobs/' + encodeURIComponent(jid) + '/log?lines=40', { headers });
+                        if (lr.ok) log = await lr.text();
+                    } catch (e) { /* log optional */ }
+                }
+                sendResponse({ ok: true, jobs, detail, log, at: Date.now() });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message || String(e) });
+            }
+        })();
+        return true;
+    }
+
     if (msg.action === 'setAccountMeta') {
         // Content script reports scraped identity (email/user/authuser).
         chrome.storage.local.set({ accountMeta: msg.meta || {} },

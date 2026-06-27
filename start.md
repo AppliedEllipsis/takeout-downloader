@@ -21,6 +21,49 @@ moving.**
 
 ---
 
+## 0.5 Pre-flight check results (verified 2026-06-26)
+
+A full live verification was run against the server. Snapshot:
+
+| Check | Result |
+|-------|--------|
+| Both containers up | ✓ `takeout-webgui`, `takeout-tunnel` both `Up` |
+| Manager process | ✓ running under the real venv `/opt/manager-venv/bin/python … uvicorn` |
+| `takeout_root` | ✓ `/opt/archives/google-takeout` (venv NOT shadowed) |
+| Free disk | ✓ ~1 PB free on the JuiceFS `/opt/archives` mount |
+| CDP | ✓ live on `127.0.0.1:9222` (Chrome 149) |
+| Extension version | ✓ `4.1.0`, `autoPost` + `autoRecapture` on |
+| Jobs list | ✓ empty (clean slate) |
+
+> **GOTCHA — the API/capture tokens are currently EMPTY (auth is OPEN).**
+> Despite `webgui/.env` defining `MANAGER_API_TOKEN` and
+> `MANAGER_CAPTURE_TOKEN`, both resolve to **empty inside the container**. Cause:
+> in `docker-compose.webgui.yml` the `environment:` block does
+> `MANAGER_API_TOKEN: ${MANAGER_API_TOKEN:-}` / `MANAGER_CAPTURE_TOKEN: ${...:-}`,
+> which interpolates from the **host shell / root `.env`** (neither defines those
+> secrets) — and an explicit `environment:` entry **overrides** the
+> `env_file: webgui/.env` value. So the manager runs with empty tokens.
+>
+> **What this means in practice:**
+> - The manager's auth checks short-circuit on empty (`if cfg.capture_token and …`),
+>   so the **control plane and capture endpoint are OPEN** — `/api/jobs` returns
+>   200 with no token. The `-H "X-Api-Token: $TOKEN"` headers in the steps below
+>   are harmless (ignored), so existing instructions still work as written.
+> - It is internally **consistent**: the extension's managed policy also has
+>   `captureToken: ""`, so empty-matches-empty → **auto-POST + the happy path work**.
+> - Blast radius is limited: the manager binds localhost-only inside the
+>   container and the tunnel exposes only the KasmVNC portal (not port 8080).
+> - **DO NOT "fix" only one side.** If you wire the manager token from
+>   `webgui/.env` but leave the extension policy's `captureToken` empty (or vice
+>   versa), auto-POST will start returning **401**. Fix both together or neither.
+> - To actually enforce tokens: add the two secrets to the **root `.env`** (the
+>   file compose interpolates from), re-`up -d`, and re-run `init_custom.sh`'s
+>   policy step so the extension policy picks up the same capture token. This
+>   **restarts the stack and kills the Chrome login** (see §11) — so only do it
+>   between accounts, never mid-download.
+
+---
+
 ## 1. Where everything is
 
 | Thing | Value |

@@ -16,7 +16,6 @@ No download/integrity logic lives here — that all stays in takeout_dl.
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -152,6 +151,17 @@ class JobRunner:
                     self.on_event("error", self.job)
                     return
 
+                # A stop requested mid-pool (pause/cancel/delete) makes
+                # download_exports return NORMALLY with parts still queued.
+                # Bail before verify/finalize so a paused job stays paused and
+                # resumable — otherwise the fall-through below would mark a
+                # half-done job COMPLETE (and resume() refuses complete jobs).
+                # The orchestrator owns the paused/error status in that case;
+                # we just persist the partial progress and let the thread exit.
+                if self._stop.is_set():
+                    self.job.persist()
+                    return
+
                 # download_exports returned without AuthError => all parts done
                 # or non-auth-stopped. Verify + finalize.
                 complete, incomplete = engine.verify_exports(self._exports, self.job.output_dir)
@@ -181,22 +191,23 @@ class JobRunner:
         self.on_auth(self.job)
         self.on_event("needs_cookie", self.job)
 
-    def _wait_for_cookie(self, timeout: float = 3600.0) -> bool:
-        """Block until a fresh payload arrives (set_payload) or stop/timeout.
+    def _wait_for_cookie(self) -> bool:
+        """Block until a fresh payload arrives (set_payload) or the job is
+        stopped (pause/cancel/delete).
+
+        The job stays parked in needs_cookie indefinitely while it waits — a
+        cookie that hasn't been re-captured yet is NOT an error, it's the
+        normal resting state for a long export whose short-lived Takeout
+        cookie outran a single download window. Only an explicit stop ends
+        the wait.
 
         Returns True to continue the loop, False to terminate the runner.
         """
         self._fresh_cookie.clear()
-        deadline = time.monotonic() + timeout
         while not self._stop.is_set():
             if self._fresh_cookie.wait(timeout=5.0):
                 self._fresh_cookie.clear()
                 if self._stop.is_set():
                     return False
                 return True
-            if time.monotonic() > deadline:
-                self.job.set_status(J.ERROR, error="timed out waiting for fresh cookie")
-                self.job.persist()
-                self.on_event("error", self.job)
-                return False
         return False

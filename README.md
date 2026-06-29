@@ -1,5 +1,10 @@
 # 📦 Google Takeout Bulk Downloader
 
+> 🚧 **Status: Currently Partially Usable** as I explore and figure out how
+> to get it stable. The goal: a Google Takeout downloader in a remote Docker
+> UI with a browser, so you can use a remote server's storage and bandwidth
+> and automate most of it.
+
 Download Google Takeout archives from a terminal with resume, parallel
 downloads, ZIP integrity checks, and optional aria2c acceleration. A
 browser extension captures the authenticated download request and hands

@@ -289,7 +289,70 @@ python takeout_cli_analyze.py downloads/takeout_cli.log --follow
 
 ---
 
-## 6b. Paste relay ("ngrok but zero-config")
+## 6b. Web UI (browser dashboard)
+
+The Web UI is a FastAPI application served at `http://localhost:8000`. It
+replaces clipboard-paste with a browser dashboard that shows live per-part
+progress, overall speed, ETA, and a log. It is especially convenient inside
+Docker, where clipboard paste over SSH is fragile.
+
+### Start the Web UI
+
+```bash
+# Native
+python web_server.py
+
+# Docker (daemon mode)
+docker compose up -d takeout-web
+```
+
+Then open `http://localhost:8000` in the same browser that has the
+extension.
+
+### Using the dashboard
+
+1. Paste the JSON payload into the textarea.
+2. Set the output directory (e.g. `/downloads/my-takeout`).
+3. Choose parallelism. The default is `1` because Google serves Takeout
+   single-stream; raising it increases the risk of rate-limiting.
+4. Click **Start Download**.
+
+The dashboard will:
+
+- Discover all numbered parts.
+- Show per-part progress bars, speed, and status.
+- Display overall progress, total speed, and estimated time remaining.
+- Stream log messages from the engine.
+
+### Controls
+
+| Button | Action |
+|--------|--------|
+| **Start Download** | Begin a new job from the pasted payload. |
+| **Pause** | Ask the downloader to finish its current chunk and stop. State is saved. |
+| **Resume** | Continue a paused job. If the cookie is still valid, you can resume without pasting a new payload. Otherwise, paste a fresh payload first. |
+| **Cancel** | Stop the job and mark it cancelled. Already-downloaded parts are kept. |
+
+### State persistence
+
+Jobs are saved to `<output_dir>/.takeout_web_state/` and to a per-output
+`takeout_state.json`. Refreshing the page or restarting the container will
+reconnect to any paused/running job automatically.
+
+### Resume after a cookie expires
+
+If Google returns an sign-in challenge, the UI pauses and shows a warning.
+
+1. In the browser, click **Download** on any part to refresh the session.
+2. Extension → **Copy as JSON**.
+3. Paste the fresh payload into the textarea.
+4. Click **Resume**.
+
+Only unfinished parts are re-downloaded; completed parts are skipped.
+
+---
+
+## 6c. Paste relay ("ngrok but zero-config")
 
 Pasting a big JSON blob through SSH → tmux → a Docker container's stdin is
 fragile: bracketed-paste markers get stripped, long lines wrap, the terminal

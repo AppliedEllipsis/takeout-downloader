@@ -141,6 +141,42 @@ services:
     working_dir: /work
     entrypoint: ["python", "-u", "/work/takeout.py"]
 
+  # Web UI variant — FastAPI dashboard with live SSE progress. Runs as a
+  # persistent server; use `docker compose up -d takeout-web` (or `run` for
+  # foreground). Bind-mount the downloads volume the same as the CLI/TUI so
+  # archives and resume state persist across container restarts.
+  #
+  #     docker compose up -d takeout-web
+  #     # open http://localhost:8000
+  #
+  # The web UI reads the same payload JSON the extension produces; when the
+  # cookie expires it pauses and asks for a fresh payload before resuming.
+  takeout-web:
+    build: .
+    image: takeout-downloader:latest
+    container_name: takeout-web
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OUTPUT_DIR: ${OUTPUT_DIR:-/downloads}
+      PORT: "8000"
+      MAX_PARTS: ${MAX_PARTS:-500}
+    volumes:
+      - ./downloads:/downloads
+      - ./drop:/downloads/drop
+      - .:/work
+      - type: bind
+        source: /opt
+        target: /opt
+        bind:
+          propagation: rslave
+          recursive: enabled
+    working_dir: /work
+    entrypoint: ["python", "-u", "/work/web_server.py"]
+
   # CLI variant — same image, no terminal UI. Drop in.json into the output dir
   # (or pipe via stdin) and aria2c takes over with native progress output.
   # This is the recommended path for SSH->tmux->Docker chains where Textual's

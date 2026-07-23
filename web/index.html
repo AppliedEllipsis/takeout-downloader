@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Takeout Downloader</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>
+        <span class="logo" aria-hidden="true"></span>
+        Takeout Downloader
+      </h1>
+      <p class="tagline">Browser-based Google Takeout bulk downloader with live progress, resume, and rate-limit protection.</p>
+    </header>
+
+    <main class="container">
+      <section class="card setup" id="setup-card">
+        <h2>1. Paste your payload</h2>
+        <p class="hint">From the extension, click <strong>Copy as JSON</strong>, then paste the whole blob here.</p>
+        <textarea id="payload" rows="8" placeholder='{&#10;  &quot;schema&quot;: 2,&#10;  &quot;url&quot;: &quot;https://takeout-download.usercontent.google.com/...&quot;,&#10;  &quot;cookie&quot;: &quot;__Secure-1PSID=...&quot;,&#10;  &quot;headers&quot;: { ... }&#10;}'></textarea>
+
+        <div class="fields">
+          <div class="field">
+            <label for="output-dir">Output directory</label>
+            <input type="text" id="output-dir" placeholder="./downloads" value="./downloads">
+          </div>
+          <div class="field narrow">
+            <label for="parallel">Parallel</label>
+            <input type="number" id="parallel" min="1" max="10" value="1">
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="start-btn" class="primary">Start Download</button>
+          <button id="pause-btn" class="warning" disabled>Pause</button>
+          <button id="cancel-btn" class="danger" disabled>Cancel</button>
+          <button id="resume-btn" class="secondary" disabled>Resume</button>
+          <span id="status-badge" class="badge idle">Idle</span>
+        </div>
+
+        <div id="message" class="message" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="card progress-card">
+        <h2>2. Live progress</h2>
+        <div id="overall" class="overall">
+          <div class="overall-left">
+            <div class="overall-label">Overall</div>
+            <div class="overall-bar-bg">
+              <div id="overall-bar" class="overall-bar" style="width: 0%"></div>
+            </div>
+            <div id="overall-stats" class="overall-stats">0 of 0 parts</div>
+          </div>
+          <div id="overall-speed" class="overall-speed">0 B/s</div>
+          <div id="overall-eta" class="overall-eta">–</div>
+        </div>
+
+        <div id="log" class="log" aria-live="polite"></div>
+
+        <div id="parts" class="parts">
+          <p class="empty">Start a download to see live part progress here.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>Single-stream downloads by default to avoid exhausting Google’s rate limits. Resume is automatic from the on-disk partial files.</p>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -26,9 +26,9 @@ Cookie expires after a few files?  →  TUI rings the bell + flashes its
 title bar  →  re-capture in the browser, Copy as JSON, paste, click Resume
 ```
 
-There is **no web server, no localhost port, and no auto-send**. The
-extension only ever writes to your clipboard. The TUI only ever reads
-what you paste into it.
+The extension only ever writes to your clipboard. The TUI only ever reads
+what you paste into it. For a browser-based interface, see the optional
+Web UI below.
 
 ## Quick start
 
@@ -53,6 +53,27 @@ baked in). It is interactive, so use `run` — not `up -d`:
 docker compose build
 docker compose run --rm takeout-cli
 ```
+
+### Or use the browser-based Web UI
+
+A FastAPI dashboard is included for users who prefer a browser interface,
+especially inside Docker where clipboard paste over SSH is fragile.
+
+```bash
+# Native
+python web_server.py
+
+# Docker
+sudo lsof -t -i:8000 | xargs -r kill -9  # free the port, if needed
+docker compose up -d takeout-web
+```
+
+Then open `http://localhost:8000`, paste the JSON payload, set the output
+folder, and click **Start Download**. The dashboard shows live per-part
+progress, overall speed, ETA, and a log. If the cookie expires, the UI
+pauses and lets you paste a fresh payload and resume. State is persisted
+in the output directory, so refreshing the page or restarting the container
+does not lose progress.
 
 The TUI is still bundled for users who want a UI on a local terminal —
 it's hidden behind the `tui` profile so it doesn't appear in the default
@@ -328,6 +349,8 @@ for the full write-up of this gotcha.)
 - **aria2c backend (optional / legacy)** — `--engine aria2c` hands off to
   aria2c instead (see below).
 - **cURL fallback** — bash and PowerShell formats both accepted.
+- **Web UI** — FastAPI dashboard with live SSE progress, pause/resume, and
+  persistent state.
 
 ## aria2c engine (optional / legacy)
 
@@ -402,6 +425,8 @@ depend on its tuning), pass `--engine aria2c` or set
 ├── takeout_cli.py            # Terminal-only CLI (default service)
 ├── takeout_downloader.py     # In-process parallel HTTP downloader (default engine)
 ├── takeout_cli_analyze.py    # Offline log analyzer for takeout_cli
+├── web_server.py             # FastAPI browser dashboard (web UI)
+├── web/                      # Web UI static assets (HTML/JS/CSS)
 ├── takeout_payload.py        # JSON payload schema shared with the extension
 ├── aria2c_integration.py     # Optional aria2c RPC backend (legacy --engine aria2c)
 ├── dedupe_takeout.py         # Deduplicate downloaded archives by hash

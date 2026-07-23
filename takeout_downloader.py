@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import queue
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -64,6 +65,17 @@ DEFAULT_TIMEOUT = (
     float(os.environ.get("TAKEOUT_CONNECT_TIMEOUT", "10")),
     float(os.environ.get("TAKEOUT_READ_TIMEOUT", "30")),
 )
+
+# Retry tunables.  Exponential backoff with full jitter and a hard cap so
+# parallel workers never retry in lockstep after a transient Google blip.
+_MAX_TRIES = int(os.environ.get("MAX_RETRIES", "6"))
+_RETRY_BACKOFF = float(os.environ.get("RETRY_BACKOFF", "2.0"))
+_RETRY_MAX_WAIT = float(os.environ.get("RETRY_MAX_WAIT", "120.0"))
+
+# Minimum seconds between *consecutive* requests across the whole pool. Google
+# serves Takeout single-stream; a short inter-request delay is cheap insurance
+# against being classified as a rapid-fire bot.
+_INTER_REQUEST_DELAY = float(os.environ.get("TAKEOUT_INTER_REQUEST_DELAY", "0.5"))
 
 ZIP_MAGIC = b"PK\x03\x04"
 ZIP_EOCD = b"PK\x05\x06"
@@ -150,11 +162,13 @@ class InternalDownloader:
     """
 
     def __init__(self, cookie: str, headers: dict, output_dir: Path,
-                 parallel: int = 5,
+                 parallel: int = 1,
                  chunk_size: int = DEFAULT_CHUNK_SIZE,
                  timeout: tuple = DEFAULT_TIMEOUT,
-                 max_tries: int = 5,
-                 retry_wait: float = 5.0,
+                 max_tries: int = _MAX_TRIES,
+                 retry_wait: float = _RETRY_BACKOFF,
+                 retry_max_wait: float = _RETRY_MAX_WAIT,
+                 inter_request_delay: float = _INTER_REQUEST_DELAY,
                  logger=None):
         self.cookie = cookie
         self.headers = {k: v for k, v in (headers or {}).items()
@@ -163,9 +177,16 @@ class InternalDownloader:
         self.parallel = max(1, parallel)
         self.chunk_size = chunk_size
         self.timeout = timeout
-        self.max_tries = max_tries
-        self.retry_wait = retry_wait
+        self.max_tries = max(1, max_tries)
+        self.retry_wait = max(0.0, retry_wait)
+        self.retry_max_wait = max(1.0, retry_max_wait)
+        self.inter_request_delay = max(0.0, inter_request_delay)
         self.log = logger
+
+        # Global inter-request throttle. A single lock spaces every HTTP
+        # request across all workers so parallel > 1 cannot hammer Google.
+        self._rate_limiter = threading.Lock()
+        self._last_req_time = 0.0
 
         self._progress: dict[int, PartProgress] = {}
         self._lock = threading.Lock()
@@ -269,6 +290,24 @@ class InternalDownloader:
 
         return result
 
+    # -- rate limit helpers ------------------------------------------------
+    def _maybe_wait_for_rate_limit(self) -> None:
+        """Sleep until at least ``inter_request_delay`` seconds have passed
+        since the last request, then record this request's start time."""
+        if self.inter_request_delay <= 0:
+            return
+        with self._rate_limiter:
+            elapsed = time.monotonic() - self._last_req_time
+            if elapsed < self.inter_request_delay:
+                wait = self.inter_request_delay - elapsed
+                time.sleep(wait)
+            self._last_req_time = time.monotonic()
+
+    def _mark_request_made(self) -> None:
+        """Record that a request was just made (used after pre-flights)."""
+        with self._rate_limiter:
+            self._last_req_time = time.monotonic()
+
     # -- worker ------------------------------------------------------------
     def _worker(self, work: "queue.Queue[dict]", result: DownloadResult) -> None:
         # One Session per worker, reused across every part this worker
@@ -307,12 +346,48 @@ class InternalDownloader:
             finally:
                 work.task_done()
 
+    def _preflight_get(self, num: int, url: str, getter) -> requests.Response:
+        """Lightweight pre-flight GET to detect auth/rate-limit before the
+        real download starts. Raises AuthChallenge if the response is a
+        Google sign-in page. Returns the response for the caller to stream.
+        Caller is responsible for closing it."""
+        self._maybe_wait_for_rate_limit()
+        headers = dict(self.headers)
+        headers["Cookie"] = self.cookie
+        # Probe only the first handful of bytes so we don't waste quota.
+        headers["Range"] = "bytes=0-4095"
+
+        resp = getter.get(url, headers=headers, stream=True,
+                          timeout=self.timeout, allow_redirects=True)
+
+        final_host = resp.url.split("/")[2] if "://" in resp.url else ""
+        ctype = resp.headers.get("content-type", "").lower()
+
+        if final_host.endswith("accounts.google.com"):
+            resp.close()
+            raise AuthChallenge(f"part {num:03d}: redirected to {final_host}")
+        if "text/html" in ctype:
+            body = self._peek(resp)
+            resp.close()
+            raise AuthChallenge(
+                f"part {num:03d}: server returned HTML (ct={ctype[:40]})",
+                body=body)
+        if resp.status_code in (401, 403):
+            body = self._peek(resp)
+            resp.close()
+            raise AuthChallenge(
+                f"part {num:03d}: HTTP {resp.status_code}", body=body)
+        resp.raise_for_status()
+        return resp
+
     def _download_one(self, part: dict, session=None) -> None:
         """Download a single part with Range resume and live byte counting.
 
         Retries transient network errors up to ``max_tries``, reconnecting
         with a fresh Range from wherever the on-disk file stopped. An auth
         challenge is NOT retried — it raises immediately so the pool stops.
+        Rate-limit responses (429/503) honour ``Retry-After`` and fall back
+        to jittered exponential backoff.
 
         ``session`` is the per-worker ``requests.Session`` (connection reuse);
         falls back to the module-level ``requests`` if not supplied.
@@ -352,6 +427,23 @@ class InternalDownloader:
                 return
             except AuthChallenge:
                 raise  # never retry an auth failure
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response else 0
+                if status in (429, 503):
+                    retry_after = e.response.headers.get("retry-after")
+                    try:
+                        wait = min(self.retry_max_wait, max(1, int(retry_after)))
+                    except (TypeError, ValueError):
+                        wait = self._backoff_seconds(attempt)
+                    self._warn(f"part {num:03d}: HTTP {status}; "
+                               f"sleeping {wait:.1f}s")
+                    self._sleep_with_rate_limit(wait)
+                    continue
+                last_err = repr(e)
+                if attempt >= self.max_tries or self._stop.is_set():
+                    raise
+                self._sleep_with_rate_limit(self._backoff_seconds(attempt))
+                continue
             except (requests.RequestException, OSError) as e:
                 last_err = repr(e)
                 self._info(f"part {num:03d} attempt {attempt}/{self.max_tries} "
@@ -359,7 +451,7 @@ class InternalDownloader:
                 if attempt < self.max_tries and not self._stop.is_set():
                     # Back off, then resume from the new on-disk size.
                     self._set(num, speed_bps=0.0)
-                    time.sleep(self.retry_wait)
+                    self._sleep_with_rate_limit(self._backoff_seconds(attempt))
                     continue
                 raise
 
@@ -378,6 +470,7 @@ class InternalDownloader:
         if resume:
             headers["Range"] = f"bytes={existing}-"
 
+        self._maybe_wait_for_rate_limit()
         with getter.get(url, headers=headers, stream=True,
                         timeout=self.timeout, allow_redirects=True) as resp:
             final_host = resp.url.split("/")[2] if "://" in resp.url else ""
@@ -474,6 +567,22 @@ class InternalDownloader:
         except requests.RequestException:
             pass
         return body
+
+    # -- backoff / rate helpers ------------------------------------------
+    def _backoff_seconds(self, attempt: int) -> float:
+        """Jittered exponential backoff capped at ``self.retry_max_wait``.
+        ``attempt`` is 1-based."""
+        base = min(self.retry_max_wait, self.retry_wait * (2 ** (attempt - 1)))
+        return random.uniform(0.0, base)
+
+    def _sleep_with_rate_limit(self, seconds: float) -> None:
+        """Sleep but break early if a stop is requested."""
+        if seconds <= 0 or self._stop.is_set():
+            return
+        # Slice so a stop request is honoured promptly.
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self._stop.is_set():
+            time.sleep(min(0.25, deadline - time.monotonic()))
 
     # -- progress table ----------------------------------------------------
     def _set(self, num: int, **fields) -> None:

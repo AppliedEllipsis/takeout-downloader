@@ -103,7 +103,8 @@ def _parts(base: str) -> list[dict]:
 def _mk(out: Path, parallel: int = 3) -> "D.InternalDownloader":
     return D.InternalDownloader(
         cookie="SID=x", headers={"User-Agent": "test"},
-        output_dir=out, parallel=parallel, retry_wait=0.1, max_tries=2)
+        output_dir=out, parallel=parallel, retry_wait=0.1, max_tries=2,
+        inter_request_delay=0.0)
 
 
 # ---------------------------------------------------------------------------

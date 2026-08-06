@@ -75,6 +75,12 @@
         <div class="help">Base URL of the web manager.</div>
     </div>
     <div class="section">
+        <button id="openMonitorBtn" style="width:100%;padding:8px;background:#2d2d3f;color:#f8fafc;border:1px solid #3d3d5c;border-radius:4px;cursor:pointer;font-size:13px;">📈 Open live monitor</button>
+        <div class="help" style="margin-top:6px;">Opens the real-time per-part progress page at
+            <code>{managerUrl}/ui/monitor.html</code> in a new tab. Live progress, speed, errors,
+            and the 5-attempt budget — no separate monitoring needed.</div>
+    </div>
+    <div class="section">
         <label for="captureToken">Capture Token</label>
         <input type="text" id="captureToken" placeholder="(empty = no token)" style="width:100%;box-sizing:border-box;padding:6px;background:#2d2d3f;color:#f8fafc;border:1px solid #3d3d5c;border-radius:4px;font-family:monospace;font-size:13px;">
         <div class="help">MANAGER_CAPTURE_TOKEN from webgui/.env. The paste box in the manager UI carries the token automatically; set this only if auto-POST is needed.</div>

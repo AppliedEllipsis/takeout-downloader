@@ -14,7 +14,25 @@ document.addEventListener('DOMContentLoaded', () => {
         autoRecapture: document.getElementById('autoRecapture'),
         managerUrl: document.getElementById('managerUrl'),
         captureToken: document.getElementById('captureToken'),
+        openMonitorBtn: document.getElementById('openMonitorBtn'),
     };
+
+    // Resolve the manager base URL the same way popup.js does: the saved
+    // setting, else the localhost default the webtop uses in production.
+    function resolveManagerUrl() {
+        const raw = (els.managerUrl && els.managerUrl.value.trim()) || '';
+        return raw || 'http://127.0.0.1:8080';
+    }
+
+    if (els.openMonitorBtn) {
+        // Open the live monitor page ({managerUrl}/ui/monitor.html) in a new
+        // tab so the operator watches a multi-day download without keeping
+        // this extension page open.
+        els.openMonitorBtn.addEventListener('click', () => {
+            const base = resolveManagerUrl().replace(/\/+$/, '');
+            chrome.tabs.create({ url: base + '/ui/monitor.html' });
+        });
+    }
 
     // Load from storage.local directly (these are manager-level settings, not
     // per-badge preferences saved via background.js).

@@ -546,7 +546,7 @@ def cmd_run(args):
     store.upsert_parts(archive_id, plan.parts)
 
     from .cookie import LiveCookieJar
-    from .engine import BurstEngine, EngineConfig
+    from .engine import WRITE_CHUNK, BurstEngine, EngineConfig
     try:
         cookie = LiveCookieJar(_env("TK2_CDP_URL", DEFAULTS["CDP_URL"]),
                                timeout=_env_num("TK2_CDP_TIMEOUT_S", 10.0, float))
@@ -560,6 +560,22 @@ def cmd_run(args):
         attempt_budget=budget, budget_reserve=reserve,
         verify_level=VerifyState(_env("TK2_VERIFY_LEVEL",
                                       DEFAULTS["VERIFY_LEVEL"])),
+        # --- multi-TB reliability guards -------------------------------
+        # Abort a stream that has moved no bytes for this long. The socket
+        # read timeout cannot catch a trickle, so this is what frees a
+        # wedged attempt on a multi-day transfer.
+        stall_abort_s=_env_num("TK2_STALL_ABORT_S", 180.0, float),
+        stall_resume_attempts=_env_num("TK2_STALL_RESUME", 1, int),
+        resume_rewind=_env_num("TK2_RESUME_REWIND", WRITE_CHUNK, int),
+        fsync_interval_s=_env_num("TK2_FSYNC_INTERVAL_S", 30.0, float),
+        # Refuse to write if the storage FUSE mount died — otherwise a 10 GiB
+        # part lands on the root disk and takes the server down.
+        require_mount=_env("TK2_REQUIRE_MOUNT", "0") not in ("0", "", "false"),
+        # rclone VFS upload backlog: pause instead of stalling on a full cache.
+        cache_dir=_env("TK2_CACHE_DIR", "") or None,
+        cache_max_bytes=_env_num("TK2_CACHE_MAX_BYTES", 100 * 1024 ** 3, int),
+        cache_wait_max_s=_env_num("TK2_CACHE_WAIT_MAX_S", 1800.0, float),
+        rate_limit_backoff=_env("TK2_RATE_BACKOFF", "1") not in ("0", "false"),
     )
     result = BurstEngine(store, ledger, cookie,
                          os.path.join(output_dir, "parts"),

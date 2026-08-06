@@ -41,6 +41,7 @@
                 "https://takeout.google.com/*"
             ],
             "js": [
+                "overlay.js",
                 "content.js"
             ],
             "run_at": "document_idle"

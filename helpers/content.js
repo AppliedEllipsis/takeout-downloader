@@ -1055,4 +1055,21 @@
         observer.observe(document.body, { childList: true, subtree: true });
     } */
     // DISABLED
+
+    // -------------------------------------------------------------------------
+    // On-page overlay (helpers/overlay.js, docs/v2/08-SELF-DRIVING-UX.md §3).
+    // overlay.js is listed BEFORE this file in the manifest, so
+    // window.__tkOverlay already exists by now. It owns its own Shadow DOM,
+    // streams and teardown; init() is idempotent and never throws. The guard
+    // below is belt-and-braces: a missing or broken overlay must never break
+    // scraping or the Takeout page itself.
+    // -------------------------------------------------------------------------
+    try {
+        if (window.__tkOverlay && typeof window.__tkOverlay.init === 'function') {
+            window.__tkOverlay.init();
+        }
+    } catch (e) {
+        try { console.debug('[takeout-helper] overlay init failed:', e && e.message); }
+        catch (_) {}
+    }
 })();

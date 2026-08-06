@@ -266,3 +266,44 @@ class TestRunnerIntrospection:
         _s, _l, client, sup = build(FakeSupervisor())
         body = client.get("/api/v2/jobs/unknown/runner").json()
         assert body["alive"] is False
+
+
+# ----------------------------------------------------------------- CORS
+class TestOverlayCors:
+    """The on-page overlay lives on takeout.google.com and talks to 127.0.0.1.
+
+    A content script's fetch() rides on the extension's host_permissions, but
+    EventSource does NOT — SSE obeys ordinary CORS. Without these headers the
+    overlay's live stream is blocked and it silently degrades to polling.
+    """
+
+    def test_takeout_origin_is_allowed(self):
+        _s, _l, client, _sup = build(None)
+        r = client.get("/api/v2/jobs",
+                       headers={"Origin": "https://takeout.google.com"})
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == \
+            "https://takeout.google.com"
+
+    def test_unknown_origin_gets_no_cors_header(self):
+        """Scoped narrowly: not a blanket allow-all."""
+        _s, _l, client, _sup = build(None)
+        r = client.get("/api/v2/jobs",
+                       headers={"Origin": "https://evil.example"})
+        assert r.headers.get("access-control-allow-origin") is None
+
+    def test_sse_endpoint_is_cors_enabled_for_the_overlay(self):
+        store, _l, client, _sup = build(FakeSupervisor())
+        post_capture(client, autostart=False)
+        r = client.get(f"/api/v2/jobs/{ARCHIVE}/events",
+                       params={"since": 0, "timeout_s": 0.05},
+                       headers={"Origin": "https://takeout.google.com"})
+        assert r.headers.get("access-control-allow-origin") == \
+            "https://takeout.google.com"
+
+    def test_credentials_are_not_allowed(self):
+        """The capture token travels in an explicit header, never as a cookie."""
+        _s, _l, client, _sup = build(None)
+        r = client.get("/api/v2/jobs",
+                       headers={"Origin": "https://takeout.google.com"})
+        assert r.headers.get("access-control-allow-credentials") != "true"

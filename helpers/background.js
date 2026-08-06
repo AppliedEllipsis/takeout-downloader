@@ -345,6 +345,27 @@ async function handleV2Capture(payload) {
     }
 }
 
+/**
+ * Append one entry to the rolling capture history (last 10).
+ *
+ * Read by the on-page overlay (helpers/overlay.js) so the operator can see
+ * what has been captured and whether it reached the manager, without opening
+ * the popup or a terminal. Failures are recorded too — a history that only
+ * shows successes hides exactly the problem you need to see.
+ */
+function recordCaptureHistory(entry) {
+    try {
+        chrome.storage.local.get(['captureHistory'], (d) => {
+            const prev = Array.isArray(d.captureHistory) ? d.captureHistory : [];
+            const next = [{ ts: Date.now(), ...entry }, ...prev].slice(0, 10);
+            chrome.storage.local.set({ captureHistory: next });
+        });
+    } catch (e) {
+        // Never let bookkeeping break a capture — the payload is the
+        // time-sensitive thing we cannot afford to lose.
+    }
+}
+
 async function maybeAutoPost(capture) {
     let s;
     try { s = await getManagerSettings(); } catch (e) { return; }
@@ -359,6 +380,8 @@ async function maybeAutoPost(capture) {
                 lastPostStatus: { ok: true, jobId: result.job_id,
                                   status: result.status, at: Date.now() }
             });
+            recordCaptureHistory({ ok: true, filename: capture.filename || '',
+                                   jobId: result.job_id || '' });
             notifyManager('Sent to manager', 'Job ' + (result.job_id || '?')
                 + ' (' + (result.status || '?') + ')');
         } catch (e) {
@@ -366,6 +389,8 @@ async function maybeAutoPost(capture) {
                 lastPostStatus: { ok: false, error: e.message || String(e),
                                   at: Date.now() }
             });
+            recordCaptureHistory({ ok: false, filename: capture.filename || '',
+                                   error: e.message || String(e) });
             // Non-fatal: the clipboard copy still works as a fallback.
             notifyManager('Manager unreachable',
                 'Capture kept; use Copy as JSON. (' + (e.message || 'error') + ')');

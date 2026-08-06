@@ -160,6 +160,33 @@ def create_app(*, store, ledger, engine=None,
     app = FastAPI(title="takeout2", version="2.0.0")
     handler = CaptureHandler(store, ledger)
 
+    # CORS for the on-page overlay (helpers/overlay.js).
+    #
+    # The overlay runs in the takeout.google.com page context and talks to the
+    # manager on 127.0.0.1. A content script's `fetch` is covered by the
+    # extension's host_permissions, but **EventSource is not** — SSE obeys
+    # ordinary CORS, so without this header the live stream is blocked and the
+    # overlay silently degrades to 2 s polling.
+    #
+    # Deliberately narrow: only the Google origins the extension actually runs
+    # on, and credentials stay OFF (the capture token travels in an explicit
+    # header, never as an ambient cookie).
+    try:
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["https://takeout.google.com",
+                           "https://takeout-download.usercontent.google.com"],
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["X-Api-Token", "X-Capture-Token", "Content-Type",
+                           "Last-Event-ID"],
+            expose_headers=["Content-Type"],
+        )
+    except Exception as exc:                                    # noqa: BLE001
+        log.warning("CORS middleware unavailable (%s); the on-page overlay "
+                    "will fall back to polling", exc)
+
     # -- jobs ---------------------------------------------------------------
     # NOTE: this app is mounted at /api/v2 (see manager/v2integration.py), so
     # routes here are UNPREFIXED. Full path = /api/v2 + route.

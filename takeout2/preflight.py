@@ -170,20 +170,56 @@ def _fstype(path: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 # Individual checks
 # --------------------------------------------------------------------------
+def enclosing_mount(path: str) -> Optional[str]:
+    """Walk UP from ``path`` to the mount point that CONTAINS it.
+
+    ``os.path.ismount()`` is only true at the mount point itself, so asking it
+    about a subdirectory of a mount (``/opt/archives/google-takeout``, when the
+    mount is ``/opt/archives``) always answers False. Testing the nearest
+    *existing* ancestor is therefore not enough: it would block every
+    legitimate write into a perfectly healthy mount.
+
+    So: climb until ``ismount`` is true and return that path. Returns None if
+    the climb reaches the filesystem root without finding one — which is the
+    genuine "this lives on the root disk" answer we want to refuse.
+    """
+    current = nearest_existing(path)
+    while True:
+        try:
+            if os.path.ismount(current):
+                return current
+        except OSError:                          # pragma: no cover - exotic
+            return None
+        parent = os.path.dirname(current)
+        if parent == current:                    # reached / without a mount
+            return None
+        current = parent
+
+
 def _mount_checks(path: str, sentinel: Optional[str]) -> dict:
     resolved = nearest_existing(path)
+    mount_at = enclosing_mount(path)
     checks: dict = {
         "path": path,
         "resolved": resolved,
         "is_mount": False,
+        "mount_at": mount_at,
         "fstype": _fstype(resolved),
         "sentinel": sentinel,
         "sentinel_ok": None,
     }
-    try:
-        checks["is_mount"] = bool(os.path.ismount(resolved))
-    except OSError as exc:                      # pragma: no cover - exotic
-        checks["error"] = str(exc)
+    # A subdirectory of a live mount is fine; what we refuse is a path whose
+    # enclosing mount is the ROOT filesystem — that is the signature of a
+    # detached storage mount, and the root disk is the thing we must not fill.
+    # On POSIX the root is "/"; on Windows a drive root is e.g. "C:\\", which
+    # os.path.ismount() also reports True for, so both must be treated as
+    # "not a dedicated storage mount".
+    is_root = mount_at is not None and os.path.dirname(mount_at) == mount_at
+    checks["is_root_fs"] = is_root
+    checks["is_mount"] = mount_at is not None and not is_root
+    if is_root:
+        checks["error"] = ("nearest mount is the root filesystem — the archive "
+                           "volume is detached")
 
     if sentinel:
         # Deliberately anchored at the requested path, not at ``resolved``:

@@ -140,9 +140,10 @@ class TestHeadroomBoundary:
 # Mount detection
 # --------------------------------------------------------------------------
 class TestCheckIsMount:
-    def test_tmp_path_is_not_a_mount(self, tmp_path):
-        """tmp_path is an ordinary directory — exactly what a dead rclone
-        mountpoint degrades into, so it must fail the strict check."""
+    def test_detached_mountpoint_fails(self, tmp_path, monkeypatch):
+        """A dead rclone mountpoint degrades into an ordinary directory whose
+        enclosing mount is the root filesystem — must fail the strict check."""
+        monkeypatch.setattr(preflight, "enclosing_mount", lambda p: None)
         result = check_is_mount(str(tmp_path))
         assert result.failed
         assert "not a mount point" in result.reason
@@ -152,14 +153,24 @@ class TestCheckIsMount:
         result = check_is_mount(str(tmp_path / "parts" / "deeper"))
         assert result.checks["resolved"] == str(tmp_path)
         assert "is_mount" in result.checks
+        assert "mount_at" in result.checks
         assert "fstype" in result.checks
         assert "sentinel_ok" in result.checks
 
-    def test_filesystem_root_is_a_mount(self):
+    def test_filesystem_root_is_refused_not_accepted(self):
+        """The root FS is the disk we must never fill.
+
+        If the climb finds no dedicated storage mount above the target, the
+        bytes would land on the root disk (75 G, ~15 G free in production).
+        That is the incident this module exists to prevent, so the root
+        filesystem must be REFUSED even though ismount() reports it True.
+        """
         root = os.path.abspath(os.sep)
         if not os.path.ismount(root):            # pragma: no cover
             pytest.skip("platform does not report the root as a mount")
-        assert check_is_mount(root).ok
+        result = check_is_mount(root)
+        assert result.failed, "root filesystem must not be accepted as storage"
+        assert result.checks["is_root_fs"] is True
 
     def test_require_mount_false_passes_on_tmp_path(self, tmp_path):
         result = preflight_write(str(tmp_path), 0, require_mount=False,
@@ -203,10 +214,13 @@ class TestShortCircuit:
                                                           monkeypatch):
         """THE bug this module exists to prevent.
 
-        If rclone died, tmp_path-like plain dirs live on the ROOT filesystem,
-        which usually has room for one part — so a free-space check would
-        return ok and green-light the write that fills the root disk. The space
-        check must therefore never be reached at all.
+        If rclone died, the parts dir becomes a plain dir on the ROOT
+        filesystem, which usually has room for one part — so a free-space check
+        would return ok and green-light the write that fills the root disk. The
+        space check must therefore never be reached at all.
+
+        The detached state is forced explicitly (no enclosing mount) rather than
+        relying on tmp_path's own location, which differs per platform.
         """
         calls = []
 
@@ -216,6 +230,7 @@ class TestShortCircuit:
 
         monkeypatch.setattr(preflight, "check_free_space", spy)
         monkeypatch.setattr(preflight, "disk_free", fake_probe(500 * GIB))
+        monkeypatch.setattr(preflight, "enclosing_mount", lambda p: None)
 
         result = preflight_write(str(tmp_path), 10 * GIB, require_mount=True)
 
@@ -265,8 +280,29 @@ class TestPreflightWriteComposite:
         assert "insufficient space" in result.reason
         assert result.checks["free_space_checked"] is True
 
-    def test_defaults_require_a_mount(self, tmp_path):
+    def test_defaults_require_a_mount(self, tmp_path, monkeypatch):
+        """With no live storage mount above it, a write must be refused.
+
+        Forced by making the climb find no mount at all — exactly the state of
+        a detached rclone mountpoint.
+        """
+        monkeypatch.setattr(preflight, "enclosing_mount", lambda p: None)
         assert preflight_write(str(tmp_path)).failed
+
+    def test_subdirectory_of_a_live_mount_is_allowed(self, tmp_path,
+                                                     monkeypatch):
+        """The regression that would have blocked every real download.
+
+        Production writes to /opt/archives/google-takeout/<acct>/parts while the
+        mount point is /opt/archives. ismount() is False on the subdirectory, so
+        checking it directly refuses a perfectly healthy mount.
+        """
+        monkeypatch.setattr(preflight, "disk_free", fake_probe(500 * GIB))
+        monkeypatch.setattr(preflight, "enclosing_mount",
+                            lambda p: str(tmp_path))
+        deep = tmp_path / "google-takeout" / "acct" / "parts"
+        result = preflight_write(str(deep), 10 * GIB, require_mount=True)
+        assert result.ok, result.reason
 
     def test_nonexistent_parts_dir_is_evaluated_via_its_parent(self, tmp_path,
                                                                monkeypatch):

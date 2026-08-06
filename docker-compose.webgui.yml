@@ -55,6 +55,25 @@ services:
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-true}
+      # --- v2 multi-TB reliability guards (takeout2) --------------------
+      # Abort a stream that has moved zero bytes for this long. The socket
+      # read timeout cannot catch a trickle: a stream sending 1 byte every
+      # few minutes never times out and never finishes, wedging the
+      # transfer while holding one of Google's 5 attempts for that part.
+      TK2_STALL_ABORT_S: ${TK2_STALL_ABORT_S:-180}
+      # After a stall abort, attempt exactly ONE Range resume (a resume may
+      # cost an attempt, and there are only 5 per part, ever).
+      TK2_STALL_RESUME: ${TK2_STALL_RESUME:-1}
+      # Storage is an rclone FUSE mount. If it dies, the mount point becomes
+      # a plain dir on the root disk (75G, ~15G free) and a 10G part would
+      # fill it and take the server down. Refuse to write unless mounted.
+      TK2_REQUIRE_MOUNT: ${TK2_REQUIRE_MOUNT:-1}
+      # rclone runs --vfs-cache-max-size 100G while a single job pushes
+      # 630G through it. Pause when the upload backlog nears the cap rather
+      # than deadlocking on a full cache.
+      TK2_CACHE_DIR: ${TK2_CACHE_DIR:-/var/rclone_vfs}
+      TK2_CACHE_MAX_BYTES: ${TK2_CACHE_MAX_BYTES:-107374182400}
+      TK2_RATE_BACKOFF: ${TK2_RATE_BACKOFF:-1}
     volumes:
       - ./config:/config            # PERSISTENT: browser profile + KasmVNC creds
       - .:/work                     # live source (engine + manager + extension)
@@ -64,6 +83,16 @@ services:
         bind:
           propagation: rslave
           recursive: enabled        # JuiceFS/encfs submounts visible in-container
+      # rclone's VFS write-back cache, read-only. The engine watches its size
+      # to detect an upload backlog: we can download far faster than rclone
+      # uploads, and filling --vfs-cache-max-size stalls writes indefinitely
+      # rather than returning an error. Read-only because we only measure it.
+      - type: bind
+        source: ${TK2_CACHE_HOST_DIR:-/opt/local_cache_crypt/rclone_vfs}
+        target: /var/rclone_vfs
+        read_only: true
+        bind:
+          create_host_path: true
       - type: bind                    # LEGACY: completed 3.08TB tree (read-only)
         source: /opt/storage.jfs002
         target: /opt/storage.jfs002

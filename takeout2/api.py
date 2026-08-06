@@ -152,7 +152,9 @@ def create_app(*, store, ledger, engine=None,
     handler = CaptureHandler(store, ledger)
 
     # -- jobs ---------------------------------------------------------------
-    @app.get("/api/v2/jobs")
+    # NOTE: this app is mounted at /api/v2 (see manager/v2integration.py), so
+    # routes here are UNPREFIXED. Full path = /api/v2 + route.
+    @app.get("/jobs")
     def list_jobs(limit: int = 50, offset: int = 0):
         jobs = store.list_jobs(limit=min(limit, 500), offset=offset)
         return {
@@ -168,7 +170,7 @@ def create_app(*, store, ledger, engine=None,
             "total": len(jobs),
         }
 
-    @app.get("/api/v2/jobs/{archive_id}")
+    @app.get("/jobs/{archive_id}")
     def get_job(archive_id: str, parts: bool = False):
         job = store.get_job(archive_id)
         if not job:
@@ -193,7 +195,7 @@ def create_app(*, store, ledger, engine=None,
             } for p in store.list_parts(archive_id, limit=10000)]
         return data
 
-    @app.get("/api/v2/jobs/{archive_id}/parts")
+    @app.get("/jobs/{archive_id}/parts")
     def list_parts(archive_id: str, status: Optional[str] = None,
                    limit: int = 200, offset: int = 0):
         st = PartStatus(status) if status else None
@@ -206,7 +208,7 @@ def create_app(*, store, ledger, engine=None,
         } for p in rows]}
 
     # -- budget (the money view) -------------------------------------------
-    @app.get("/api/v2/jobs/{archive_id}/budget")
+    @app.get("/jobs/{archive_id}/budget")
     def budget(archive_id: str):
         job = store.get_job(archive_id)
         if not job:
@@ -260,12 +262,12 @@ def create_app(*, store, ledger, engine=None,
 
     for action in ("pause", "resume", "cancel"):
         app.add_api_route(
-            f"/api/v2/control/{action}/{{archive_id}}", _control(action),
+            f"/control/{action}/{{archive_id}}", _control(action),
             methods=["POST"], name=f"control_{action}",
         )
 
     # -- capture sink (the extension's POST) --------------------------------
-    @app.post("/api/v2/capture")
+    @app.post("/capture")
     async def capture(request: Request,
                       x_capture_token: Optional[str] = Header(None)):
         _auth(capture_token, x_capture_token)
@@ -276,7 +278,7 @@ def create_app(*, store, ledger, engine=None,
         return handler.ingest(payload)
 
     # -- SSE with resumable cursor ------------------------------------------
-    @app.get("/api/v2/jobs/{archive_id}/events")
+    @app.get("/jobs/{archive_id}/events")
     def events(archive_id: str, since: int = 0,
                heartbeat_s: float = 10.0, timeout_s: float = 3600.0):
         job = store.get_job(archive_id)
@@ -303,7 +305,7 @@ def create_app(*, store, ledger, engine=None,
                                           "X-Accel-Buffering": "no"})
 
     # -- capture all events (no archive filter) -----------------------------
-    @app.get("/api/v2/events")
+    @app.get("/events")
     def all_events(since: int = 0, heartbeat_s: float = 10.0):
         def stream():
             cursor = since
@@ -320,7 +322,7 @@ def create_app(*, store, ledger, engine=None,
         return StreamingResponse(stream(), media_type="text/event-stream")
 
     # -- doctor --------------------------------------------------------------
-    @app.get("/api/v2/doctor")
+    @app.get("/doctor")
     def doctor():
         checks = {}
         try:

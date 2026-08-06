@@ -26,7 +26,12 @@ def ctx():
                            budget=5, reserve=1)
     app = create_app(store=store, ledger=ledger, api_token="api-secret",
                      capture_token="cap-secret")
-    client = TestClient(app)
+    # Mirror production: the v2 app is mounted at /api/v2 (see
+    # manager/v2integration.py). Tests hit the real deployed path.
+    from fastapi import FastAPI
+    root = FastAPI()
+    root.mount("/api/v2", app)
+    client = TestClient(root)
     return store, ledger, client
 
 

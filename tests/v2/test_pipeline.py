@@ -66,7 +66,11 @@ def ctx(tmp_path):
     store = JobStore(sqlite3.connect(":memory:", check_same_thread=False))
     ledger = AttemptLedger(sqlite3.connect(":memory:", check_same_thread=False),
                            budget=5, reserve=1)
-    client = TestClient(create_app(store=store, ledger=ledger, capture_token="cap"))
+    from fastapi import FastAPI
+    app = create_app(store=store, ledger=ledger, capture_token="cap")
+    root = FastAPI()
+    root.mount("/api/v2", app)      # mirror production mount
+    client = TestClient(root)
     return store, ledger, client, str(parts_dir)
 
 

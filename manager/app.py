@@ -370,3 +370,21 @@ async def index():
         # The HTML itself is dynamic (tokens + version) — never cache it.
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
     return HTMLResponse("<h1>Takeout Manager</h1><p>UI not built yet (Phase 3).</p>")
+
+
+# --- v2 control plane (Phase 10 cutover) -----------------------------------
+# Mount takeout2's attempt-limited routes under /api/v2. v1 keeps working;
+# the v2 app shares STORAGE_ROOT and the same API/capture tokens. If v2
+# is not importable (pre-deploy), the manager must still boot — v1 only.
+try:
+    from .v2integration import mount_v2
+
+    mount_v2(app)
+    import logging as _logging
+
+    _logging.getLogger("takeout2.integration").info("v2 routes mounted")
+except Exception as _exc:  # noqa: BLE001 - v1 must never be bricked by v2
+    import logging as _logging
+
+    _logging.getLogger("takeout2.integration").warning(
+        "v2 routes NOT mounted (%s); manager running v1 only", _exc)

@@ -67,6 +67,28 @@
   .banner.warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   .banner.err { background: rgba(248,81,73,.12); border: 1px solid var(--err); color: var(--err); }
 
+  /* --- reliability-guard banners -------------------------------------------
+     A guard firing must never look like a hang: a deliberate pause, a backoff
+     sleep or a refused write each get their own always-visible banner at the
+     very top of the page, stacked worst-first (storage > rate > cache > stall). */
+  #guard-bar { display: flex; flex-direction: column; gap: 8px; padding: 12px 20px 0; }
+  #guard-bar:empty { display: none; padding: 0; }
+  .guard { display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px;
+           border-radius: 8px; font-size: 13px; }
+  .guard .g-msg { flex: 1; min-width: 0; }
+  .guard .g-why { display: block; font-size: 12px; opacity: .82; margin-top: 3px;
+                  font-weight: 400; }
+  .guard.g-storage { background: rgba(248,81,73,.18); border: 1px solid var(--err);
+                     color: #ffd7d4; font-weight: 700; }
+  .guard.g-latched { background: rgba(248,81,73,.10); font-weight: 600; }
+  .guard.g-amber { background: rgba(210,153,34,.14); border: 1px solid var(--warn);
+                   color: #f3d78f; font-weight: 600; }
+  .guard.g-quiet { background: rgba(210,153,34,.07); border: 1px solid var(--border);
+                   color: var(--warn); font-weight: 500; }
+  .guard .g-x { cursor: pointer; opacity: .65; font-weight: 700; padding: 0 2px; }
+  .guard .g-x:hover { opacity: 1; }
+  .st-guard { color: var(--warn); }
+
   /* header stats line (parts · bytes · speed · eta) */
   .stats { display: flex; gap: 20px; flex-wrap: wrap; margin: 8px 0 6px; font-size: 13px; }
   .stats b { color: var(--fg); }
@@ -129,6 +151,11 @@
   <div class="spacer"></div>
   <span id="conn" class="conn"><span class="dot"></span><span id="conn-text">connecting…</span></span>
 </header>
+
+<!-- Reliability-guard banners (storage blocked / rate limited / cache paused /
+     stall). Page-level on purpose: a dead storage volume dooms every part, so
+     it must be visible before the operator even reaches the job panel. -->
+<div id="guard-bar"></div>
 
 <main>
   <!-- Job list -->
@@ -226,6 +253,128 @@ const REASON_MSG = {
 };
 const reasonMsg = (code) => REASON_MSG[code] || code || "";
 
+/* ---------- reliability guards (v2 engine, takeout2/engine.py) -------------
+   The engine has four guards that deliberately stop or slow a transfer. Each
+   one, if unreported, is indistinguishable from a hang for the operator:
+
+   1. STALL ABORT   (_wait watchdog + _resume_after_stall) — a stream that moved
+      zero bytes for `stall_abort_s` (180 s default) is killed and retried ONCE
+      with a Range resume. Exactly once, because a resume spends one of the
+      irreplaceable 5-attempts-per-part Google budget; a second resume on a
+      link that is clearly dead would burn a third attempt for nothing.
+   2. STORAGE BLOCKED (_check_storage -> preflight_write) — the parts dir is not
+      a live mount, or writing would push the filesystem below its headroom
+      floor. This is CATASTROPHIC and page-level: the rclone FUSE mount dying
+      turns /opt/archives back into a plain directory on the ~15 GB ROOT disk,
+      and streaming a 10 GB part there has already taken this server down once.
+      Every part will fail the same way, so it gets a red, dismissible banner.
+   3. CACHE PAUSED (_wait_for_cache) — rclone's VFS write-back cache hit its
+      pause ratio. Writing into a full cache does not error, it blocks forever,
+      so the engine sleeps instead. It holds NO attempt and NO cookie while
+      paused: that is a healthy pause, not a hang, and must read as such.
+   4. RATE LIMITED (_maybe_backoff -> backoff.decide) — a 429. Retrying it
+      immediately would spend an attempt on a request Google has already said
+      it will refuse, so we sleep. Attempts per part are capped at 5 total.
+
+   None of these have a dedicated event kind, so both surfaces derive them from
+   the text the engine already writes into part.last_error / job.last_error and
+   from PartStatus. classifyGuard() is the single pattern-matching rule set and
+   is kept behaviourally identical to the copy in helpers/popup.js. */
+const GUARD_SEVERITY = { storage: 4, rate: 3, cache: 2, stall: 1 };
+
+function guardWaitSecs(t) {
+  // "waiting 42s", "waiting 42.5s", "retry-after 60" -> 42 / 60
+  const m = /(?:wait|waiting|retry[- ]after|backoff)\D{0,12}(\d+(?:\.\d+)?)\s*s?/i.exec(t);
+  return m ? Math.round(parseFloat(m[1])) : null;
+}
+function guardCachePct(t) {
+  const m = /cache\D{0,24}?(\d+(?:\.\d+)?)\s*%/i.exec(t) ||
+            /(\d+(?:\.\d+)?)\s*%\s*full/i.exec(t);
+  return m ? Math.round(parseFloat(m[1])) : null;
+}
+
+/* Pure: (errorText, partStatus) -> {kind, severity, message, why} | null. */
+function classifyGuard(errText, status) {
+  const raw = errText == null ? "" : String(errText);
+  const t = raw.toLowerCase();
+  const st = String(status == null ? "" : status).toUpperCase();
+
+  // 1. STORAGE — checked FIRST and short-circuits, mirroring preflight_write:
+  //    on a detached mount a free-space probe measures the ROOT disk and would
+  //    wrongly pass, green-lighting exactly the write we are preventing.
+  if (t.indexOf("storage preflight:") >= 0 ||
+      t.indexOf("is not a mount point") >= 0 || t.indexOf("volume is detached") >= 0 ||
+      t.indexOf("insufficient space") >= 0 || t.indexOf("headroom") >= 0 ||
+      t.indexOf("sentinel") >= 0 || t.indexOf("disk_error") >= 0 ||
+      t.indexOf("disk full") >= 0) {
+    return {
+      kind: "storage", severity: GUARD_SEVERITY.storage,
+      message: "\u26D4 storage blocked \u2014 refusing to write: " +
+               raw.replace(/^storage preflight:\s*/i, ""),
+      why: "The archive volume is detached or out of headroom. Every part will " +
+           "fail the same way, and an unguarded write would land 10 GB parts on " +
+           "the root disk. Fix the mount before resuming."
+    };
+  }
+
+  // 2. RATE LIMITED — a 429 backoff sleep.
+  if (t.indexOf("rate_limited") >= 0 || t.indexOf("rate limit") >= 0 ||
+      t.indexOf("rate-limit") >= 0 || t.indexOf("429") >= 0 ||
+      t.indexOf("throttl") >= 0 || t.indexOf("too many requests") >= 0) {
+    const w = guardWaitSecs(raw);
+    return {
+      kind: "rate", severity: GUARD_SEVERITY.rate,
+      message: "\u23F3 rate limited by Google \u2014 waiting " +
+               (w != null ? w + "s" : "out the backoff") +
+               " (attempts are limited to 5 per part)",
+      why: "Re-requesting now would spend one of the 5 irreplaceable attempts " +
+           "on a request Google has already refused, so the engine sleeps instead."
+    };
+  }
+
+  // 3. CACHE PAUSED — rclone upload backlog; a deliberate sleep, not a hang.
+  if (t.indexOf("upload cache") >= 0 || t.indexOf("vfs cache") >= 0 ||
+      t.indexOf("cache full") >= 0 || t.indexOf("rclone") >= 0 ||
+      (t.indexOf("cache") >= 0 && (t.indexOf("pause") >= 0 || t.indexOf("drain") >= 0 ||
+                                   t.indexOf("% full") >= 0))) {
+    const p = guardCachePct(raw);
+    return {
+      kind: "cache", severity: GUARD_SEVERITY.cache,
+      message: "\u23F8 paused \u2014 upload cache " + (p != null ? p + "%" : "nearly") +
+               " full, waiting for rclone to drain",
+      why: "Writing into a full VFS cache blocks forever instead of failing. " +
+           "The engine holds no attempt and no cookie while it waits \u2014 this " +
+           "is a deliberate pause, not a stall."
+    };
+  }
+
+  // 4. STALL ABORT / resume. Distinguish the three phases so the operator can
+  //    see that the ONE permitted Range resume has been used up.
+  if (t.indexOf("stall") >= 0 || t.indexOf("no bytes for") >= 0) {
+    // "stall abort on resume" / "stalled again" means the ONE permitted resume
+    // was itself killed by the watchdog -> the engine stopped for good.
+    const gaveUp = t.indexOf("on resume") >= 0 || t.indexOf("again") >= 0 ||
+                   t.indexOf("gave up") >= 0 || t.indexOf("giving up") >= 0 ||
+                   t.indexOf("twice") >= 0;
+    const resumed = !gaveUp && (t.indexOf("resum") >= 0 || st === "ACTIVE");
+    return {
+      kind: "stall", severity: GUARD_SEVERITY.stall,
+      message: gaveUp
+        ? "\u23F1 stalled twice \u2014 gave up"
+        : (resumed ? "\u23F1 stalled \u2192 resumed (1 of 1)"
+                   : "\u23F1 stalled \u2014 stream aborted by the watchdog"),
+      why: gaveUp
+        ? "A second resume would spend a third attempt on a link that is not " +
+          "moving, so the engine stopped. Attempts left are shown per part."
+        : "A stream that moves zero bytes never trips a socket timeout, so a " +
+          "watchdog kills it. Exactly ONE Range resume is allowed \u2014 a resume " +
+          "can cost one of the 5 attempts per part."
+    };
+  }
+  return null;
+}
+
+
 const parseTs = (ts) => {
   if (ts == null) return Date.now();
   let ms = Date.parse(ts);
@@ -252,6 +401,17 @@ let sseFails = 0;
 let inPollMode = false;
 let moreExpanded = false;
 let dirty = false, rafPending = false;
+
+/* Guard state. Everything except the storage note is DERIVED FRESH each render
+   from rows/jobSnap, so a banner disappears as soon as the condition stops
+   showing up in new data (no latching, per the contract). The storage note is
+   the one exception: a detached mount is catastrophic and silently "recovers"
+   the moment the engine stops trying, so we keep it until dismissed. */
+const GUARD_NOTICE_TTL_MS = 120000;   // an ephemeral engine note ages out
+let guardNotices = new Map();         // (kind + "@" + source) -> {guard, at}
+let guardStorageNote = null;          // latched, dismissible
+let guardStorageDismissed = false;
+let guardActive = new Set();          // kinds currently rendered (for the conn dot)
 
 const terminalJobs = new Set(["COMPLETE", "FAILED", "BUDGET_EXHAUSTED"]);
 
@@ -338,8 +498,8 @@ function connectSSE() {
     setConn("warn", "reconnecting…");
     setTimeout(connectSSE, 1200);          // resume with lastSeq => lossless
   };
-  const kinds = ["part_progress", "part_done", "part_error", "job_status",
-                 "heartbeat", "attempt_spent", "needs_cookie",
+  const kinds = ["part_progress", "part_done", "part_error", "part_update",
+                 "job_status", "heartbeat", "attempt_spent", "needs_cookie",
                  "budget_warning", "error"];
   for (const k of kinds) es.addEventListener(k, onSseEvent);
   es.onmessage = onSseEvent;               // safety net for unnamed frames
@@ -390,13 +550,29 @@ function applyEvent(kind, d, ts) {
     r.attempts_left = typeof d.attempts_left === "number" ? d.attempts_left : null;
     r.lastProgressAtMs = null;             // don't ALSO flag it stalled
     partSpeed.delete(d.idx);
+    noteGuard(r.error, r.state, "part " + d.idx);
+  } else if (kind === "part_update") {
+    // The current engine emits part_update (state.update_part) rather than the
+    // normative part_done/part_error for quiet transitions; guard text such as
+    // "storage preflight: …" arrives on THIS kind, so it must be inspected too.
+    const r = row(d.idx);
+    if (d.status) r.state = String(d.status).toUpperCase();
+    if (d.verify_state) r.verify = d.verify_state;
+    if (typeof d.size_on_disk === "number") r.size_on_disk = d.size_on_disk;
+    if (d.error != null) { r.error = d.error; noteGuard(d.error, r.state, "part " + d.idx); }
+    if (r.state === "DONE") { r.error = null; partSpeed.delete(d.idx); }
   } else if (kind === "attempt_spent") {   // ledger audit trail
     const r = row(d.idx);
     if (typeof d.attempts === "number") r.attempts_used = d.attempts;
     if (d.outcome) r.last_error = d.outcome;
+    // The ledger note carries the stall-abort / stall-resume wording written by
+    // engine._run_one / _resume_after_stall; it is the ONLY place a successful
+    // resume is visible, so mine it for stall state.
+    if (d.note) noteGuard(d.note, r.state, "part " + d.idx + " ledger");
   } else if (kind === "job_status") {
     if (jobSnap && d.status) jobSnap.status = d.status;
     if (jobSnap && d.error) jobSnap.last_error = d.error;
+    if (d.error) noteGuard(d.error, d.status, "job");
   } else if (kind === "needs_cookie") {
     showBanner("warn", "🔑 Cookie expired — job is parked, waiting for a fresh capture.");
   } else if (kind === "budget_warning") {
@@ -406,6 +582,7 @@ function applyEvent(kind, d, ts) {
     fetchBudget(selected);                 // refresh the money view
   } else if (kind === "error") {
     showBanner("err", esc(d.message || d.error || "engine error"));
+    noteGuard(d.message || d.error, null, "engine");
   }
   // heartbeat and unknown kinds: nothing to apply (heartbeat resets the stall
   // clock via markEvent(); lastSeq advances for lossless reconnect).
@@ -501,11 +678,96 @@ function resetJobView() {
   jobSnap = null;
   lastSeq = 0;
   moreExpanded = false;
+  guardNotices.clear();
+  guardStorageNote = null;
+  guardStorageDismissed = false;
+  renderGuards();
   $("#d-banner").innerHTML = "";
   $("#parts-body").innerHTML = "";
   $("#more-row-wrap").innerHTML = "";
   $("#empty-detail").hidden = true;
   $("#detail").hidden = false;
+}
+
+/* ---------- guard surfacing ------------------------------------------------
+   noteGuard() records an EPHEMERAL guard sighting from an event (events are
+   one-shot: the wording never appears again, so we keep it briefly). Guards
+   still visible in the parts snapshot are recomputed every render instead, so
+   both paths converge and nothing latches except the storage note. */
+function noteGuard(text, status, source) {
+  const g = classifyGuard(text, status);
+  if (!g) return;
+  if (g.kind === "storage") {
+    // Catastrophic: keep it until the operator dismisses it, because the
+    // engine simply stops trying and the symptom would silently vanish.
+    if (!guardStorageDismissed) guardStorageNote = g;
+    return;
+  }
+  guardNotices.set(g.kind + "@" + (source || ""), { guard: g, at: Date.now() });
+}
+
+function collectGuards(now) {
+  const best = new Map();          // kind -> guard (keep the first/worst text)
+  const add = (g) => {
+    if (!g) return;
+    if (g.kind === "storage") {
+      if (!guardStorageDismissed) guardStorageNote = g;
+      return;                       // rendered from the latched note instead
+    }
+    if (!best.has(g.kind)) best.set(g.kind, g);
+  };
+  // Fresh data first: anything still present in a row/job error is live.
+  if (jobSnap && jobSnap.last_error) add(classifyGuard(jobSnap.last_error, jobSnap.status));
+  rows.forEach((r) => {
+    if (r.error) add(classifyGuard(r.error, r.state));
+    else if (r.last_error) add(classifyGuard(r.last_error, r.state));
+  });
+  // Then recent event-only sightings that have not aged out.
+  guardNotices.forEach((v, k) => {
+    if (now - v.at > GUARD_NOTICE_TTL_MS) guardNotices.delete(k);
+    else add(v.guard);
+  });
+  const out = [...best.values()];
+  out.sort((a, b) => b.severity - a.severity);   // storage > rate > cache > stall
+  return out;
+}
+
+function guardHtml(g, cls, dismissKind) {
+  return '<div class="guard ' + cls + '" data-kind="' + esc(g.kind) + '">' +
+    '<span class="g-msg">' + esc(g.message) +
+    '<span class="g-why">' + esc(g.why) + "</span></span>" +
+    (dismissKind ? '<span class="g-x" data-dismiss="' + dismissKind + '" title="dismiss">\u2715</span>' : "") +
+    "</div>";
+}
+
+function renderGuards() {
+  const bar = $("#guard-bar");
+  if (!bar) return;
+  const now = Date.now();
+  const list = collectGuards(now);
+  guardActive = new Set(list.map((g) => g.kind));
+  if (guardStorageNote && !guardStorageDismissed) guardActive.add("storage");
+  const html = [];
+  // Storage first, always, and dismissible (see classifyGuard's comment on why
+  // this one must not auto-clear).
+  if (guardStorageNote && !guardStorageDismissed) {
+    html.push(guardHtml(guardStorageNote, "g-storage", "storage"));
+  }
+  for (const g of list) {
+    const cls = g.kind === "stall" ? "g-quiet" : "g-amber";
+    html.push(guardHtml(g, cls, null));
+  }
+  const next = html.join("");
+  if (bar.dataset.sig !== next) {          // avoid clobbering on every frame
+    bar.dataset.sig = next;
+    bar.innerHTML = next;
+    const x = bar.querySelector('[data-dismiss="storage"]');
+    if (x) x.onclick = () => {
+      guardStorageDismissed = true;
+      guardStorageNote = null;
+      scheduleRender();
+    };
+  }
 }
 
 function showBanner(kind, html) {
@@ -528,6 +790,16 @@ function markEvent() { lastEventAt = Date.now(); }
 function updateConn() {
   const el = $("#conn"), txt = $("#conn-text");
   const age = Math.floor((Date.now() - lastEventAt) / 1000);
+  // A deliberate engine pause must never read as "stalled?": while a cache or
+  // rate-limit guard is active the stream legitimately goes quiet for minutes.
+  const paused = guardActive.has("cache") ? "cache" :
+                 (guardActive.has("rate") ? "rate" : null);
+  if (paused && !inPollMode && age > 20) {
+    el.className = "conn warn";
+    txt.textContent = (paused === "cache" ? "\u23F8 paused (cache)" : "\u23F3 backing off")
+                      + " \u00b7 " + age + "s quiet";
+    return;
+  }
   if (inPollMode) {
     el.className = "conn poll " + (age > 60 ? "dead" : age > 20 ? "warn" : "live");
     txt.textContent = "polling · " + age + "s ago";
@@ -671,16 +943,23 @@ function rowHtml(r, now) {
   const p = pct(r.size_on_disk, exp);
   const stalled = stalledFor(r, now);
   const risk = (budgetMap.get(r.idx) || {}).at_risk;
+  // Per-row guard: the same classifier as the banners, so a part row explains
+  // itself ("stalled → resumed (1 of 1)") instead of showing a raw error blob.
+  const guard = r.state === "DONE" ? null : classifyGuard(r.error || r.last_error, r.state);
 
   let cls = "row-";
   if (r.state === "DONE") cls = "row-done";
   else if (r.state === "BUDGET_EXHAUSTED") cls = "row-exhausted";
+  else if (guard && guard.kind === "storage") cls = "row-exhausted";
+  else if (guard && guard.kind !== "stall") cls = "row-risk";
   else if (r.error || r.state === "FAILED") cls = "row-error";
   else if (risk) cls = "row-risk";
 
   let stateCell;
   if (r.state === "DONE") stateCell = '<span class="st-done">✓ DONE</span>';
   else if (r.state === "BUDGET_EXHAUSTED") stateCell = '<span class="st-exhausted">✖ BUDGET_EXHAUSTED</span>';
+  else if (guard) stateCell = '<span class="' +
+    (guard.kind === "storage" ? "st-error" : "st-guard") + '">' + esc(guard.message) + "</span>";
   else if (r.state === "FAILED") stateCell = '<span class="st-error">✖ FAILED</span>';
   else if (r.error) stateCell = '<span class="st-error">✖ ' + esc(r.state) + "</span>";
   else if (stalled) stateCell = '<span class="st-partial">⏳ stalled ' + stalled + "s</span>";
@@ -695,6 +974,15 @@ function rowHtml(r, now) {
   let errCell = "—";
   if (r.state === "BUDGET_EXHAUSTED") {
     errCell = '<span class="err-cell">✖ budget exhausted</span>';
+  } else if (guard) {
+    // The guard already explains itself in the state cell; here we show the
+    // attempt arithmetic, which is the number that decides recoverability
+    // (5 attempts per part, and a stall resume spends one of them).
+    const left = typeof r.attempts_left === "number"
+      ? r.attempts_left + " of 5 attempts left"
+      : (r.attempts_used ? r.attempts_used + "/5 attempts used" : "guard fired");
+    errCell = '<span class="' + (guard.kind === "storage" ? "err-cell" : "st-guard") +
+              '">' + esc(left) + "</span>";
   } else if (r.error) {
     let msg = reasonMsg(r.error);
     if (!msg && r.outcome) msg = reasonMsg(r.outcome);
@@ -721,6 +1009,7 @@ function render() {
   if (!selected) return;
   if (jobSnap) { refreshSelectedFromSnapshot(); renderStats(jobSnap); }
   renderBudget();
+  renderGuards();      // guard banners recomputed from fresh data every frame
   updateConn();
 
   const now = Date.now();

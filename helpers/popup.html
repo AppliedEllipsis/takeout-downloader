@@ -64,6 +64,21 @@
         .v2-pending { color: #94a3b8; }
         .v2-more { grid-column: 1 / -1; color: #64748b; font-size: 9px; }
         .v2c-err { color: #ef4444; word-break: break-all; }
+        /* reliability-guard banners (takeout2 engine guards). A guard firing must
+           never look like a hang, so these sit above the parts table and are
+           stacked worst-first: storage > rate > cache > stall. */
+        #v2GuardBar { margin: 0 0 8px; }
+        .v2guard { position: relative; padding: 7px 9px; border-radius: 6px; font-size: 11px;
+                   line-height: 1.4; margin-bottom: 5px; }
+        .v2guard-why { color: #cbd5e1; opacity: .75; font-size: 10px; margin-top: 2px; }
+        .v2guard-storage { background: #4c1111; border: 1px solid #ef4444; color: #fecaca;
+                           font-weight: 700; }
+        .v2guard-amber { background: #3a2a08; border: 1px solid #f59e0b; color: #fed7aa;
+                         font-weight: 600; }
+        .v2guard-quiet { background: #2d2d3f; border: 1px solid #3d3d5c; color: #f59e0b; }
+        .v2guard-x { position: absolute; top: 4px; right: 6px; cursor: pointer;
+                     font-weight: 700; opacity: .7; }
+        .v2guard-x:hover { opacity: 1; }
     </style>
 </head>
 <body>
@@ -90,6 +105,10 @@
          the v2 control plane SSE + snapshot endpoints at {managerUrl}/api/v2.
          Hidden until v2 jobs exist; the existing v1 panels are untouched. -->
     <div class="section" id="v2LiveSection" style="display:none;">
+        <!-- Engine reliability guards (storage blocked / rate limited / cache
+             paused / stall). Rendered above everything else in this section so a
+             detached storage mount is impossible to miss. -->
+        <div id="v2GuardBar" style="display:none;"></div>
         <div id="v2LiveHead" class="help" style="font-size:11px; margin-bottom:2px;">takeout2 &#8230;</div>
         <div id="v2LiveConn" class="help" style="margin-bottom:4px;">&#8230;</div>
         <div id="v2JobSelector" style="display:none;">

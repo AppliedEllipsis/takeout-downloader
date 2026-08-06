@@ -897,6 +897,134 @@ const v2LiveMonitor = (function () {
     const SSE_MAX_FAILS = 2;             // then fall back to 2 s polling
     const CONN_COLORS = { ok: '#22c55e', warn: '#f59e0b', err: '#ef4444', dim: '#94a3b8' };
 
+    // -- reliability guards (takeout2/engine.py) ----------------------------
+    // The v2 engine has four guards that deliberately stop or slow a transfer.
+    // Unreported, every one of them looks identical to a hang:
+    //
+    //  1. STALL ABORT (stall_abort_s, default 180 s) — a stream that moves zero
+    //     bytes never trips a socket read timeout (a trickle of 1 byte every
+    //     4 minutes would run forever), so a watchdog kills it. Exactly ONE
+    //     Range resume is then attempted, because a resume can cost one of
+    //     Google's irreplaceable 5 attempts per part. Stall twice => give up;
+    //     a third attempt on a dead link buys nothing and cannot be refunded.
+    //  2. STORAGE BLOCKED (_check_storage -> preflight.preflight_write) — the
+    //     parts dir is not a live mount, or the write would break the headroom
+    //     floor. CATASTROPHIC and job-wide: when the rclone FUSE mount dies the
+    //     mountpoint silently reverts to a plain directory on the ~15 GB ROOT
+    //     disk, and streaming a 10 GB part there has already taken the box
+    //     down once. Every part fails the same way => prominent RED banner,
+    //     and it stays until dismissed.
+    //  3. CACHE PAUSED (_wait_for_cache) — rclone's VFS write-back cache hit
+    //     its pause ratio. Writing into a full cache does NOT error, it blocks
+    //     forever, so the engine sleeps holding neither an attempt nor a
+    //     cookie. That is a healthy pause and must read as one.
+    //  4. RATE LIMITED (_maybe_backoff -> backoff.decide) — a 429. Re-requesting
+    //     immediately would spend one of the 5 attempts on a request Google has
+    //     already refused, so we wait out the Retry-After / exponential delay.
+    //
+    // No dedicated event kind exists for these, so we pattern-match the text
+    // the engine already writes into part.last_error / job.last_error / ledger
+    // notes. classifyGuard() below is kept BEHAVIOURALLY IDENTICAL to the copy
+    // in manager/web/monitor.html — change both or neither.
+    const GUARD_SEVERITY = { storage: 4, rate: 3, cache: 2, stall: 1 };
+    const GUARD_NOTICE_TTL_MS = 120000;   // an event-only sighting ages out
+
+    function guardWaitSecs(t) {
+        const m = /(?:wait|waiting|retry[- ]after|backoff)\D{0,12}(\d+(?:\.\d+)?)\s*s?/i.exec(t);
+        return m ? Math.round(parseFloat(m[1])) : null;
+    }
+    function guardCachePct(t) {
+        const m = /cache\D{0,24}?(\d+(?:\.\d+)?)\s*%/i.exec(t) ||
+                  /(\d+(?:\.\d+)?)\s*%\s*full/i.exec(t);
+        return m ? Math.round(parseFloat(m[1])) : null;
+    }
+
+    // Pure: (errorText, partStatus) -> {kind, severity, message, why} | null.
+    function classifyGuard(errText, status) {
+        const raw = errText == null ? '' : String(errText);
+        const t = raw.toLowerCase();
+        const st = String(status == null ? '' : status).toUpperCase();
+
+        // 1. STORAGE — checked FIRST and short-circuits, mirroring
+        //    preflight_write: on a detached mount a free-space probe measures
+        //    the ROOT disk and would wrongly pass, green-lighting exactly the
+        //    write we are trying to prevent.
+        if (t.indexOf('storage preflight:') >= 0 ||
+            t.indexOf('is not a mount point') >= 0 || t.indexOf('volume is detached') >= 0 ||
+            t.indexOf('insufficient space') >= 0 || t.indexOf('headroom') >= 0 ||
+            t.indexOf('sentinel') >= 0 || t.indexOf('disk_error') >= 0 ||
+            t.indexOf('disk full') >= 0) {
+            return {
+                kind: 'storage', severity: GUARD_SEVERITY.storage,
+                message: '\u26D4 storage blocked \u2014 refusing to write: ' +
+                         raw.replace(/^storage preflight:\s*/i, ''),
+                why: 'The archive volume is detached or out of headroom. Every ' +
+                     'part will fail the same way, and an unguarded write would ' +
+                     'land 10 GB parts on the root disk. Fix the mount before resuming.'
+            };
+        }
+
+        // 2. RATE LIMITED — a 429 backoff sleep.
+        if (t.indexOf('rate_limited') >= 0 || t.indexOf('rate limit') >= 0 ||
+            t.indexOf('rate-limit') >= 0 || t.indexOf('429') >= 0 ||
+            t.indexOf('throttl') >= 0 || t.indexOf('too many requests') >= 0) {
+            const w = guardWaitSecs(raw);
+            return {
+                kind: 'rate', severity: GUARD_SEVERITY.rate,
+                message: '\u23F3 rate limited by Google \u2014 waiting ' +
+                         (w != null ? w + 's' : 'out the backoff') +
+                         ' (attempts are limited to 5 per part)',
+                why: 'Re-requesting now would spend one of the 5 irreplaceable ' +
+                     'attempts on a request Google has already refused, so the ' +
+                     'engine sleeps instead.'
+            };
+        }
+
+        // 3. CACHE PAUSED — rclone upload backlog: a deliberate sleep.
+        if (t.indexOf('upload cache') >= 0 || t.indexOf('vfs cache') >= 0 ||
+            t.indexOf('cache full') >= 0 || t.indexOf('rclone') >= 0 ||
+            (t.indexOf('cache') >= 0 && (t.indexOf('pause') >= 0 ||
+                                         t.indexOf('drain') >= 0 ||
+                                         t.indexOf('% full') >= 0))) {
+            const p = guardCachePct(raw);
+            return {
+                kind: 'cache', severity: GUARD_SEVERITY.cache,
+                message: '\u23F8 paused \u2014 upload cache ' +
+                         (p != null ? p + '%' : 'nearly') +
+                         ' full, waiting for rclone to drain',
+                why: 'Writing into a full VFS cache blocks forever instead of ' +
+                     'failing. The engine holds no attempt and no cookie while ' +
+                     'it waits \u2014 this is a deliberate pause, not a stall.'
+            };
+        }
+
+        // 4. STALL ABORT / resume — three distinguishable phases so the
+        //    operator can see the ONE permitted Range resume being used up.
+        if (t.indexOf('stall') >= 0 || t.indexOf('no bytes for') >= 0) {
+            // "stall abort on resume" / "stalled again" means the ONE permitted
+            // resume was itself killed -> the engine stopped for good.
+            const gaveUp = t.indexOf('on resume') >= 0 || t.indexOf('again') >= 0 ||
+                           t.indexOf('gave up') >= 0 || t.indexOf('giving up') >= 0 ||
+                           t.indexOf('twice') >= 0;
+            const resumed = !gaveUp && (t.indexOf('resum') >= 0 || st === 'ACTIVE');
+            return {
+                kind: 'stall', severity: GUARD_SEVERITY.stall,
+                message: gaveUp
+                    ? '\u23F1 stalled twice \u2014 gave up'
+                    : (resumed ? '\u23F1 stalled \u2192 resumed (1 of 1)'
+                               : '\u23F1 stalled \u2014 stream aborted by the watchdog'),
+                why: gaveUp
+                    ? 'A second resume would spend a third attempt on a link ' +
+                      'that is not moving, so the engine stopped. Attempts left ' +
+                      'are shown per part.'
+                    : 'A stream that moves zero bytes never trips a socket ' +
+                      'timeout, so a watchdog kills it. Exactly ONE Range resume ' +
+                      'is allowed \u2014 a resume can cost one of the 5 attempts per part.'
+            };
+        }
+        return null;
+    }
+
     let cfg = { mgrUrl: null, token: '' };
     let jobs = [];
     let archiveId = null;
@@ -918,6 +1046,15 @@ const v2LiveMonitor = (function () {
     let connText = '\u2026';
     let connCls = 'dim';
     let started = false;
+    // Guard state. Everything except the storage note is DERIVED FRESH from
+    // rows/headJob on each render, so a banner clears as soon as the condition
+    // stops appearing in new data (no permanent latching). Storage is the one
+    // exception — it is catastrophic and the symptom disappears the moment the
+    // engine stops trying, so it stays until the operator dismisses it.
+    let guardNotices = new Map();     // kind@source -> {guard, at}
+    let guardStorageNote = null;
+    let guardStorageDismissed = false;
+    let guardActiveKinds = [];        // kinds currently rendered (worst first)
 
     // -- tiny helpers --------------------------------------------------------
     function esc(s) {
@@ -1073,6 +1210,7 @@ const v2LiveMonitor = (function () {
         row.stallSecs = 0;
         row.lastProgressAt = Date.now();     // the per-part stall clock (90 s)
         if (row.done) { row.speedBps = null; row.attemptsLeft = null; }
+        if (d.error != null) noteGuard(d.error, row.status, 'part ' + d.idx);
         patchV2Row(d.idx);
     }
     function applyPartDone(d) {
@@ -1100,6 +1238,9 @@ const v2LiveMonitor = (function () {
         row.speedBps = null;
         row.done = false;
         row.lastProgressAt = Date.now();
+        // Guard text (e.g. "storage preflight: …") arrives here — surface it as
+        // a banner, not just a red row, because storage failures are job-wide.
+        noteGuard(row.lastError, row.status, 'part ' + d.idx);
         patchV2Row(d.idx);
         fetchBudget();
         addActivity('\u2717', 'Part ' + d.idx + ' failed',
@@ -1117,6 +1258,7 @@ const v2LiveMonitor = (function () {
         if (d.verify_state) { row.verify = d.verify_state; changed = true; }
         if (typeof d.size_on_disk === 'number') { row.sizeOnDisk = d.size_on_disk; changed = true; }
         if (d.error != null) { row.lastError = d.error; changed = true; }
+        if (d.error != null) noteGuard(d.error, row.status, 'part ' + d.idx);
         if (changed) {
             row.done = row.status === 'DONE';
             if (row.done) { row.speedBps = null; row.attemptsLeft = null; }
@@ -1138,6 +1280,7 @@ const v2LiveMonitor = (function () {
             if (d.status) headJob.status = d.status;
             if (d.error != null) headJob.last_error = d.error;
         }
+        if (d.error != null) noteGuard(d.error, d.status, 'job');
         renderV2Header();
         if (d.status === 'COMPLETE' || d.status === 'FAILED' || d.status === 'BUDGET_EXHAUSTED') {
             addActivity(d.status === 'COMPLETE' ? '\u2713' : '\u26a0',
@@ -1146,7 +1289,12 @@ const v2LiveMonitor = (function () {
             ensureActivityVisible();
         }
     }
-    function applyAttemptSpent() {
+    function applyAttemptSpent(d) {
+        // The ledger note is the only place a SUCCESSFUL stall resume shows up
+        // ("stall resume OK_PARTIAL <n>B" / "stall abort on resume: …"), so it is
+        // mined for stall guard state before the budget refresh is scheduled.
+        if (d && d.note) noteGuard(d.note, d.state || null,
+                                   'part ' + (d.idx != null ? d.idx : '?') + ' ledger');
         if (budgetTimer) clearTimeout(budgetTimer);
         budgetTimer = setTimeout(fetchBudget, 500);
     }
@@ -1154,13 +1302,17 @@ const v2LiveMonitor = (function () {
     // -- rendering ------------------------------------------------------------
     function v2RowClass(row) {
         if (row.done) return 'v2-done';
+        const g = classifyGuard(row.lastError, row.status);
+        if (g && g.kind === 'storage') return 'v2-err';
+        if (g && g.kind !== 'stall') return 'v2-stall';   // amber: paused, not broken
         if (row.lastError || row.status === 'FAILED' || row.status === 'BUDGET_EXHAUSTED') return 'v2-err';
-        if (row.isStalled) return 'v2-stall';
+        if (row.isStalled || (g && g.kind === 'stall')) return 'v2-stall';
         if (row.status === 'ACTIVE' || row.status === 'PARTIAL' || row.status === 'VERIFYING') return 'v2-active';
         return 'v2-pending';
     }
     function v2RowHtml(row) {
         const pct = rowPct(row);
+        const guard = row.done ? null : classifyGuard(row.lastError, row.status);
         const bar = pct == null
             ? '<span class="v2-bar-none">\u2014</span>'
             : '<span class="v2-bar-track"><span class="v2-bar-fill" style="width:' +
@@ -1175,14 +1327,22 @@ const v2LiveMonitor = (function () {
                 : fmtSpeed(row.speedBps));
         let err = '';
         if (row.done) err = '\u2713';
-        else if (row.lastError) {
+        else if (guard) {
+            // Guard wording replaces the raw error blob; the attempt arithmetic
+            // is what decides recoverability (5 per part, a resume spends one).
+            err = esc(guard.message);
+            if (row.attemptsLeft != null) err += ' \u00b7 ' + row.attemptsLeft + ' of 5 left';
+            else if (row.attemptsUsed) err += ' \u00b7 ' + row.attemptsUsed + '/5 used';
+        } else if (row.lastError) {
             err = '\u2716 ' + esc(row.lastError);
             if (row.attemptsLeft != null) err += ' \u00b7 ' + row.attemptsLeft + ' attempts left';
         }
         return '<div class="v2-row ' + v2RowClass(row) + '" data-idx="' + row.idx +
             '" title="' + esc(row.filename || 'part ' + row.idx) + '">' +
             '<span class="v2c-idx">' + String(row.idx).padStart(2, '0') + '</span>' +
-            '<span class="v2c-state">' + esc(rowState(row)) + '</span>' +
+            '<span class="v2c-state">' +
+            (guard ? esc(guard.kind === 'storage' ? 'STORAGE' : guard.kind.toUpperCase())
+                   : esc(rowState(row))) + '</span>' +
             '<span class="v2c-bar">' + bar + '</span>' +
             '<span class="v2c-pct">' + (pct == null ? '\u2014' : pct.toFixed(0) + '%') + '</span>' +
             '<span class="v2c-disk">' + disk + '</span>' +
@@ -1217,6 +1377,7 @@ const v2LiveMonitor = (function () {
         }
         wrap.scrollTop = st;
         renderV2Summary();
+        renderV2Guards();   // recompute banners from the freshest row data
     }
     function patchV2Row(idx) {
         const body = $('v2PartsBody');
@@ -1277,9 +1438,92 @@ const v2LiveMonitor = (function () {
         if (!el) return;
         const age = lastEventAt
             ? Math.max(0, Math.round((Date.now() - lastEventAt) / 1000)) : null;
-        el.textContent = connText +
+        // A deliberate pause must not read as "stalled": while a cache or
+        // rate-limit guard is active the stream legitimately goes quiet for
+        // minutes at a time, so say WHY it is quiet.
+        const pausedBy = guardActiveKinds.indexOf('cache') >= 0 ? 'cache'
+                       : (guardActiveKinds.indexOf('rate') >= 0 ? 'rate' : null);
+        let text = connText;
+        if (pausedBy && age != null && age > 20) {
+            text = pausedBy === 'cache'
+                ? '\u23F8 paused \u2014 upload cache draining'
+                : '\u23F3 backing off \u2014 rate limited';
+        }
+        el.textContent = text +
             (age != null ? ' \u00b7 last event ' + age + 's ago' : '');
-        el.style.color = CONN_COLORS[connCls] || '#94a3b8';
+        el.style.color = pausedBy ? CONN_COLORS.warn : (CONN_COLORS[connCls] || '#94a3b8');
+    }
+
+    // -- guard surfacing -----------------------------------------------------
+    // noteGuard() records an EPHEMERAL sighting straight off an event: events
+    // are one-shot, so wording like "stall resume OK_PARTIAL 8388608B" would
+    // otherwise be gone forever. Guards still visible in the snapshot are
+    // recomputed from rows every render, so both paths converge.
+    function noteGuard(text, status, source) {
+        const g = classifyGuard(text, status);
+        if (!g) return;
+        if (g.kind === 'storage') {
+            if (!guardStorageDismissed) guardStorageNote = g;
+            renderV2Guards();
+            return;
+        }
+        guardNotices.set(g.kind + '@' + (source || ''), { guard: g, at: Date.now() });
+        renderV2Guards();
+    }
+    function collectGuards() {
+        const now = Date.now();
+        const best = new Map();
+        const add = function (g) {
+            if (!g) return;
+            if (g.kind === 'storage') {
+                if (!guardStorageDismissed) guardStorageNote = g;
+                return;                 // rendered from the latched note
+            }
+            if (!best.has(g.kind)) best.set(g.kind, g);
+        };
+        if (headJob && headJob.last_error) add(classifyGuard(headJob.last_error, headJob.status));
+        rows.forEach(function (r) { if (r.lastError) add(classifyGuard(r.lastError, r.status)); });
+        guardNotices.forEach(function (v, k) {
+            if (now - v.at > GUARD_NOTICE_TTL_MS) guardNotices.delete(k);
+            else add(v.guard);
+        });
+        const out = [];
+        best.forEach(function (g) { out.push(g); });
+        // Worst first: storage > rate > cache > stall.
+        out.sort(function (a, b) { return b.severity - a.severity; });
+        return out;
+    }
+    function guardRowHtml(g, cls, dismissable) {
+        return '<div class="v2guard ' + cls + '" data-kind="' + esc(g.kind) + '">' +
+            (dismissable ? '<span class="v2guard-x" id="v2GuardDismiss">\u2715</span>' : '') +
+            '<div>' + esc(g.message) + '</div>' +
+            '<div class="v2guard-why">' + esc(g.why) + '</div>' +
+            '</div>';
+    }
+    function renderV2Guards() {
+        const bar = $('v2GuardBar');
+        const list = collectGuards();
+        guardActiveKinds = list.map(function (g) { return g.kind; });
+        if (guardStorageNote && !guardStorageDismissed) guardActiveKinds.unshift('storage');
+        if (!bar) return;
+        const html = [];
+        if (guardStorageNote && !guardStorageDismissed) {
+            html.push(guardRowHtml(guardStorageNote, 'v2guard-storage', true));
+        }
+        list.forEach(function (g) {
+            html.push(guardRowHtml(g, g.kind === 'stall' ? 'v2guard-quiet' : 'v2guard-amber', false));
+        });
+        const next = html.join('');
+        if (bar.getAttribute('data-sig') === next) return;   // avoid reflow churn
+        bar.setAttribute('data-sig', next);
+        bar.innerHTML = next;
+        bar.style.display = next ? 'block' : 'none';
+        const x = $('v2GuardDismiss');
+        if (x) x.addEventListener('click', function () {
+            guardStorageDismissed = true;
+            guardStorageNote = null;
+            renderV2Guards();
+        });
     }
     function renderSelector() {
         const sel = $('v2JobSelect');
@@ -1384,6 +1628,11 @@ const v2LiveMonitor = (function () {
         rows = new Map();
         totals = {};
         headJob = null;
+        guardNotices = new Map();
+        guardStorageNote = null;
+        guardStorageDismissed = false;
+        guardActiveKinds = [];
+        renderV2Guards();
         showLiveSection(true);
         renderSelector();
         setConn('loading\u2026', 'dim');
@@ -1430,6 +1679,7 @@ const v2LiveMonitor = (function () {
                 });
                 renderV2Header();
                 renderV2Table();
+                renderV2Guards();
                 connectV2SSE();
             })
             .catch(function (err) {
@@ -1539,8 +1789,14 @@ const v2LiveMonitor = (function () {
             sseFailed('stale (no event for 60s)');
             return;
         }
-        const jobPaused = headJob && ['PAUSED', 'NEEDS_COOKIE', 'COMPLETE', 'FAILED',
-                                      'BUDGET_EXHAUSTED'].indexOf(headJob.status) >= 0;
+        const jobPaused = (headJob && ['PAUSED', 'NEEDS_COOKIE', 'COMPLETE', 'FAILED',
+                                      'BUDGET_EXHAUSTED'].indexOf(headJob.status) >= 0) ||
+            // A cache/rate guard means the engine is deliberately sleeping. Do
+            // not ALSO paint every row "stalled" — that is the exact confusion
+            // between "paused on purpose" and "hung" we are here to remove.
+            guardActiveKinds.indexOf('cache') >= 0 ||
+            guardActiveKinds.indexOf('rate') >= 0 ||
+            guardActiveKinds.indexOf('storage') >= 0;
         const body = $('v2PartsBody');
         rows.forEach(function (row) {
             const was = row.isStalled;
@@ -1567,6 +1823,7 @@ const v2LiveMonitor = (function () {
                 patchV2Row(row.idx);
             }
         });
+        renderV2Guards();  // expire aged notices / clear banners that healed
         renderV2Conn();   // keep the "last event Ns ago" ticking
     }
 

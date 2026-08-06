@@ -1,10 +1,22 @@
 """takeout2.cli — operator CLI for the v2 engine.
 
 Commands (docs/v2/03-UX-AND-OBSERVABILITY.md §2): status, watch, run, budget,
-verify, identity, doctor, migrate. Reads state.db directly — no HTTP, no
-Google host; the only outbound call is a FREE CDP read of our own Chrome.
-Every command accepts --json; no tracebacks without --debug; ``run --dry-run``
-builds components, prints a plan, and reserves nothing.
+verify, identity, doctor, migrate — plus ``next`` (the advisor). Reads state.db
+directly — no HTTP, no Google host; the only outbound call is a FREE CDP read of
+our own Chrome. Every command accepts --json; no tracebacks without --debug;
+``run --dry-run`` builds components, prints a plan, and reserves nothing.
+
+UX layer (additive, backward compatible):
+
+* ``status`` opens with one plain-English summary line per job (progress bar,
+  percentage, parts, bytes, state, budget warning) and closes with the advisor
+  hint. All pre-existing detail is unchanged and still printed below it.
+* ``next`` prints the single most useful next action, derived from the real
+  JobStatus/PartStatus values in contracts.py. It only ever names commands and
+  surfaces that actually exist.
+* ``doctor --fix`` repairs what is safe to repair (missing parts dir, schema,
+  stale ACTIVE part rows from a crashed process) and REFUSES anything that
+  would spend a Google attempt or delete downloaded bytes.
 """
 from __future__ import annotations
 
@@ -127,6 +139,42 @@ def _since_str(iso):
     return f"since {hhmm} ({total // 3600}h {(total % 3600) // 60}m)"
 
 
+def _progress_bar(pct, width=10):
+    """'▓▓▓▓░░░░░░' for 40%. ``pct is None`` (unknown total) renders '──────────'."""
+    if pct is None:
+        return "─" * width
+    filled = int(round(max(0.0, min(100.0, float(pct))) / 100.0 * width))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _pct_str(pct):
+    return "  —" if pct is None else f"{float(pct):.0f}%"
+
+
+def summary_line(d):
+    """The human-first one-liner at the top of ``status``.
+
+    braincreation  ▓▓▓▓░░░░░░ 19%  12/63 parts  412 GB / 3.08 TB  DOWNLOADING
+    """
+    p = d["parts"]
+    bits = [
+        f"{_truncate_middle(d['account_label'] or '—', 16):<16}",
+        _progress_bar(d["pct"]),
+        f"{_pct_str(d['pct']):>4}",
+        f"{p['done']}/{p['total']} parts",
+        f"{_fmt(d['bytes_done'])} / {_fmt(d['bytes_total'])}",
+        str(d["status"]),
+    ]
+    b = d["budget"]
+    if b["at_0"]:
+        noun = "part" if b["at_0"] == 1 else "parts"
+        bits.append(f"⚠ {b['at_0']} {noun} out of attempts")
+    elif b["at_1"]:
+        noun = "part" if b["at_1"] == 1 else "parts"
+        bits.append(f"⚠ {b['at_1']} {noun} at 1 attempt left")
+    return "  ".join(bits)
+
+
 def _use_color():
     try:
         return sys.stdout.isatty()
@@ -158,9 +206,15 @@ def open_backend(db_path):
     """Open JobStore + AttemptLedger on one SQLite file with env config."""
     budget = _env_num("TK2_ATTEMPT_BUDGET", DEFAULTS["ATTEMPT_BUDGET"], int)
     reserve = _env_num("TK2_BUDGET_RESERVE", DEFAULTS["BUDGET_RESERVE"], int)
-    store = JobStore.open(db_path)
-    ledger = AttemptLedger(sqlite3.connect(db_path, check_same_thread=False),
-                           budget=budget, reserve=reserve)
+    try:
+        store = JobStore.open(db_path)
+        ledger = AttemptLedger(sqlite3.connect(db_path, check_same_thread=False),
+                               budget=budget, reserve=reserve)
+    except (sqlite3.Error, OSError) as exc:
+        raise CliError(
+            f"cannot open state.db at {db_path}: {exc}\n"
+            f"      point --db at the real file, e.g. "
+            f"{PROG} status --db /opt/archives/state.db") from None
     return store, ledger, budget, reserve
 
 
@@ -244,10 +298,31 @@ def _load_payload(path):
 
 
 def _get_job(store, archive_id):
+    """Fetch a job or print a friendly one-liner naming a real next command."""
     job = store.get_job(archive_id)
-    if job is None:
-        return _err(f"no job for archive {archive_id} (see: status)")
-    return job
+    if job is not None:
+        return job
+    known = store.list_jobs()
+    if not known:
+        _err(f"no job for archive {archive_id!r} — this state.db has no jobs "
+             f"at all.\n      {CAPTURE_HINT}")
+        return None
+    guess = _closest_archive_id(archive_id, known)
+    hint = f"did you mean {guess}? " if guess else ""
+    _err(f"no job for archive {archive_id!r}. {hint}"
+         f"{len(known)} job(s) known — list them with: {PROG} status")
+    return None
+
+
+def _closest_archive_id(archive_id, jobs):
+    """A typo'd/abbreviated id often still matches one job by substring."""
+    needle = str(archive_id).strip().lstrip("j=").lower()
+    if not needle:
+        return None
+    hits = [j.archive_id for j in jobs
+            if needle in j.archive_id.lower()
+            or (len(needle) >= 4 and needle[-5:] in j.archive_id.lower())]
+    return hits[0] if len(hits) == 1 else None
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +363,7 @@ def job_status_data(store, ledger, job):
                    "at_1": sum(1 for b in budgets if b.remaining == 1),
                    "at_0": sum(1 for b in budgets if b.remaining == 0)},
         "cookie": cookie_probe(),
+        "last_error": job.last_error,
         "errors": errors,
     }
 
@@ -377,22 +453,202 @@ def render_budget(d):
 
 
 # --------------------------------------------------------------------------
+# advisor — "what should I do now?"
+# --------------------------------------------------------------------------
+#: The zero-CLI happy path. Everything downstream is inspection and recovery.
+CAPTURE_HINT = ("Open takeout.google.com in the webtop browser and click "
+                "Download on any archive — the extension captures it and the "
+                "download starts automatically.")
+
+#: Ranking: the lower the number, the more urgent. The advisor prints exactly
+#: one action — the most urgent one across all jobs.
+_ADVICE_RANK = {
+    "budget_exhausted": 0,
+    "needs_cookie": 1,
+    "failed": 2,
+    "parts_exhausted": 3,
+    "paused": 4,
+    "stalled_parts": 5,
+    "verifying": 6,
+    "discovering": 7,
+    "downloading": 8,
+    "complete": 9,
+    "no_jobs": 10,
+}
+
+
+def _runner_present():
+    """Is a runner/manager process plausibly driving jobs right now?
+
+    We must not import takeout2.runner (it may not exist yet) and we must not
+    make a network call. The env flag the compose file sets is the only signal
+    the CLI can read for FREE.
+    """
+    flag = _env("TK2_RUNNER", "") or _env("TK2_MANAGER_URL", "")
+    return flag not in ("", "0", "false")
+
+
+def advise(jobs):
+    """Pick the single most useful next action from real job snapshots.
+
+    ``jobs`` is a list of ``job_status_data`` dicts. Returns a dict with
+    ``kind`` (a stable key for scripting), ``headline`` (one line of plain
+    English) and ``commands`` (zero or more copy-pasteable commands — only
+    commands that actually exist in this CLI).
+    """
+    if not jobs:
+        return {"kind": "no_jobs", "archive_id": None,
+                "headline": f"No jobs yet. {CAPTURE_HINT}",
+                "commands": []}
+
+    candidates = [_advise_job(d) for d in jobs]
+    candidates.sort(key=lambda a: (_ADVICE_RANK.get(a["kind"], 99),
+                                   str(a["archive_id"])))
+    best = candidates[0]
+    if len(candidates) > 1:
+        best = dict(best, others=len(candidates) - 1)
+    return best
+
+
+def _advise_job(d):
+    aid = d["archive_id"]
+    short = _short_id(aid)
+    label = d["account_label"] or short
+    parts = d["parts"]
+    status = d["status"]
+
+    def out(kind, headline, commands=()):
+        return {"kind": kind, "archive_id": aid, "headline": headline,
+                "commands": list(commands)}
+
+    if status == JobStatus.BUDGET_EXHAUSTED.value:
+        return out("budget_exhausted",
+                   f"{label} is out of download attempts. Google allows "
+                   f"5 downloads per archive part; this job has spent them, so "
+                   f"a human must decide what happens next — nothing will "
+                   f"retry on its own (that is deliberate: a retry here could "
+                   f"waste the last attempt on another part). Check which "
+                   f"parts are affected, then either accept the archive as-is "
+                   f"or re-export it from Takeout.",
+                   [f"{PROG} budget {aid}", f"{PROG} verify {aid}"])
+
+    if status == JobStatus.NEEDS_COOKIE.value:
+        return out("needs_cookie",
+                   f"{label} needs a fresh cookie. Open the Takeout page in "
+                   f"the webtop browser — the extension re-captures "
+                   f"automatically and the job resumes where it stopped. "
+                   f"Nothing is lost and no attempt is spent by waiting.",
+                   [f"{PROG} status --db <db>"])
+
+    if status == JobStatus.FAILED.value:
+        why = f" Last error: {d.get('last_error')}." if d.get("last_error") else ""
+        return out("failed",
+                   f"{label} is FAILED.{why} Look at the per-part detail before "
+                   f"doing anything that costs an attempt.",
+                   [f"{PROG} budget {aid}", f"{PROG} verify {aid}"])
+
+    if parts["exhausted"]:
+        noun = "part" if parts["exhausted"] == 1 else "parts"
+        return out("parts_exhausted",
+                   f"{label}: {parts['exhausted']} {noun} hit the 5-attempt "
+                   f"limit and will not be retried automatically — a human has "
+                   f"to decide. The rest of the job keeps going.",
+                   [f"{PROG} budget {aid}"])
+
+    if status == JobStatus.PAUSED.value:
+        return out("paused",
+                   f"{label} is PAUSED and will not move until it is resumed "
+                   f"from the manager (extension popup / overlay Pause button, "
+                   f"or the manager's resume control).",
+                   [f"{PROG} status --db <db>"])
+
+    if status == JobStatus.DOWNLOADING.value:
+        return out("downloading",
+                   f"Nothing to do — {label} is downloading. Watch it live, or "
+                   f"open the monitor page in the webtop browser.",
+                   [f"{PROG} watch"])
+
+    if status == JobStatus.VERIFYING.value:
+        return out("verifying",
+                   f"Nothing to do — {label} is verifying what is on disk. "
+                   f"You can run the local check yourself; it costs no "
+                   f"attempts and touches no bytes on Google's side.",
+                   [f"{PROG} verify {aid}"])
+
+    if status == JobStatus.DISCOVERING.value:
+        return out("discovering",
+                   f"Nothing to do — {label} is still working out how many "
+                   f"parts the export has. It starts downloading by itself "
+                   f"once the part list is known.",
+                   [f"{PROG} watch"])
+
+    if status == JobStatus.COMPLETE.value:
+        return out("complete",
+                   f"{label} is COMPLETE — {parts['done']}/{parts['total']} "
+                   f"parts, {_fmt(d['bytes_done'])} on disk. Optionally run a "
+                   f"local verification pass; it spends no attempts.",
+                   [f"{PROG} verify {aid}"])
+
+    # READY, or anything with resumable bytes and nothing driving it.
+    resumable = parts["partial"] + parts["pending"]
+    if resumable and not _runner_present():
+        return out("stalled_parts",
+                   f"{label} has {resumable} part(s) waiting to be downloaded "
+                   f"and no runner appears to be driving it. Normally the "
+                   f"manager auto-starts the job when a capture arrives — "
+                   f"start the manager, or re-click Download on the Takeout "
+                   f"page so a fresh capture kicks it off.",
+                   [f"{PROG} status --db <db>"])
+    return out("downloading",
+               f"Nothing to do — {label} is queued and will start on its own. "
+               f"Watch it if you want to see it move.",
+               [f"{PROG} watch"])
+
+
+def render_advice(advice, prefix="next"):
+    print(f"{prefix}: {advice['headline']}")
+    for cmd in advice["commands"]:
+        print(f"      $ {cmd}")
+    if advice.get("others"):
+        n = advice["others"]
+        print(f"      (+{n} other job{'s' if n != 1 else ''} — see: {PROG} status)")
+
+
+def cmd_next(args):
+    store, ledger, _b, _r = open_backend(args.db)
+    jobs = [job_status_data(store, ledger, job) for job in store.list_jobs()]
+    advice = advise(jobs)
+    if args.json:
+        return _emit({"generated_at": _utcnow_iso(), "advice": advice})
+    render_advice(advice)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # status / watch
 # --------------------------------------------------------------------------
 def cmd_status(args):
     store, ledger, _b, _r = open_backend(args.db)
-    data = {"generated_at": _utcnow_iso(),
-            "jobs": [job_status_data(store, ledger, job)
-                     for job in store.list_jobs()]}
+    jobs = [job_status_data(store, ledger, job) for job in store.list_jobs()]
+    advice = advise(jobs)
+    data = {"generated_at": _utcnow_iso(), "jobs": jobs, "advice": advice}
     if args.json:
         return _emit(data)
-    if not data["jobs"]:
-        print(f"{PROG}: no jobs yet — run: {PROG} run --payload <capture.json>")
+    if not jobs:
+        print(f"{PROG}: no jobs yet.")
+        print()
+        render_advice(advice)
         return 0
-    for i, d in enumerate(data["jobs"]):
+    # Human-first: the plain-English summary first, all the detail below it.
+    for d in jobs:
+        print(summary_line(d))
+    print()
+    for i, d in enumerate(jobs):
         if i:
             print()
         render_status(d)
+    print()
+    render_advice(advice)
     return 0
 
 
@@ -713,10 +969,179 @@ def _check(checks, name, passed, ok_detail, fail_detail):
                    ok_detail if passed else fail_detail))
 
 
+# --- doctor --fix ---------------------------------------------------------
+# Two lists, and the split is the whole point:
+#   fixes    — mechanical, local, reversible-by-rerun. Applied automatically.
+#   refusals — anything that could spend a Google attempt (5 per part, ever)
+#              or destroy downloaded bytes. NEVER applied; the human is told
+#              exactly what to do instead.
+def _fix(fixes, name, before, after):
+    fixes.append({"fix": name, "before": before, "after": after})
+
+
+def _refuse(refusals, name, why, do_this):
+    refusals.append({"issue": name, "why": why, "do_this": do_this})
+
+
+def doctor_fix(args, storage_root):
+    """Repair what is safe; refuse the rest with concrete instructions.
+
+    Returns ``(fixes, refusals)``. Never spends an attempt, never deletes or
+    truncates a file, never contacts Google.
+    """
+    fixes, refusals = [], []
+
+    # 1. storage root — a missing directory is a mkdir, not a decision.
+    if not os.path.isdir(storage_root):
+        try:
+            os.makedirs(storage_root, exist_ok=True)
+            _fix(fixes, "storage root", f"missing: {storage_root}",
+                 f"created: {storage_root}")
+        except OSError as exc:
+            _refuse(refusals, "storage root",
+                    f"cannot create {storage_root}: {exc}",
+                    "check the mount is attached, then re-run: "
+                    f"{PROG} doctor --fix")
+
+    # 2. state.db schema — JobStore.open()/AttemptLedger both run an
+    #    idempotent CREATE TABLE IF NOT EXISTS script, so opening the backend
+    #    *is* the repair (state.py SCHEMA / ledger._ensure_schema).
+    existed = os.path.exists(args.db)
+    try:
+        store, ledger, _b, _r = open_backend(args.db)
+    except Exception as exc:  # noqa: BLE001
+        _refuse(refusals, "state.db", f"cannot open {args.db}: {exc}",
+                "state.db is unreadable — do NOT delete it (it is the only "
+                "record of how many attempts each part has spent). Restore it "
+                "from a backup, or move it aside and re-capture.")
+        return fixes, refusals
+    _fix(fixes, "state.db schema",
+         ("present" if existed else "missing") + f": {args.db}",
+         "schema ensured (job, part, event, attempt, remote_count)")
+
+    # WAL is a pragma, not data.
+    try:
+        with sqlite3.connect(args.db) as conn:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
+                after = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                _fix(fixes, "journal mode", f"journal_mode={mode}",
+                     f"journal_mode={after}")
+    except sqlite3.Error as exc:
+        _refuse(refusals, "journal mode", str(exc),
+                "another process may hold the db; stop the manager and re-run")
+
+    # 3. dangling reservations — settle them FAIL CLOSED (ledger docstring).
+    #    This spends nothing: an unsettled attempt already counts as used;
+    #    reconciling only labels it, so accounting stops drifting.
+    try:
+        orphans = ledger.reconcile_orphans()
+        if orphans:
+            _fix(fixes, "orphan reservations",
+                 f"{orphans} unsettled attempt row(s) from a crashed process",
+                 f"{orphans} settled as ABORTED (assumed consumed — fail closed)")
+    except Exception as exc:  # noqa: BLE001
+        _refuse(refusals, "orphan reservations", str(exc),
+                f"inspect manually, then re-run: {PROG} doctor --fix")
+
+    for job in store.list_jobs():
+        aid = job.archive_id
+        label = job.account_label or _short_id(aid)
+
+        # 4. missing parts dir — a mkdir; downloads land here.
+        parts_dir = os.path.join(job.output_dir, "parts")
+        if not os.path.isdir(parts_dir):
+            try:
+                os.makedirs(parts_dir, exist_ok=True)
+                _fix(fixes, f"parts dir [{label}]", f"missing: {parts_dir}",
+                     f"created: {parts_dir}")
+            except OSError as exc:
+                _refuse(refusals, f"parts dir [{label}]",
+                        f"cannot create {parts_dir}: {exc}",
+                        "check the storage mount is attached before starting "
+                        "a burst — writing to a detached mount fills the root "
+                        "disk")
+
+        # 5. stale ACTIVE parts — no process is streaming them (this CLI is
+        #    the only thing running), and their bytes are on disk, so they are
+        #    resumable, not failed. Exactly what JobStore.recover() does.
+        stale = store.list_parts(aid, status=PartStatus.ACTIVE)
+        for part in stale:
+            store.update_part(aid, part.idx, status=PartStatus.PARTIAL)
+            _fix(fixes, f"stale part [{label}] idx={part.idx}",
+                 f"ACTIVE with {_fmt(part.size_on_disk)} on disk "
+                 f"(no process is streaming it)",
+                 "PARTIAL — resumable on the next burst, 0 attempts spent")
+
+        # ---- refusals: everything below costs attempts or bytes -----------
+        exhausted = store.list_parts(aid, status=PartStatus.BUDGET_EXHAUSTED)
+        if exhausted:
+            idxs = ", ".join(str(p.idx) for p in exhausted)
+            _refuse(refusals, f"budget exhausted [{label}]",
+                    f"part(s) {idxs} have spent all 5 of Google's download "
+                    f"attempts — clearing this would spend an attempt that "
+                    f"does not exist",
+                    f"review the counters ({PROG} budget {aid}), then either "
+                    f"accept the archive without those parts or re-export it "
+                    f"from takeout.google.com")
+
+        failed = store.list_parts(aid, status=PartStatus.FAILED)
+        if failed:
+            idxs = ", ".join(str(p.idx) for p in failed)
+            _refuse(refusals, f"failed parts [{label}]",
+                    f"part(s) {idxs} are FAILED — retrying costs 1 Google "
+                    f"attempt per part, so it is never automatic",
+                    f"read the reason ({PROG} budget {aid}) and let the runner "
+                    f"retry inside a fresh cookie burst")
+
+        corrupt = [p for p in store.list_parts(aid)
+                   if p.verify_state is VerifyState.CORRUPT]
+        if corrupt:
+            idxs = ", ".join(str(p.idx) for p in corrupt)
+            _refuse(refusals, f"corrupt parts [{label}]",
+                    f"part(s) {idxs} verify as CORRUPT — deleting downloaded "
+                    f"bytes is never automatic",
+                    f"confirm with: {PROG} verify {aid} --deep, then decide "
+                    f"whether to re-download (costs 1 attempt per part)")
+
+        if job.status is JobStatus.NEEDS_COOKIE:
+            _refuse(refusals, f"needs cookie [{label}]",
+                    "a cookie cannot be forged locally",
+                    "open takeout.google.com in the webtop browser — the "
+                    "extension re-captures automatically and the job resumes")
+
+    return fixes, refusals
+
+
+def render_fixes(fixes, refusals):
+    if fixes:
+        print("fixed:")
+        for f in fixes:
+            print(f"  ✓ {f['fix']}")
+            print(f"      before: {f['before']}")
+            print(f"      after:  {f['after']}")
+    else:
+        print("fixed: nothing needed repairing")
+    if refusals:
+        print("refused (needs a human — these cost attempts or bytes):")
+        for r in refusals:
+            print(f"  ✖ {r['issue']}")
+            print(f"      why:      {r['why']}")
+            print(f"      do this:  {r['do_this']}")
+
+
 def cmd_doctor(args):
     checks = []
     storage_root = _env("TK2_STORAGE_ROOT", "") or os.path.dirname(
         os.path.abspath(args.db))
+
+    fixes = refusals = None
+    if getattr(args, "fix", False):
+        fixes, refusals = doctor_fix(args, storage_root)
+        if not args.json:
+            render_fixes(fixes, refusals)
+            print()
 
     # 1. storage root writable
     try:
@@ -800,13 +1225,18 @@ def cmd_doctor(args):
 
     all_pass = all(status in ("PASS", "SKIP") for _, status, _ in checks)
     if args.json:
-        return _emit({"checks": [{"name": n, "status": s, "detail": d}
-                                  for n, s, d in checks],
-                      "exit": 0 if all_pass else 1},
-                     0 if all_pass else 1)
+        payload = {"checks": [{"name": n, "status": s, "detail": d}
+                              for n, s, d in checks],
+                   "exit": 0 if all_pass else 1}
+        if fixes is not None:
+            payload["fixes"] = fixes
+            payload["refusals"] = refusals
+        return _emit(payload, 0 if all_pass else 1)
     for name, status, detail in checks:
         print(f"  {name:<26} {status:<4} {detail}")
     print(f"doctor: {'all checks pass' if all_pass else '1 or more checks failed'}")
+    if not all_pass and not getattr(args, "fix", False):
+        print(f"doctor: some of this may be repairable — try: {PROG} doctor --fix")
     return 0 if all_pass else 1
 
 
@@ -861,10 +1291,38 @@ def cmd_migrate(args):
 # --------------------------------------------------------------------------
 # parser + entry point
 # --------------------------------------------------------------------------
+EPILOG = """
+TYPICAL USE — you normally do not need this CLI at all.
+
+  1. Open takeout.google.com in the webtop browser.
+  2. Click Download on an archive. That is the whole workflow.
+
+  The extension captures the click, the manager creates the job and starts it
+  automatically, and a dead cookie heals itself (open the Takeout page again
+  and it re-captures). A 3 TB / 63-part export runs for days with no further
+  interaction.
+
+This CLI is for INSPECTION and RECOVERY:
+
+  takeout2 status          human summary of every job + what to do next
+  takeout2 next            just the single most useful next action
+  takeout2 watch           live dashboard while a job runs
+  takeout2 budget <id>     Google's own attempt counter per part (the money view)
+  takeout2 verify <id>     local structural check — spends no attempts
+  takeout2 doctor --fix    diagnose, and repair what is safe to repair
+
+Nothing here ever spends a Google download attempt except `run`. Each archive
+part may only be downloaded 5 times, ever — that is why nothing retries by
+itself once a part is exhausted.
+"""
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog=PROG, description="Operator CLI for the takeout2 download engine "
-                               "(reads state.db; never contacts Google).")
+                               "(reads state.db; never contacts Google).",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default="./state.db", metavar="PATH",
                         help="path to state.db (default: ./state.db)")
@@ -880,6 +1338,7 @@ def build_parser():
         return p
 
     add("status", "one-shot snapshot", cmd_status)
+    add("next", "what should I do now? (the advisor)", cmd_next)
     add("watch", "live dashboard (repeated status without a TTY)", cmd_watch)
     p = add("run", "start a burst from a capture payload", cmd_run)
     p.add_argument("--payload", required=True, metavar="FILE",
@@ -896,13 +1355,52 @@ def build_parser():
     p.add_argument("archive_id", help="the j= archive key")
     p.add_argument("--set-label", metavar="LABEL",
                    help="overwrite the account label (OPERATOR_OVERRIDE)")
-    add("doctor", "preflight health checks", cmd_doctor)
+    p = add("doctor", "preflight health checks", cmd_doctor)
+    p.add_argument("--fix", action="store_true",
+                   help="repair what is SAFE to repair (dirs, schema, stale "
+                        "ACTIVE rows); refuse anything costing an attempt "
+                        "or downloaded bytes")
     p = add("migrate", "v1 state -> state.db (dry-run by default)", cmd_migrate)
     p.add_argument("--output-dir", metavar="DIR", default=".",
                    help="v1 tree to adopt (dir containing .manager_state.json)")
     p.add_argument("--apply", action="store_true",
                    help="commit the migration (default is dry-run)")
     return parser
+
+
+def _friendly_reason(exc):
+    """Map a raw exception onto (cause, suggested command) in plain English.
+
+    Only for the handful of failures an operator actually hits. Anything else
+    falls through to the exception text (and --debug still shows the traceback).
+    """
+    text = str(exc)
+    if isinstance(exc, sqlite3.OperationalError):
+        if "unable to open database file" in text:
+            return ("state.db cannot be opened — the path or its directory "
+                    "does not exist", f"{PROG} status --db ./state.db")
+        if "no such table" in text:
+            return ("state.db is missing tables (empty or truncated file)",
+                    f"{PROG} doctor --fix")
+        if "database is locked" in text:
+            return ("state.db is locked by another process (the manager is "
+                    "probably writing)", f"{PROG} status")
+    if isinstance(exc, sqlite3.DatabaseError):
+        return ("state.db is not a valid SQLite database — do NOT delete it, "
+                "it records how many attempts each part has spent",
+                f"{PROG} doctor")
+    if isinstance(exc, FileNotFoundError):
+        return (f"file not found: {getattr(exc, 'filename', None) or text}",
+                f"{PROG} doctor")
+    if isinstance(exc, PermissionError):
+        return (f"permission denied: {getattr(exc, 'filename', None) or text}",
+                f"{PROG} doctor")
+    lowered = text.lower()
+    if ("connection refused" in lowered or "connectionerror" in lowered
+            or "failed to establish" in lowered or "max retries" in lowered):
+        return ("the manager / Chrome is unreachable — nothing is listening",
+                f"{PROG} doctor")
+    return None
 
 
 def main(argv=None):
@@ -926,8 +1424,16 @@ def main(argv=None):
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "debug", False):
             traceback.print_exc()
-        else:
+            return 1
+        friendly = _friendly_reason(exc)
+        if friendly is None:
             print(f"{PROG}: {exc}", file=sys.stderr)
+            print(f"{PROG}: re-run with --debug for the full traceback",
+                  file=sys.stderr)
+            return 1
+        cause, suggestion = friendly
+        print(f"{PROG}: {cause}", file=sys.stderr)
+        print(f"      try: {suggestion}", file=sys.stderr)
         return 1
 
 

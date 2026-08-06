@@ -873,3 +873,706 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+// ---------------------------------------------------------------------------
+// v4.3 — v2 LIVE PER-PART MONITOR  (docs/v2/06-LIVE-MONITORING.md §4 & §6)
+// Consumes the v2 control plane at {managerUrl}/api/v2 (mounted by
+// manager/v2integration.py):
+//   GET  /jobs                         -> job list / auto-select / <select>
+//   GET  /jobs/{id}?parts=1            -> seed rows (sizes, statuses, verify)
+//   GET  /jobs/{id}/events?since=<seq> -> SSE: part_progress / part_done /
+//                                          part_error / job_status /
+//                                          attempt_spent / heartbeat
+//   GET  /jobs/{id}/budget             -> parts_at_risk (header "budget ⚠ N")
+// Additive only: the v1 status panel, the budget panel and the activity log
+// stay untouched. Nothing here touches background.js / content.js / manifest.
+// ---------------------------------------------------------------------------
+const v2LiveMonitor = (function () {
+    'use strict';
+
+    const TERMINAL = new Set(['DONE', 'FAILED', 'SKIPPED', 'BUDGET_EXHAUSTED']);
+    const MAX_ROWS = 50;                 // cap rendered rows for huge jobs
+    const PART_STALL_MS = 90000;         // per-part: no part_progress in 90 s
+    const GLOBAL_STALL_MS = 60000;       // global: no event of any kind in 60 s
+    const SSE_MAX_FAILS = 2;             // then fall back to 2 s polling
+    const CONN_COLORS = { ok: '#22c55e', warn: '#f59e0b', err: '#ef4444', dim: '#94a3b8' };
+
+    let cfg = { mgrUrl: null, token: '' };
+    let jobs = [];
+    let archiveId = null;
+    let rows = new Map();                // idx -> row
+    let totals = {};
+    let headJob = null;                  // last job snapshot
+    let lastSeq = 0;                     // SSE cursor (the `id:` line)
+    let lastEventAt = 0;                 // any-event clock (global stall)
+    let sse = null;
+    let sseFails = 0;
+    let mode = 'idle';                   // idle | sse | polling
+    let pollTimer = null;
+    let stallTimer = null;
+    let listTimer = null;
+    let budgetTimer = null;
+    let retryTimer = null;
+    let retries = 0;
+    let partsAtRisk = 0;
+    let connText = '\u2026';
+    let connCls = 'dim';
+    let started = false;
+
+    // -- tiny helpers --------------------------------------------------------
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+    function v2Url(path) {
+        const base = cfg.mgrUrl || 'http://127.0.0.1:8080';
+        return base + '/api/v2' + path;
+    }
+    function fetchV2Json(path, opts) {
+        opts = opts || {};
+        const headers = Object.assign({}, opts.headers || {});
+        if (cfg.token) headers['X-Capture-Token'] = cfg.token;
+        return fetch(v2Url(path), { headers: headers }).then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + path);
+            return r.json();
+        });
+    }
+    function fmtSpeed(bps) {
+        if (!bps || bps <= 0) return '\u2014';
+        return fmtBytes(bps) + '/s';
+    }
+    function fmtEta(sec) {
+        if (sec == null || !isFinite(sec) || sec < 0) return '';
+        if (sec < 60) return '~' + Math.round(sec) + 's';
+        if (sec < 3600) return '~' + Math.round(sec / 60) + 'm';
+        return '~' + Math.floor(sec / 3600) + 'h ' + Math.round((sec % 3600) / 60) + 'm';
+    }
+    function isTerminal(row) {
+        return !!(row.done || (row.status && TERMINAL.has(row.status)));
+    }
+    function rowState(row) {
+        return row.lastError ? 'ERROR' : (row.status || '?');
+    }
+    function rowPct(row) {
+        if (row.done) return 100;
+        if (!row.sizeExpected || row.sizeExpected <= 0) return null;
+        return Math.min(100, ((row.sizeOnDisk || 0) / row.sizeExpected) * 100);
+    }
+    function scheduleRetry(fn, ms) {
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(fn, ms);
+    }
+    function setConn(text, cls) {
+        connText = text;
+        connCls = cls || 'dim';
+        renderV2Conn();
+    }
+    function showLiveSection(show) {
+        const el = $('v2LiveSection');
+        if (el) el.style.display = show ? 'block' : 'none';
+    }
+    function v2StatusClass(st) {
+        if (st === 'COMPLETE') return 'ok';
+        if (st === 'FAILED' || st === 'BUDGET_EXHAUSTED') return 'err';
+        if (st === 'NEEDS_COOKIE' || st === 'PAUSED') return 'warn';
+        return 'dim';
+    }
+
+    // -- rows ----------------------------------------------------------------
+    function ensureRow(idx) {
+        const row = {
+            idx: idx,
+            filename: 'part ' + idx,
+            status: 'PENDING',
+            verify: 'UNVERIFIED',
+            sizeExpected: null,
+            sizeOnDisk: null,
+            attemptsUsed: 0,
+            attemptsLeft: null,
+            speedBps: null,
+            lastError: null,
+            lastProgressAt: null,
+            isStalled: false,
+            stallSecs: 0,
+            done: false
+        };
+        rows.set(idx, row);
+        return row;
+    }
+    function mergeSnapshot(snap) {
+        // Reconcile rows from a poll snapshot; keeps speedBps when available
+        // and computes a crude delta speed between 2 s polls when it grew.
+        const now = Date.now();
+        (snap.parts || []).forEach(function (p) {
+            const prev = rows.get(p.idx);
+            const done = p.status === 'DONE';
+            const grew = prev && prev.sizeOnDisk != null &&
+                         (p.size_on_disk || 0) > prev.sizeOnDisk;
+            const inFlight = p.status === 'ACTIVE' || p.status === 'PARTIAL' ||
+                             p.status === 'VERIFYING';
+            rows.set(p.idx, {
+                idx: p.idx,
+                filename: p.filename || (prev ? prev.filename : 'part ' + p.idx),
+                status: p.status || (prev ? prev.status : 'PENDING'),
+                verify: p.verify_state || (prev ? prev.verify : 'UNVERIFIED'),
+                sizeExpected: (p.size_expected != null && p.size_expected > 0)
+                    ? p.size_expected : (prev ? prev.sizeExpected : null),
+                sizeOnDisk: p.size_on_disk != null
+                    ? p.size_on_disk : (prev ? prev.sizeOnDisk : null),
+                attemptsUsed: p.attempts_used != null
+                    ? p.attempts_used : (prev ? prev.attemptsUsed : 0),
+                attemptsLeft: prev ? prev.attemptsLeft : null,
+                speedBps: grew
+                    ? Math.round((p.size_on_disk - prev.sizeOnDisk) / 2)
+                    : (prev ? prev.speedBps : null),
+                lastError: p.last_error || (prev ? prev.lastError : null),
+                lastProgressAt: (grew || done)
+                    ? now : (prev ? prev.lastProgressAt : (inFlight ? now : null)),
+                // Preserve the stall state when the part didn't grow this poll,
+                // so the "⏳ stalled Ns" marker doesn't flicker on each refresh.
+                isStalled: (grew || done) ? false : (prev ? prev.isStalled : false),
+                stallSecs: prev ? prev.stallSecs : 0,
+                done: done
+            });
+        });
+    }
+
+    // -- SSE event handlers ---------------------------------------------------
+    function handleV2Event(e, kind) {
+        lastEventAt = Date.now();            // any event resets the global stall clock
+        const id = parseInt(e.lastEventId, 10);
+        if (!isNaN(id) && id > lastSeq) lastSeq = id;   // lossless cursor
+        let ev = null;
+        try { ev = JSON.parse(e.data); } catch (err) { /* non-JSON: ignore */ }
+        if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
+        const k = kind || (ev && ev.kind) || 'message';
+        const d = (ev && ev.data) || {};
+        switch (k) {
+            case 'part_progress': applyPartProgress(d); break;
+            case 'part_done':     applyPartDone(d); break;
+            case 'part_error':    applyPartError(d); break;
+            case 'part_update':   applyPartUpdate(d); break;   // current engine emits this
+            case 'part_state':    applyPartState(d); break;    // current engine emits this
+            case 'job_status':    applyJobStatus(d); break;
+            case 'attempt_spent': applyAttemptSpent(d); break;
+            default: break;   // heartbeat + unknown kinds: only timers bumped
+        }
+        renderV2Conn();
+    }
+    function applyPartProgress(d) {
+        const row = rows.get(d.idx) || ensureRow(d.idx);
+        if (typeof d.size_on_disk === 'number' && d.size_on_disk >= 0) row.sizeOnDisk = d.size_on_disk;
+        if (typeof d.size_expected === 'number' && d.size_expected > 0) row.sizeExpected = d.size_expected;
+        if (typeof d.speed_bps === 'number') row.speedBps = d.speed_bps;
+        if (d.state) row.status = String(d.state).toUpperCase();
+        if (d.verify) row.verify = d.verify;
+        if (d.error != null) row.lastError = d.error;
+        row.done = row.status === 'DONE';
+        row.isStalled = false;
+        row.stallSecs = 0;
+        row.lastProgressAt = Date.now();     // the per-part stall clock (90 s)
+        if (row.done) { row.speedBps = null; row.attemptsLeft = null; }
+        patchV2Row(d.idx);
+    }
+    function applyPartDone(d) {
+        const row = rows.get(d.idx) || ensureRow(d.idx);
+        row.status = d.state || 'DONE';
+        row.done = true;
+        if (typeof d.size_expected === 'number' && d.size_expected > 0) row.sizeExpected = d.size_expected;
+        if (typeof d.size_on_disk === 'number' && d.size_on_disk >= 0) row.sizeOnDisk = d.size_on_disk;
+        else if (row.sizeExpected != null) row.sizeOnDisk = row.sizeExpected;
+        if (d.verify) row.verify = d.verify;
+        row.speedBps = null;
+        row.lastError = null;
+        row.attemptsLeft = null;
+        row.isStalled = false;
+        row.lastProgressAt = Date.now();
+        patchV2Row(d.idx);
+        fetchBudget();                       // attempts freed — refresh the money view
+    }
+    function applyPartError(d) {
+        const row = rows.get(d.idx) || ensureRow(d.idx);
+        row.status = d.state ? String(d.state).toUpperCase() : 'FAILED';
+        if (typeof d.attempts_left === 'number') row.attemptsLeft = d.attempts_left;
+        if (row.attemptsLeft === 0) row.status = 'BUDGET_EXHAUSTED';
+        row.lastError = d.error || (d.outcome || 'ERROR');
+        row.speedBps = null;
+        row.done = false;
+        row.lastProgressAt = Date.now();
+        patchV2Row(d.idx);
+        fetchBudget();
+        addActivity('\u2717', 'Part ' + d.idx + ' failed',
+            (d.error || d.outcome || '') +
+            (row.attemptsLeft != null ? ' \u00b7 ' + row.attemptsLeft + ' attempts left' : ''),
+            'act-err');
+        ensureActivityVisible();
+    }
+    function applyPartUpdate(d) {
+        // Defensive: the CURRENT engine emits part_update (status/size/verify
+        // changes) instead of the normative part_done; treat DONE as terminal.
+        const row = rows.get(d.idx) || ensureRow(d.idx);
+        let changed = false;
+        if (d.status) { row.status = String(d.status).toUpperCase(); changed = true; }
+        if (d.verify_state) { row.verify = d.verify_state; changed = true; }
+        if (typeof d.size_on_disk === 'number') { row.sizeOnDisk = d.size_on_disk; changed = true; }
+        if (d.error != null) { row.lastError = d.error; changed = true; }
+        if (changed) {
+            row.done = row.status === 'DONE';
+            if (row.done) { row.speedBps = null; row.attemptsLeft = null; }
+            row.isStalled = false;
+            row.lastProgressAt = Date.now();
+            patchV2Row(d.idx);
+            if (row.done) fetchBudget();
+        }
+    }
+    function applyPartState(d) {
+        if (d.idx == null || !d.state) return;
+        const row = rows.get(d.idx) || ensureRow(d.idx);
+        row.status = String(d.state).toUpperCase();
+        row.done = row.status === 'DONE';
+        patchV2Row(d.idx);
+    }
+    function applyJobStatus(d) {
+        if (headJob) {
+            if (d.status) headJob.status = d.status;
+            if (d.error != null) headJob.last_error = d.error;
+        }
+        renderV2Header();
+        if (d.status === 'COMPLETE' || d.status === 'FAILED' || d.status === 'BUDGET_EXHAUSTED') {
+            addActivity(d.status === 'COMPLETE' ? '\u2713' : '\u26a0',
+                'v2 job ' + d.status.toLowerCase(),
+                d.error || '', d.status === 'COMPLETE' ? 'act-ok' : 'act-warn');
+            ensureActivityVisible();
+        }
+    }
+    function applyAttemptSpent() {
+        if (budgetTimer) clearTimeout(budgetTimer);
+        budgetTimer = setTimeout(fetchBudget, 500);
+    }
+
+    // -- rendering ------------------------------------------------------------
+    function v2RowClass(row) {
+        if (row.done) return 'v2-done';
+        if (row.lastError || row.status === 'FAILED' || row.status === 'BUDGET_EXHAUSTED') return 'v2-err';
+        if (row.isStalled) return 'v2-stall';
+        if (row.status === 'ACTIVE' || row.status === 'PARTIAL' || row.status === 'VERIFYING') return 'v2-active';
+        return 'v2-pending';
+    }
+    function v2RowHtml(row) {
+        const pct = rowPct(row);
+        const bar = pct == null
+            ? '<span class="v2-bar-none">\u2014</span>'
+            : '<span class="v2-bar-track"><span class="v2-bar-fill" style="width:' +
+              pct.toFixed(1) + '%"></span></span>';
+        const disk = row.sizeExpected != null
+            ? fmtBytes(row.sizeOnDisk || 0) + '/' + fmtBytes(row.sizeExpected)
+            : (row.sizeOnDisk != null ? fmtBytes(row.sizeOnDisk) + '/?' : '\u2014');
+        const speed = row.done
+            ? '\u2014'
+            : (row.isStalled
+                ? '\u23F3 stalled ' + (row.stallSecs || 0) + 's'
+                : fmtSpeed(row.speedBps));
+        let err = '';
+        if (row.done) err = '\u2713';
+        else if (row.lastError) {
+            err = '\u2716 ' + esc(row.lastError);
+            if (row.attemptsLeft != null) err += ' \u00b7 ' + row.attemptsLeft + ' attempts left';
+        }
+        return '<div class="v2-row ' + v2RowClass(row) + '" data-idx="' + row.idx +
+            '" title="' + esc(row.filename || 'part ' + row.idx) + '">' +
+            '<span class="v2c-idx">' + String(row.idx).padStart(2, '0') + '</span>' +
+            '<span class="v2c-state">' + esc(rowState(row)) + '</span>' +
+            '<span class="v2c-bar">' + bar + '</span>' +
+            '<span class="v2c-pct">' + (pct == null ? '\u2014' : pct.toFixed(0) + '%') + '</span>' +
+            '<span class="v2c-disk">' + disk + '</span>' +
+            '<span class="v2c-speed">' + speed + '</span>' +
+            '<span class="v2c-err">' + err + '</span>' +
+            '</div>';
+    }
+    function renderV2Summary() {
+        const sum = $('v2PartsSummary');
+        if (!sum) return;
+        if (rows.size === 0) { sum.textContent = ''; return; }
+        let done = 0, errs = 0;
+        rows.forEach(function (r) { if (r.done) done++; if (r.lastError) errs++; });
+        sum.textContent = '(' + done + '/' + rows.size + ' done' +
+            (errs ? ', ' + errs + ' error' + (errs > 1 ? 's' : '') : '') + ')';
+    }
+    function renderV2Table() {
+        const wrap = $('v2PartsTable');
+        const body = $('v2PartsBody');
+        if (!wrap || !body) return;
+        const st = wrap.scrollTop;
+        const sorted = Array.from(rows.values()).sort(function (a, b) { return a.idx - b.idx; });
+        if (sorted.length === 0) {
+            body.innerHTML = '<div class="v2-more">no parts yet (discovering)\u2026</div>';
+        } else {
+            const shown = sorted.slice(0, MAX_ROWS);
+            body.innerHTML = shown.map(v2RowHtml).join('') +
+                (sorted.length > MAX_ROWS
+                    ? '<div class="v2-more">\u2026 (' + (sorted.length - MAX_ROWS) +
+                      ' more parts hidden)</div>'
+                    : '');
+        }
+        wrap.scrollTop = st;
+        renderV2Summary();
+    }
+    function patchV2Row(idx) {
+        const body = $('v2PartsBody');
+        const row = rows.get(idx);
+        if (!body || !row) return;
+        const el = body.querySelector('.v2-row[data-idx="' + idx + '"]');
+        if (el) {
+            el.outerHTML = v2RowHtml(row);
+        } else {
+            renderV2Table();   // new part appeared (or beyond cap) — rebuild
+        }
+        renderV2Summary();
+        renderV2Header();
+    }
+    function renderV2Header() {
+        const el = $('v2LiveHead');
+        const meta = $('v2LiveMeta');
+        const barFill = $('v2LiveBarFill');
+        if (!el || !meta) return;
+        if (!headJob) { el.textContent = ''; meta.textContent = ''; return; }
+        const label = headJob.label || headJob.archive_id || '?';
+        const ts = headJob.export_ts || 'unknown';
+        let doneCount = 0, bytesDone = 0, bytesTotal = 0, agg = 0;
+        rows.forEach(function (r) {
+            if (r.done) doneCount++;
+            if (r.sizeOnDisk != null) bytesDone += r.sizeOnDisk;
+            if (r.sizeExpected != null) bytesTotal += r.sizeExpected;
+            if (r.speedBps && r.speedBps > 0) agg += r.speedBps;
+        });
+        if (rows.size === 0 && totals.parts_total) {
+            doneCount = totals.parts_done || 0;
+            bytesDone = totals.bytes_done || 0;
+            bytesTotal = totals.bytes_total || 0;
+        }
+        const totalParts = rows.size || totals.parts_total || 0;
+        const pct = bytesTotal > 0 ? (bytesDone / bytesTotal) * 100 : 0;
+        const remaining = Math.max(0, bytesTotal - bytesDone);
+        const eta = agg > 0 && remaining > 0 ? fmtEta(remaining / agg) : '';
+        const st = headJob.status || '?';
+        const bits = [
+            doneCount + '/' + totalParts + ' done',
+            (bytesTotal > 0 ? pct.toFixed(1) : '?') + '%',
+            agg > 0 ? fmtSpeed(agg) + ' agg' : '0 B/s agg'
+        ];
+        if (eta) bits.push(eta);
+        if (partsAtRisk > 0) bits.push('budget \u26a0 ' + partsAtRisk);
+        el.textContent = 'takeout2 \u00b7 ' + label + ' / ' + ts;
+        meta.innerHTML = '<span class="pill ' + v2StatusClass(st) + '">' + esc(st) +
+            '</span> ' + bits.join(' \u00b7 ');
+        if (barFill) {
+            barFill.style.width = (bytesTotal > 0 ? Math.min(100, pct) : 0).toFixed(1) + '%';
+            barFill.style.background =
+                st === 'COMPLETE' ? '#22c55e' : (st === 'FAILED' ? '#ef4444' : '#a855f7');
+        }
+    }
+    function renderV2Conn() {
+        const el = $('v2LiveConn');
+        if (!el) return;
+        const age = lastEventAt
+            ? Math.max(0, Math.round((Date.now() - lastEventAt) / 1000)) : null;
+        el.textContent = connText +
+            (age != null ? ' \u00b7 last event ' + age + 's ago' : '');
+        el.style.color = CONN_COLORS[connCls] || '#94a3b8';
+    }
+    function renderSelector() {
+        const sel = $('v2JobSelect');
+        const wrap = $('v2JobSelector');
+        if (!sel || !wrap) return;
+        if (jobs.length <= 1) {
+            wrap.style.display = 'none';
+            return;
+        }
+        wrap.style.display = 'block';
+        sel.innerHTML = jobs.map(function (j) {
+            const label = j.label || j.archive_id || '?';
+            return '<option value="' + esc(j.archive_id) + '"' +
+                (j.archive_id === archiveId ? ' selected' : '') + '>' +
+                esc(label + ' \u00b7 ' + (j.status || '?') + ' \u00b7 ' +
+                    (j.parts_done || 0) + '/' + (j.parts_total || 0)) + '</option>';
+        }).join('');
+    }
+
+    // -- lifecycle ------------------------------------------------------------
+    function init() {
+        if (started) return;
+        started = true;
+        const sel = $('v2JobSelect');
+        if (sel) sel.addEventListener('change', function () { selectJob(sel.value); });
+        startListRefresh();
+        // Resolve manager config the SAME way refreshManager() does: ask the
+        // background for getState, read managerUrl + captureToken from it.
+        chrome.runtime.sendMessage({ action: 'getState' }, function (st) {
+            if (chrome.runtime.lastError || !st) {
+                showLiveSection(true);
+                setConn('extension state unavailable', 'err');
+                return;
+            }
+            cfg.mgrUrl = String(st.managerUrl || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+            cfg.token = st.captureToken || '';
+            // Wire the live-monitor link to the same resolved manager URL.
+            var mon = document.getElementById('openMonitorBtn');
+            if (mon) {
+                mon.addEventListener('click', function (ev) {
+                    ev.preventDefault();
+                    chrome.tabs.create({ url: cfg.mgrUrl + '/ui/monitor.html' });
+                });
+            }
+            loadJobList();
+        });
+    }
+    function loadJobList() {
+        fetchV2Json('/jobs?limit=50').then(function (data) {
+            retries = 0;
+            jobs = (data && data.jobs) || [];
+            if (jobs.length === 0) {
+                showLiveSection(true);
+                setConn('No v2 jobs yet \u2014 start a download.', 'dim');
+                renderSelector();
+                return;
+            }
+            if (archiveId && jobs.some(function (j) { return j.archive_id === archiveId; })) {
+                renderSelector();          // keep the current selection
+                return;
+            }
+            if (jobs.length === 1) {
+                selectJob(jobs[0].archive_id);            // auto-select the single job
+            } else {
+                // Multiple jobs: the <select> is shown; auto-select the first so
+                // the monitor is live immediately (the operator can switch).
+                renderSelector();
+                selectJob(jobs[0].archive_id);
+            }
+        }).catch(function (err) {
+            retries++;
+            showLiveSection(true);
+            setConn('v2 manager unreachable (' + err.message + ')' +
+                (retries < 12 ? ' \u2014 retrying\u2026' : ''), 'err');
+            if (retries < 12) scheduleRetry(loadJobList, 5000);
+            else stopStreaming();
+        });
+    }
+    function refreshList() {
+        fetchV2Json('/jobs?limit=50').then(function (data) {
+            jobs = (data && data.jobs) || [];
+            if (archiveId == null) {
+                if (jobs.length > 0) selectJob(jobs[0].archive_id);
+                else setConn('No v2 jobs yet \u2014 start a download.', 'dim');
+                return;
+            }
+            renderSelector();
+        }).catch(function () { /* manager down; keep current state */ });
+    }
+    function startListRefresh() {
+        if (listTimer) clearInterval(listTimer);
+        listTimer = setInterval(refreshList, 30000);
+    }
+    function selectJob(id) {
+        if (archiveId === id && mode !== 'idle') return;   // already watching it
+        stopStreaming();
+        archiveId = id;
+        lastSeq = 0;
+        lastEventAt = 0;
+        sseFails = 0;
+        partsAtRisk = 0;
+        rows = new Map();
+        totals = {};
+        headJob = null;
+        showLiveSection(true);
+        renderSelector();
+        setConn('loading\u2026', 'dim');
+        seedJob();
+        fetchBudget();
+    }
+    function stopStreaming() {
+        if (sse) { try { sse.close(); } catch (e) {} sse = null; }
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+        if (budgetTimer) { clearTimeout(budgetTimer); budgetTimer = null; }
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        mode = 'idle';
+    }
+    function seedJob() {
+        fetchV2Json('/jobs/' + encodeURIComponent(archiveId) + '?parts=1')
+            .then(function (snap) {
+                if (!snap || snap.archive_id !== archiveId) return;
+                headJob = snap;
+                totals = snap;
+                rows = new Map();
+                const now = Date.now();
+                (snap.parts || []).forEach(function (p) {
+                    const done = p.status === 'DONE';
+                    const inFlight = p.status === 'ACTIVE' || p.status === 'PARTIAL' ||
+                                     p.status === 'VERIFYING';
+                    rows.set(p.idx, {
+                        idx: p.idx,
+                        filename: p.filename || ('part ' + p.idx),
+                        status: p.status || 'PENDING',
+                        verify: p.verify_state || 'UNVERIFIED',
+                        sizeExpected: (p.size_expected != null && p.size_expected > 0)
+                            ? p.size_expected : null,
+                        sizeOnDisk: p.size_on_disk != null ? p.size_on_disk : null,
+                        attemptsUsed: p.attempts_used || 0,
+                        attemptsLeft: null,
+                        speedBps: null,
+                        lastError: p.last_error || null,
+                        lastProgressAt: (done || !inFlight) ? null : now,
+                        isStalled: false,
+                        stallSecs: 0,
+                        done: done
+                    });
+                });
+                renderV2Header();
+                renderV2Table();
+                connectV2SSE();
+            })
+            .catch(function (err) {
+                setConn('load failed: ' + err.message + ' \u2014 retrying\u2026', 'err');
+                scheduleRetry(seedJob, 3000);
+            });
+    }
+
+    // -- SSE + fallback --------------------------------------------------------
+    function connectV2SSE() {
+        if (!archiveId) return;
+        if (sse) { try { sse.close(); } catch (e) {} sse = null; }
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        mode = 'sse';
+        setConn('connecting\u2026', 'dim');
+        const url = v2Url('/jobs/' + encodeURIComponent(archiveId) +
+                          '/events?since=' + lastSeq);
+        let es;
+        try {
+            es = new EventSource(url);
+        } catch (e) {
+            sseFailed('EventSource error: ' + e.message);
+            return;
+        }
+        sse = es;
+        es.onopen = function () {
+            sseFails = 0;              // a live connection resets the failure count
+            lastEventAt = Date.now();
+            setConn('\u25CF live', 'ok');
+            startV2StallWatch();
+        };
+        ['part_progress', 'part_done', 'part_error', 'job_status',
+         'attempt_spent', 'part_update', 'part_state', 'heartbeat']
+            .forEach(function (kind) {
+                es.addEventListener(kind, function (e) { handleV2Event(e, kind); });
+            });
+        es.onmessage = function (e) { handleV2Event(e, null); };   // safety net
+        es.onerror = function () {
+            // EventSource would auto-reconnect to the STALE URL; close it and
+            // reconnect ourselves with a fresh ?since=<lastSeq> (lossless).
+            try { es.close(); } catch (e) {}
+            if (sse === es) sse = null;
+            sseFailed('stream dropped');
+        };
+    }
+    function sseFailed(reason) {
+        if (mode === 'polling') return;
+        mode = 'idle';
+        sseFails++;
+        lastEventAt = 0;
+        setConn('stream error (' + reason + ') \u2014 reconnect ' + sseFails + '/2', 'warn');
+        if (sseFails >= SSE_MAX_FAILS) {
+            startPollFallback();
+            return;
+        }
+        scheduleRetry(function () { connectV2SSE(); }, 2000);
+    }
+    function startPollFallback() {
+        mode = 'polling';
+        sseFails = 0;
+        setConn('\u25CD polling every 2s', 'warn');
+        pollOnce();
+        pollTimer = setInterval(pollOnce, 2000);
+        startV2StallWatch();
+    }
+    function pollOnce() {
+        if (!archiveId || mode !== 'polling') return;
+        fetchV2Json('/jobs/' + encodeURIComponent(archiveId) + '?parts=1')
+            .then(function (snap) {
+                if (!snap || snap.archive_id !== archiveId) return;
+                lastEventAt = Date.now();
+                totals = snap;
+                headJob = snap;
+                mergeSnapshot(snap);
+                renderV2Header();
+                renderV2Table();
+                renderV2Conn();
+            })
+            .catch(function (err) {
+                setConn('poll failed: ' + err.message, 'err');
+            });
+    }
+    function fetchBudget() {
+        if (!archiveId) return;
+        fetchV2Json('/jobs/' + encodeURIComponent(archiveId) + '/budget')
+            .then(function (b) {
+                if (b && typeof b.parts_at_risk === 'number') {
+                    partsAtRisk = b.parts_at_risk;
+                    renderV2Header();
+                }
+            })
+            .catch(function () { /* budget is best-effort */ });
+    }
+
+    // -- stall detection -------------------------------------------------------
+    function startV2StallWatch() {
+        if (stallTimer) clearInterval(stallTimer);
+        stallTimer = setInterval(v2StallTick, 2000);
+    }
+    function v2StallTick() {
+        const now = Date.now();
+        // Global: SSE open but no event of any kind for 60 s -> stale, reconnect.
+        if (mode === 'sse' && sse && lastEventAt && (now - lastEventAt) > GLOBAL_STALL_MS) {
+            setConn('\u26a0 stale \u2014 reconnect', 'warn');
+            try { sse.close(); } catch (e) {}
+            sse = null;
+            sseFailed('stale (no event for 60s)');
+            return;
+        }
+        const jobPaused = headJob && ['PAUSED', 'NEEDS_COOKIE', 'COMPLETE', 'FAILED',
+                                      'BUDGET_EXHAUSTED'].indexOf(headJob.status) >= 0;
+        const body = $('v2PartsBody');
+        rows.forEach(function (row) {
+            const was = row.isStalled;
+            if (jobPaused || !row.lastProgressAt || isTerminal(row)) {
+                row.isStalled = false;
+                if (was && body) {
+                    const el = body.querySelector('.v2-row[data-idx="' + row.idx + '"]');
+                    if (el) { el.classList.remove('v2-stall'); patchV2Row(row.idx); }
+                }
+                return;
+            }
+            const age = now - row.lastProgressAt;
+            row.isStalled = age > PART_STALL_MS;
+            row.stallSecs = Math.floor(age / 1000);
+            if (!body) return;
+            const el = body.querySelector('.v2-row[data-idx="' + row.idx + '"]');
+            if (!el) return;
+            if (row.isStalled) {
+                const sp = el.querySelector('.v2c-speed');
+                if (sp) sp.textContent = '\u23F3 stalled ' + row.stallSecs + 's';
+                if (!was) el.classList.add('v2-stall');
+            } else if (was) {
+                el.classList.remove('v2-stall');
+                patchV2Row(row.idx);
+            }
+        });
+        renderV2Conn();   // keep the "last event Ns ago" ticking
+    }
+
+    return { init: init };
+})();
+
+document.addEventListener('DOMContentLoaded', function () {
+    v2LiveMonitor.init();
+});

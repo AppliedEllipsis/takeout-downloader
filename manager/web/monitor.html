@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Takeout Monitor</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1f232c;
+    --fg: #e6e8eb; --dim: #8b929e; --accent: #4f8cff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --border: #2a2f3a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--border); }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 12px; margin: 0 0 10px; color: var(--dim); text-transform: uppercase;
+       letter-spacing: .06em; }
+  .dim { color: var(--dim); }
+  .spacer { flex: 1; }
+
+  /* --- connection indicator ------------------------------------------------- */
+  .conn { display: inline-flex; align-items: center; gap: 7px; font-size: 12px;
+          padding: 4px 12px; border-radius: 12px; background: var(--panel2); white-space: nowrap; }
+  .conn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+  .conn.live .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .conn.warn .dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  .conn.dead .dot { background: var(--err); box-shadow: 0 0 6px var(--err); }
+  .conn.poll { opacity: .85; }
+
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px 20px;
+         align-items: start; }
+
+  /* --- job list sidebar ----------------------------------------------------- */
+  .jobs-list { display: flex; flex-direction: column; gap: 8px; }
+  .job-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+              padding: 10px 12px; cursor: pointer; transition: border-color .15s; }
+  .job-card:hover { border-color: var(--accent); }
+  .job-card.active { border-color: var(--accent); }
+  .job-card .jc-top { display: flex; justify-content: space-between; gap: 8px; }
+  .job-card .jc-name { font-weight: 600; word-break: break-all; }
+  .job-card .jc-ts { font-size: 11px; color: var(--dim); margin-top: 2px; word-break: break-all; }
+  .job-card .jc-sub { font-size: 12px; color: var(--dim); margin-top: 4px; }
+
+  .badge { padding: 2px 9px; border-radius: 10px; font-size: 12px; background: var(--panel2);
+           text-transform: capitalize; white-space: nowrap; }
+  .badge.downloading { color: var(--accent); }
+  .badge.verifying { color: var(--accent); }
+  .badge.complete { color: var(--ok); }
+  .badge.needs_cookie { color: var(--warn); }
+  .badge.budget_exhausted { color: var(--err); }
+  .badge.failed { color: var(--err); }
+  .badge.paused, .badge.discovering, .badge.ready { color: var(--dim); }
+
+  /* --- detail panel --------------------------------------------------------- */
+  #detail-panel { background: var(--panel); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 16px; min-width: 0; }
+  .detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+                 flex-wrap: wrap; }
+  .detail-head .dh-title { font-size: 16px; font-weight: 600; word-break: break-all; }
+  .detail-head .dh-ts { font-size: 12px; color: var(--dim); word-break: break-all; }
+  .detail-head .dh-badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  .banner { padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-size: 13px; }
+  .banner.warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
+  .banner.err { background: rgba(248,81,73,.12); border: 1px solid var(--err); color: var(--err); }
+
+  /* header stats line (parts · bytes · speed · eta) */
+  .stats { display: flex; gap: 20px; flex-wrap: wrap; margin: 8px 0 6px; font-size: 13px; }
+  .stats b { color: var(--fg); }
+
+  /* aggregate bytes bar */
+  .progress-big { height: 10px; background: var(--panel2); border-radius: 6px;
+                  overflow: hidden; margin-bottom: 8px; }
+  .progress-big .bar { height: 100%; width: 0; background: var(--accent);
+                       transition: width .3s; }
+
+  /* budget line — must be impossible to miss */
+  .budget-line { font-size: 13px; margin-top: 8px; padding: 6px 10px; border-radius: 6px;
+                 background: var(--panel2); }
+  .budget-line .at-risk { color: var(--warn); font-weight: 700; }
+  .budget-line .exhausted { color: var(--err); font-weight: 700; }
+  .budget-line.ok { color: var(--dim); }
+
+  /* per-part table */
+  table.parts { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  table.parts th, table.parts td { text-align: left; padding: 5px 8px;
+                                   border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.parts th { color: var(--dim); font-weight: 500; position: sticky; top: 0;
+                   background: var(--panel); }
+  .minibar { height: 6px; width: 110px; background: var(--panel2); border-radius: 4px;
+             overflow: hidden; }
+  .minibar > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  .pct { width: 44px; text-align: right !important; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .err-cell { color: var(--err); }
+  .ok-cell { color: var(--ok); }
+  tr.row-error td { background: rgba(248,81,73,.06); }
+  tr.row-error td:first-child { border-left: 3px solid var(--err); }
+  tr.row-exhausted td { background: rgba(248,81,73,.14); }
+  tr.row-exhausted td:first-child { border-left: 3px solid var(--err); }
+  tr.row-risk td { background: rgba(210,153,34,.08); }
+  tr.row-risk td:first-child { border-left: 3px solid var(--warn); }
+  tr.row-done td { opacity: .72; }
+  td.idx { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .st-done { color: var(--ok); }
+  .st-active { color: var(--accent); }
+  .st-partial { color: var(--warn); }
+  .st-error, .st-exhausted { color: var(--err); font-weight: 600; }
+  .st-pending, .st-skipped { color: var(--dim); }
+
+  .more-row td { padding: 4px 8px; }
+  .btn { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+         border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
+  .btn:hover { border-color: var(--accent); }
+
+  .status-note { font-size: 12px; color: var(--dim); margin-top: 10px; }
+  .status-note b { color: var(--fg); }
+
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Takeout Monitor</h1>
+  <span class="dim" id="mode-label">v2 · SSE</span>
+  <div class="spacer"></div>
+  <span id="conn" class="conn"><span class="dot"></span><span id="conn-text">connecting…</span></span>
+</header>
+
+<main>
+  <!-- Job list -->
+  <section>
+    <h2>Jobs</h2>
+    <div id="jobs-list" class="jobs-list">
+      <p class="dim" id="no-jobs">No jobs yet. Capture a Takeout export to start one.</p>
+    </div>
+  </section>
+
+  <!-- Selected job detail -->
+  <section id="detail-panel">
+    <p class="dim" id="empty-detail">Select a job to monitor it live.</p>
+    <div id="detail" hidden>
+      <div class="detail-head">
+        <span class="dh-title" id="d-label">—</span>
+        <span class="dh-ts" id="d-export">—</span>
+        <div class="dh-badges">
+          <span class="badge" id="d-status">—</span>
+        </div>
+      </div>
+      <div id="d-banner"></div>
+
+      <div class="stats" id="d-stats"></div>
+      <div class="progress-big"><div id="d-bar" class="bar"></div></div>
+      <div class="budget-line ok" id="d-budget">budget: —</div>
+
+      <table class="parts">
+        <thead>
+          <tr>
+            <th>idx</th><th>state</th><th>progress</th><th class="pct">%</th>
+            <th>on-disk / total</th><th>speed</th><th>error</th>
+          </tr>
+        </thead>
+        <tbody id="parts-body"></tbody>
+      </table>
+      <div id="more-row-wrap"></div>
+      <p class="status-note" id="d-note"></p>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+/* Takeout v2 live monitor — single self-contained page, vanilla JS.
+   Consumes the same SSE event stream as the extension popup + CLI watch
+   (docs/v2/06-LIVE-MONITORING.md). Lossless by construction: every
+   reconnect resumes with ?since=<last_seq>. If SSE fails twice, falls back
+   to polling the job snapshot every 2 s. */
+const $ = (sel, root = document) => root.querySelector(sel);
+
+const STALL_S = 90;            // TK2_STALL_S — no progress for this long => stalled
+const MAX_ROWS = 50;           // cap for the collapsed (non-expanded) table
+const EWMA_ALPHA = 0.3;        // per-part speed EWMA
+const JOBLIST_INTERVAL = 5000; // sidebar refresh (also the empty-state poll)
+const POLL_INTERVAL = 2000;    // fallback snapshot poll
+const BUDGET_INTERVAL = 30000; // refresh the budget view
+
+/* ---------- formatting helpers ----------------------------------------- */
+const fmtBytes = (n) => {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 1 : 0) + " " + u[i];
+};
+const fmtSpeed = (bps) => (bps ? fmtBytes(bps) + "/s" : "—");
+const pct = (done, total) => (total > 0 ? Math.min(100, (done / total) * 100) : 0);
+const fmtDur = (sec) => {
+  if (!isFinite(sec) || sec <= 0) return "—";
+  if (sec < 60) return "~" + Math.round(sec) + "s";
+  const m = Math.floor(sec / 60);
+  if (m < 60) return "~" + m + " min";
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h >= 48) return "~" + (h / 24).toFixed(1) + " d";
+  return "~" + h + " h " + mm + " m";
+};
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+/* ReasonCode -> human message (docs/v2/03-UX-AND-OBSERVABILITY.md §6) */
+const REASON_MSG = {
+  OK_COMPLETE:   "complete",
+  OK_PARTIAL:    "resumed",
+  AUTH_REDIRECT: "cookie expired — recapturing",
+  AUTH_401:      "session rejected (401)",
+  LIMIT_EXCEEDED: "⚠ download limit hit",
+  NOT_FOUND:     "part index past end",
+  END_OF_RANGE:  "reached end of archive",
+  RATE_LIMITED:  "Google throttled us",
+  NETWORK_ERROR: "connection reset",
+  DISK_ERROR:    "local disk full!",
+  ABORTED:       "cancelled by operator",
+};
+const reasonMsg = (code) => REASON_MSG[code] || code || "";
+
+const parseTs = (ts) => {
+  if (ts == null) return Date.now();
+  let ms = Date.parse(ts);
+  if (!isFinite(ms)) {
+    const f = parseFloat(ts);           // heartbeat ts is epoch seconds
+    ms = isFinite(f) ? f * 1000 : NaN;
+  }
+  return isFinite(ms) ? ms : Date.now();
+};
+
+/* ---------- state -------------------------------------------------------- */
+let jobs = [];                 // sidebar list
+let selected = null;           // selected archive_id
+let rows = new Map();          // idx -> part row
+let budgetMap = new Map();     // idx -> {at_risk, remaining, effective_used}
+let budget = { at_risk: 0, exhausted: 0, last_attempt: 0 };
+let jobSnap = null;            // last snapshot: totals/status/label/last_error
+let lastSeq = 0;               // SSE resume cursor
+let lastEventAt = Date.now();  // last event of any kind (for the conn dot)
+let partSpeed = new Map();     // idx -> EWMA bps
+let prevPollBytes = new Map(); // idx -> bytes at last poll (for delta speed)
+let lastPollAt = 0;
+let sseFails = 0;
+let inPollMode = false;
+let moreExpanded = false;
+let dirty = false, rafPending = false;
+
+const terminalJobs = new Set(["COMPLETE", "FAILED", "BUDGET_EXHAUSTED"]);
+
+/* ---------- network ------------------------------------------------------ */
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(r.status + " " + (await r.text()).slice(0, 200));
+  return r.json();
+}
+
+async function loadJobs() {
+  try {
+    const data = await api("/api/v2/jobs?limit=500");
+    jobs = data.jobs || [];
+  } catch { /* manager down — keep showing what we have */ }
+  renderJobList();
+}
+
+async function selectJob(id) {
+  if (id === selected) return;
+  selected = id;
+  stopStreams();
+  resetJobView();
+  renderJobList();
+  try {
+    const snap = await api("/api/v2/jobs/" + encodeURIComponent(id) + "?parts=1");
+    jobSnap = snap;
+    seedRows(snap);
+    scheduleRender();
+  } catch (e) {
+    showBanner("err", "Failed to load job: " + esc(e.message));
+  }
+  fetchBudget(id);
+  refreshSelectedFromSnapshot();          // header + stats from snapshot
+  lastSeq = 0;
+  moreExpanded = false;
+  inPollMode = false;
+  sseFails = 0;
+  connectSSE();
+}
+
+async function fetchBudget(id) {
+  try {
+    const b = await api("/api/v2/jobs/" + encodeURIComponent(id) + "/budget");
+    budgetMap.clear();
+    let last = 0;
+    for (const p of b.parts || []) {
+      budgetMap.set(p.idx, p);
+      if (p.at_risk && p.remaining === 1) last++;
+    }
+    budget = {
+      at_risk: b.parts_at_risk || 0,
+      exhausted: 0,
+      last_attempt: last,
+    };
+    scheduleRender();
+  } catch { /* non-fatal */ }
+}
+
+/* ---------- SSE ----------------------------------------------------------- */
+let es = null, pollTimer = null, budgetTimer = null;
+
+function stopStreams() {
+  if (es) { es.close(); es = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  // budgetTimer is a job-independent global interval (guarded by `selected`),
+  // set once at boot — do NOT clear it here.
+  inPollMode = false;
+}
+
+function connectSSE() {
+  if (!selected) return;
+  stopStreams();
+  inPollMode = false;
+  setMode("SSE");
+  const url = "/api/v2/jobs/" + encodeURIComponent(selected)
+            + "/events?since=" + lastSeq;
+  es = new EventSource(url);
+  es.onopen = () => { sseFails = 0; markEvent(); scheduleRender(); };
+  es.onerror = () => {
+    if (es) { es.close(); es = null; }
+    sseFails++;
+    if (sseFails >= 2) { startPolling(); return; }
+    setConn("warn", "reconnecting…");
+    setTimeout(connectSSE, 1200);          // resume with lastSeq => lossless
+  };
+  const kinds = ["part_progress", "part_done", "part_error", "job_status",
+                 "heartbeat", "attempt_spent", "needs_cookie",
+                 "budget_warning", "error"];
+  for (const k of kinds) es.addEventListener(k, onSseEvent);
+  es.onmessage = onSseEvent;               // safety net for unnamed frames
+}
+
+function onSseEvent(e) {
+  if (!selected) return;
+  let env;
+  try { env = JSON.parse(e.data); } catch { return; }
+  if (env.archive_id && env.archive_id !== selected) return;
+  const seq = Number(env.seq);
+  if (isFinite(seq) && seq > lastSeq) lastSeq = seq;
+  applyEvent(env.kind, env.data || {}, env.ts);
+  markEvent();
+  scheduleRender();
+}
+
+function applyEvent(kind, d, ts) {
+  if (kind === "part_progress") {
+    let r = row(d.idx);
+    if (typeof d.size_on_disk === "number") r.size_on_disk = d.size_on_disk;
+    if (d.size_expected != null) r.size_expected = d.size_expected;
+    if (d.state) r.state = d.state;
+    if (d.verify) r.verify = d.verify;
+    r.error = null; r.outcome = null;
+    if (typeof d.speed_bps === "number") {
+      const prev = partSpeed.get(d.idx) || 0;
+      partSpeed.set(d.idx, prev === 0 ? d.speed_bps
+                                     : EWMA_ALPHA * d.speed_bps + (1 - EWMA_ALPHA) * prev);
+    }
+    // ts lives on the SSE envelope, not inside the event payload. It drives
+    // the per-part stall clock: replayed events carry their original ts, so
+    // stall math stays correct even while the stream catches up on connect.
+    if (ts != null) r.lastProgressAtMs = parseTs(ts);
+  } else if (kind === "part_done") {
+    const r = row(d.idx);
+    r.state = "DONE";
+    if (d.size_on_disk != null) r.size_on_disk = d.size_on_disk;
+    if (d.size_expected != null) r.size_expected = d.size_expected;
+    if (d.verify) r.verify = d.verify;
+    r.error = null; r.outcome = null;
+    partSpeed.delete(d.idx);
+  } else if (kind === "part_error") {
+    const r = row(d.idx);
+    r.state = d.state || "PARTIAL";
+    r.error = d.error || d.outcome || "error";
+    r.outcome = d.outcome || null;
+    r.attempts_left = typeof d.attempts_left === "number" ? d.attempts_left : null;
+    r.lastProgressAtMs = null;             // don't ALSO flag it stalled
+    partSpeed.delete(d.idx);
+  } else if (kind === "attempt_spent") {   // ledger audit trail
+    const r = row(d.idx);
+    if (typeof d.attempts === "number") r.attempts_used = d.attempts;
+    if (d.outcome) r.last_error = d.outcome;
+  } else if (kind === "job_status") {
+    if (jobSnap && d.status) jobSnap.status = d.status;
+    if (jobSnap && d.error) jobSnap.last_error = d.error;
+  } else if (kind === "needs_cookie") {
+    showBanner("warn", "🔑 Cookie expired — job is parked, waiting for a fresh capture.");
+  } else if (kind === "budget_warning") {
+    const idx = d.idx;
+    showBanner("warn", "⚠ budget_warning — part " + (idx != null ? idx : "?")
+                + " is on its last attempt.");
+    fetchBudget(selected);                 // refresh the money view
+  } else if (kind === "error") {
+    showBanner("err", esc(d.message || d.error || "engine error"));
+  }
+  // heartbeat and unknown kinds: nothing to apply (heartbeat resets the stall
+  // clock via markEvent(); lastSeq advances for lossless reconnect).
+}
+
+/* ---------- polling fallback (SSE failed twice) --------------------------- */
+function startPolling() {
+  if (!selected || inPollMode) return;
+  inPollMode = true;
+  if (es) { es.close(); es = null; }
+  setMode("POLL");
+  pollTimer = setInterval(pollJob, POLL_INTERVAL);
+  pollJob();
+}
+
+async function pollJob() {
+  if (!selected) return;
+  try {
+    const snap = await api("/api/v2/jobs/" + encodeURIComponent(selected) + "?parts=1");
+    jobSnap = snap;
+    const now = Date.now();
+    const dt = lastPollAt ? (now - lastPollAt) / 1000 : 0;
+    lastPollAt = now;
+    for (const p of snap.parts || []) {
+      const r = row(p.idx);
+      r.state = p.status || r.state;
+      if (p.verify_state) r.verify = p.verify_state;
+      if (p.size_expected != null) r.size_expected = p.size_expected;
+      if (p.attempts_used != null) r.attempts_used = p.attempts_used;
+      if (p.last_error) { r.error = p.last_error; r.lastProgressAtMs = null; }
+      if (typeof p.size_on_disk === "number") {
+        const prev = prevPollBytes.get(p.idx);
+        if (dt > 0 && prev != null && p.size_on_disk > prev && dt < 30) {
+          const inst = (p.size_on_disk - prev) / dt;
+          const old = partSpeed.get(p.idx) || 0;
+          partSpeed.set(p.idx, old === 0 ? inst : EWMA_ALPHA * inst + (1 - EWMA_ALPHA) * old);
+          r.lastProgressAtMs = now;
+        }
+        r.size_on_disk = p.size_on_disk;
+      }
+      prevPollBytes.set(p.idx, p.size_on_disk || 0);
+    }
+    markEvent();
+    scheduleRender();
+  } catch { /* transient — try again next tick */ }
+}
+
+/* ---------- row model ------------------------------------------------------ */
+function row(idx) {
+  let r = rows.get(idx);
+  if (!r) {
+    r = { idx, filename: "part " + idx, state: "PENDING", verify: null,
+          size_on_disk: 0, size_expected: null, error: null, outcome: null,
+          attempts_used: 0, attempts_left: null, lastProgressAtMs: null };
+    rows.set(idx, r);
+  }
+  return r;
+}
+
+function seedRows(snap) {
+  rows.clear();
+  partSpeed.clear();
+  prevPollBytes.clear();
+  const parts = snap.parts || [];
+  for (const p of parts) {
+    const r = row(p.idx);
+    r.filename = p.filename || "part " + p.idx;
+    r.state = p.status || "PENDING";
+    r.verify = p.verify_state || null;
+    r.size_on_disk = p.size_on_disk || 0;
+    r.size_expected = p.size_expected != null ? p.size_expected : null;
+    r.attempts_used = p.attempts_used || 0;
+    if (p.last_error) r.error = p.last_error;
+    // Parts already moving: seed the stall clock so we never falsely flag
+    // them as stalled right after page load.
+    if (p.status === "ACTIVE" || p.status === "PARTIAL") {
+      r.lastProgressAtMs = Date.now();
+    }
+  }
+  // Fill rows for expected-but-unseen parts so the operator sees the full span.
+  const total = snap.parts_total || parts.length;
+  if (total > parts.length) {
+    for (let i = parts.length; i < total; i++) row(i);
+  }
+}
+
+function resetJobView() {
+  rows.clear();
+  partSpeed.clear();
+  prevPollBytes.clear();
+  budgetMap.clear();
+  budget = { at_risk: 0, exhausted: 0, last_attempt: 0 };
+  jobSnap = null;
+  lastSeq = 0;
+  moreExpanded = false;
+  $("#d-banner").innerHTML = "";
+  $("#parts-body").innerHTML = "";
+  $("#more-row-wrap").innerHTML = "";
+  $("#empty-detail").hidden = true;
+  $("#detail").hidden = false;
+}
+
+function showBanner(kind, html) {
+  const b = $("#d-banner");
+  b.innerHTML = '<div class="banner ' + kind + '">' + html + "</div>";
+}
+
+/* ---------- rendering ------------------------------------------------------ */
+function scheduleRender() {
+  dirty = true;
+  if (!rafPending) {
+    rafPending = true;
+    requestAnimationFrame(() => { rafPending = false; if (dirty) { dirty = false; render(); } });
+  }
+}
+
+function setMode(label) { $("#mode-label").textContent = "v2 · " + label; }
+function markEvent() { lastEventAt = Date.now(); }
+
+function updateConn() {
+  const el = $("#conn"), txt = $("#conn-text");
+  const age = Math.floor((Date.now() - lastEventAt) / 1000);
+  if (inPollMode) {
+    el.className = "conn poll " + (age > 60 ? "dead" : age > 20 ? "warn" : "live");
+    txt.textContent = "polling · " + age + "s ago";
+  } else if (age > 60) {
+    el.className = "conn dead";
+    txt.textContent = "stalled? · " + age + "s since last event";
+  } else if (age > 20) {
+    el.className = "conn warn";
+    txt.textContent = "⚠ " + age + "s since last event";
+  } else {
+    el.className = "conn live";
+    txt.textContent = "live · " + age + "s ago";
+  }
+}
+
+function renderJobList() {
+  const list = $("#jobs-list");
+  const no = $("#no-jobs");
+  if (!jobs.length) {
+    no.hidden = false;
+    list.querySelectorAll(".job-card").forEach((c) => c.remove());
+    return;
+  }
+  no.hidden = true;
+  const existing = new Map();
+  list.querySelectorAll(".job-card").forEach((c) => existing.set(c.dataset.id, c));
+  for (const j of jobs) {
+    let card = existing.get(j.archive_id);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "job-card";
+      card.dataset.id = j.archive_id;
+      card.onclick = () => selectJob(j.archive_id);
+      list.appendChild(card);
+    } else existing.delete(j.archive_id);
+    card.classList.toggle("active", j.archive_id === selected);
+    card.innerHTML =
+      '<div class="jc-top"><span class="jc-name">' + esc(j.label || j.archive_id) +
+      '</span><span class="badge ' + esc(j.status || "").toLowerCase() + '">' +
+      esc(j.status || "?") + "</span></div>" +
+      '<div class="jc-ts">' + esc(j.export_ts || "") + " · " + esc(j.archive_id) + "</div>" +
+      '<div class="jc-sub">' + (j.parts_done || 0) + "/" + (j.parts_total || 0) +
+      " parts · " + fmtBytes(j.bytes_done) + " / " + fmtBytes(j.bytes_total) + "</div>";
+  }
+  existing.forEach((card) => card.remove());
+  if (!selected && jobs.length) selectJob(jobs[0].archive_id);
+}
+
+function refreshSelectedFromSnapshot() {
+  if (!jobSnap) return;
+  const t = jobSnap;
+  $("#d-label").textContent = t.label || t.archive_id;
+  $("#d-export").textContent = t.export_ts || "";
+  const st = $("#d-status");
+  st.textContent = (t.status || "?").replace(/_/g, " ").toLowerCase();
+  st.className = "badge " + esc(t.status || "").toLowerCase();
+  const ban = $("#d-banner");
+  if (t.status === "NEEDS_COOKIE" && !ban.children.length) {
+    showBanner("warn", "🔑 Cookie expired — waiting for a fresh capture from the browser.");
+  } else if (t.status !== "NEEDS_COOKIE" && ban.textContent.startsWith("🔑")) {
+    ban.innerHTML = "";   // cookie re-captured (or job moved on)
+  } else if (t.last_error && !ban.children.length) {
+    showBanner("err", esc(t.last_error));
+  }
+}
+
+function renderStats(t) {
+  const agg = aggregateSpeed();
+  const remaining = Math.max(0, (t.bytes_total || 0) - (t.bytes_done || 0));
+  const eta = agg > 0 ? remaining / agg : NaN;
+  const done = t.parts_done || 0, total = t.parts_total || 0;
+  $("#d-stats").innerHTML =
+    "<span><b>" + done + "</b>/" + total + " parts done</span>" +
+    '<span><b>' + fmtBytes(t.bytes_done) + "</b> / " + fmtBytes(t.bytes_total) + "</span>" +
+    "<span>speed <b>" + fmtSpeed(agg) + "</b> agg</span>" +
+    "<span>eta <b>" + fmtDur(eta) + "</b></span>";
+  $("#d-bar").style.width = pct(t.bytes_done, t.bytes_total) + "%";
+}
+
+function renderBudget() {
+  const el = $("#d-budget");
+  // exhausted comes from job_totals (BUDGET_EXHAUSTED count); the budget
+  // endpoint only reports parts_at_risk + per-part remaining.
+  const x = jobSnap && typeof jobSnap.parts_exhausted === "number"
+          ? jobSnap.parts_exhausted : 0;
+  const n = budget.at_risk, last = budget.last_attempt;
+  let parts = [];
+  if (n > 0) parts.push('<span class="at-risk">⚠ ' + n + " part" + (n === 1 ? "" : "s") +
+                        " at risk" + (last > 0 ? " (" + last + " on last attempt)" : "") + "</span>");
+  if (x > 0) parts.push('<span class="exhausted">' + x + " exhausted</span>");
+  if (parts.length) {
+    el.className = "budget-line";
+    el.innerHTML = "budget: " + parts.join(" · ");
+  } else {
+    el.className = "budget-line ok";
+    el.innerHTML = "budget: ✓ " + n + " at risk · " + x + " exhausted";
+  }
+}
+
+function aggregateSpeed() {
+  let sum = 0;
+  for (const [idx, spd] of partSpeed) {
+    const r = rows.get(idx);
+    if (!r || r.state === "DONE" || r.state === "FAILED" || r.state === "BUDGET_EXHAUSTED") continue;
+    sum += spd;
+  }
+  return sum;
+}
+
+function stalledFor(r, now) {
+  if (!r.lastProgressAtMs) return null;
+  if (r.state !== "ACTIVE" && r.state !== "PARTIAL") return null;
+  const sec = (now - r.lastProgressAtMs) / 1000;
+  return sec >= STALL_S ? Math.floor(sec) : null;
+}
+
+const interesting = (r, now) =>
+  r.state === "ACTIVE" || r.state === "PARTIAL" || r.state === "FAILED" ||
+  r.state === "BUDGET_EXHAUSTED" || r.error || stalledFor(r, now) != null ||
+  (budgetMap.get(r.idx) || {}).at_risk;
+
+function visibleRows(now) {
+  const sorted = [...rows.values()].sort((a, b) => a.idx - b.idx);
+  if (moreExpanded || sorted.length <= MAX_ROWS) return { visible: sorted, more: 0 };
+  const ints = sorted.filter((r) => interesting(r, now)).slice(0, MAX_ROWS);
+  let vis = ints;
+  if (vis.length < MAX_ROWS) {
+    const have = new Set(vis.map((r) => r.idx));
+    vis = vis.slice();
+    for (const r of sorted) {
+      if (have.has(r.idx)) continue;
+      vis.push(r);
+      if (vis.length >= MAX_ROWS) break;
+    }
+  }
+  return { visible: vis, more: sorted.length - vis.length };
+}
+
+function rowHtml(r, now) {
+  const exp = r.size_expected;
+  const p = pct(r.size_on_disk, exp);
+  const stalled = stalledFor(r, now);
+  const risk = (budgetMap.get(r.idx) || {}).at_risk;
+
+  let cls = "row-";
+  if (r.state === "DONE") cls = "row-done";
+  else if (r.state === "BUDGET_EXHAUSTED") cls = "row-exhausted";
+  else if (r.error || r.state === "FAILED") cls = "row-error";
+  else if (risk) cls = "row-risk";
+
+  let stateCell;
+  if (r.state === "DONE") stateCell = '<span class="st-done">✓ DONE</span>';
+  else if (r.state === "BUDGET_EXHAUSTED") stateCell = '<span class="st-exhausted">✖ BUDGET_EXHAUSTED</span>';
+  else if (r.state === "FAILED") stateCell = '<span class="st-error">✖ FAILED</span>';
+  else if (r.error) stateCell = '<span class="st-error">✖ ' + esc(r.state) + "</span>";
+  else if (stalled) stateCell = '<span class="st-partial">⏳ stalled ' + stalled + "s</span>";
+  else if (r.state === "ACTIVE") stateCell = '<span class="st-active">ACTIVE</span>';
+  else if (r.state === "PARTIAL") stateCell = '<span class="st-partial">PARTIAL</span>';
+  else stateCell = '<span class="st-pending">' + esc(r.state) + "</span>";
+
+  const diskCell = fmtBytes(r.size_on_disk) + " / " +
+    (exp != null ? fmtBytes(exp) : "—");
+  const speedCell = (r.state === "DONE") ? "—" : fmtSpeed(partSpeed.get(r.idx) || 0);
+
+  let errCell = "—";
+  if (r.state === "BUDGET_EXHAUSTED") {
+    errCell = '<span class="err-cell">✖ budget exhausted</span>';
+  } else if (r.error) {
+    let msg = reasonMsg(r.error);
+    if (!msg && r.outcome) msg = reasonMsg(r.outcome);
+    if (!msg) msg = r.error;
+    const left = typeof r.attempts_left === "number" ? " · " + r.attempts_left + " attempts left" : "";
+    errCell = '<span class="err-cell">✖ ' + esc(msg) + left + "</span>";
+  } else if (risk) {
+    const b = budgetMap.get(r.idx);
+    errCell = '<span class="err-cell">⚠ ' + b.remaining + " attempt" + (b.remaining === 1 ? "" : "s") + " left</span>";
+  }
+
+  return '<tr class="' + cls + '">' +
+    '<td class="idx">' + r.idx + "</td>" +
+    "<td>" + stateCell + "</td>" +
+    '<td><div class="minibar"><div style="width:' + p.toFixed(1) + '%"></div></div></td>' +
+    '<td class="pct">' + (exp != null ? p.toFixed(0) + "%" : "—") + "</td>" +
+    "<td>" + diskCell + "</td>" +
+    "<td>" + speedCell + "</td>" +
+    "<td>" + errCell + "</td>" +
+    "</tr>";
+}
+
+function render() {
+  if (!selected) return;
+  if (jobSnap) { refreshSelectedFromSnapshot(); renderStats(jobSnap); }
+  renderBudget();
+  updateConn();
+
+  const now = Date.now();
+  const { visible, more } = visibleRows(now);
+  const body = $("#parts-body");
+  body.innerHTML = visible.map((r) => rowHtml(r, now)).join("");
+  $("#more-row-wrap").innerHTML = "";
+  if (more > 0) {
+    const w = $("#more-row-wrap");
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = moreExpanded ? "collapse" : "(" + more + " more parts — show all)";
+    btn.onclick = () => { moreExpanded = !moreExpanded; scheduleRender(); };
+    w.appendChild(btn);
+  }
+
+  const note = $("#d-note");
+  const t = jobSnap || {};
+  const cnts = [];
+  if (t.parts_done) cnts.push(t.parts_done + " done");
+  if (t.parts_active) cnts.push(t.parts_active + " active");
+  if (t.parts_partial) cnts.push(t.parts_partial + " partial");
+  if (t.parts_exhausted) cnts.push('<span class="err-cell">' + t.parts_exhausted + " exhausted</span>");
+  const pending = (t.parts_total || 0) - (t.parts_done || 0) - (t.parts_active || 0) -
+                  (t.parts_partial || 0) - (t.parts_failed || 0) - (t.parts_exhausted || 0);
+  if (pending > 0) cnts.push(pending + " pending");
+  const src = inPollMode ? "polling snapshot every 2 s (SSE unavailable)"
+                         : "SSE · resume cursor " + lastSeq;
+  note.innerHTML = "<b>" + (cnts.length ? cnts.join(" · ") : "no parts yet") +
+                   "</b><br><span class=\"dim\">" + src + "</span>";
+}
+
+/* ---------- boot ----------------------------------------------------------- */
+loadJobs();
+setInterval(loadJobs, JOBLIST_INTERVAL);
+setInterval(() => {
+  if (selected) updateConn();
+  // Re-render once a second so stall countdowns + conn age stay fresh.
+  scheduleRender();
+}, 1000);
+if (budgetTimer === null) budgetTimer = setInterval(() => { if (selected) fetchBudget(selected); }, BUDGET_INTERVAL);
+</script>
+</body>
+</html>

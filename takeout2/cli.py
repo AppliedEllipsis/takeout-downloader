@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from .contracts import (AccountIdentity, DEFAULTS, IdentityRecord, JobStatus,
                         LabelSource, PartStatus, VerifyState, parse_export_ts)
 from .ledger import AttemptLedger
+from .progress import make_progress_emitter
 from .state import JobStore
 from .verify import VerifyResult, scan_parts_dir, verify_part
 
@@ -562,7 +563,9 @@ def cmd_run(args):
     )
     result = BurstEngine(store, ledger, cookie,
                          os.path.join(output_dir, "parts"),
-                         config=config).run_burst(archive_id)
+                         config=config,
+                         on_chunk=make_progress_emitter(store, archive_id),
+                         ).run_burst(archive_id)
     failed = ", ".join(f"{k}:{v}" for k, v in sorted(result.failed.items()))
     print("\n".join(lines))
     print(f"burst      started={result.started} canary={result.canary_passed} "

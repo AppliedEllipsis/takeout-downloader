@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Takeout Monitor
+Comment=Live per-part download progress, speed, and errors
+Exec=/usr/local/bin/takeout-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;

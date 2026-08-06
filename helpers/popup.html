@@ -34,6 +34,17 @@
         a { color: #a855f7; text-decoration: none; }
         a:hover { text-decoration: underline; }
         .help { font-size: 11px; color: #94a3b8; margin-top: 8px; line-height: 1.5; }
+        /* activity log entries */
+        .act-entry { padding: 3px 4px; border-bottom: 1px solid #2d2d3f; line-height: 1.4; }
+        .act-entry .act-time { color: #64748b; margin-right: 6px; }
+        .act-entry .act-icon { margin-right: 4px; }
+        .act-entry .act-msg { }
+        .act-entry .act-detail { color: #64748b; display: block; margin-left: 56px; margin-top: 1px; }
+        .act-ok { color: #22c55e; }
+        .act-err { color: #ef4444; }
+        .act-warn { color: #f59e0b; }
+        .act-dim { color: #64748b; }
+        .act-info { color: #a855f7; }
     </style>
 </head>
 <body>
@@ -43,6 +54,17 @@
     <div id="errorBox" class="status err" style="display:none; margin-top:6px;">
         <span id="errorText"></span>
         <span id="errorDismiss" style="float:right; cursor:pointer; font-weight:bold;">✕</span>
+    </div>
+
+    <!-- v4.2: Google attempt budget + identity (docs/v2/03-UX §5). The warning
+         is drawn above every fold, always. -->
+    <div class="section" id="budgetPanel" style="display:none;">
+        <div id="budgetWarn" class="status err" style="display:none; margin-bottom:6px;"></div>
+        <div id="budgetIdentity" class="help" style="margin-bottom:4px;"></div>
+        <details id="budgetDetails" style="margin-bottom:4px;">
+            <summary>Google attempt counter <span id="budgetSummary" class="help"></span></summary>
+            <div id="budgetList" style="max-height:120px; overflow:auto; font-size:10px; font-family:ui-monospace,monospace; margin-top:4px;"></div>
+        </details>
     </div>
 
     <div class="section">
@@ -74,6 +96,13 @@
             <pre class="payload" id="jobLog" style="max-height:140px;">No log yet.</pre>
         </details>
     </div>
+
+    <details id="activityDetails">
+        <summary>📋 Activity log <span id="activityBadge" style="display:none; background:#7c3aed; color:#fff; padding:0 5px; border-radius:8px; font-size:9px; margin-left:4px;">0</span></summary>
+        <div id="activityLog" style="max-height:180px; overflow:auto; font-size:10px; font-family:ui-monospace,monospace; margin-top:4px;">
+            <div class="act-entry act-dim">Waiting for activity…</div>
+        </div>
+    </details>
 
     <details>
         <summary>Preview capture <span id="copyPreview" style="cursor:pointer; color:#a855f7; margin-left:6px;">[copy]</span></summary>

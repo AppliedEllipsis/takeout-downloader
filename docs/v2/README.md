@@ -39,22 +39,42 @@ STRUCT_OK** — never a full read, never a probe.
 ## Already implemented and green
 
 ```
-takeout2/contracts.py    enums, identity provenance, regexes (111-test base)
-takeout2/classify.py     HTTP response -> ReasonCode, END_OF_RANGE vs AUTH_REDIRECT
-takeout2/ledger.py       AttemptLedger: reserve/commit/release, budget ceiling,
+takeout2/contracts.py    enums, identity provenance, regexes
+ takeout2/classify.py     HTTP response -> ReasonCode, END_OF_RANGE vs AUTH_REDIRECT
+ takeout2/ledger.py       AttemptLedger: reserve/commit/release, budget ceiling,
                          crash reconciliation, Google dl_count ground truth
-takeout2/state.py        JobStore: SQLite job/part/event, identity upgrade+rename,
+ takeout2/state.py        JobStore: SQLite job/part/event, identity upgrade+rename,
                          restart recovery
-takeout2/verify.py       SIZE/STRUCT/HASH ladder, one-scan parts directory
-tests/v2/               111 tests, all network-free, all passing
+ takeout2/verify.py       SIZE/STRUCT/HASH ladder, one-scan parts directory
+ takeout2/plan.py         zero-probe discovery (payload -> state.db -> filenames -> opt-in probes)
+ takeout2/cookie.py       live CDP jar pull (Storage.getCookies), non-localhost guard
+ takeout2/engine.py       cookie-window burst scheduler with canary-first
+ takeout2/api.py          FastAPI v2: capture sink, jobs/budget/parts, SSE ?since=, doctor
+tests/v2/               155+ tests, all network-free, all passing
 ```
 
 Run the suite:
 
 ```bash
 cd /d/_projects/takeout_downloader_script && python -m pytest tests/v2/ -q
-# → 111 passed
+# → 155 passed
 ```
+
+## Testing with the small export (the user's plan)
+
+A smaller account export is available for end-to-end testing. The intended flow:
+
+1. **Scaffold a state.db + manager** and point the extension at the v2 capture
+   endpoint (`POST /api/v2/capture`) so the manage-page scrape (dl_counts,
+   parts_expected, sizes) feeds the ledger for free.
+2. **`python -m takeout2.cli run --payload in.json`** to plan + burst a part.
+3. **`takeout2 budget <archive_id>`** to watch Google's own counter feed the
+   budget view — this doubles as the attempt-cost experiment source.
+4. **`takeout2 doctor`** before the run; **`takeout2 verify`** after.
+
+The attempt-cost study (`experiment.py`, phase 9) should run on THIS small
+account before any real multi-TB run: a probe / aborted GET / resume on a
+throwaway part, diffing dl_counts, settles whether those cost attempts.
 
 ## The three design pillars
 
@@ -70,11 +90,12 @@ cd /d/_projects/takeout_downloader_script && python -m pytest tests/v2/ -q
 
 ## What is deliberately NOT done yet
 
-The build plan is executed in phases 2–10. Modules `state.py` (phase 2) is
-already built; `plan.py`, `cookie.py`, `engine.py`, `api.py`, `cli.py`, the
-extension wiring, migration, the empirical cost study, and cutover remain.
-Each has a spec, a DONE-WHEN, a validation command, and stop rules — see
-`02-BUILD-PLAN-A/B.md`.
+The build plan is executed in phases 2–10. Modules `state.py` (phase 2) and
+`plan/cookie/engine/api` (phases 3–6) are built. Remaining: the rich CLI
+(`cli.py`), the extension wiring (`POST /api/v2/capture`), v1→v2 migration
+(`migrate.py`), the attempt-cost study harness (`experiment.py`), and the
+server cutover. Each has a spec, a DONE-WHEN, a validation command, and stop
+rules — see `02-BUILD-PLAN-A/B.md`.
 
 ## The single most valuable next change
 

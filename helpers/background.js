@@ -281,6 +281,70 @@ async function postToManager(payload) {
     return body;
 }
 
+// ---------------------------------------------------------------------------
+// v2 structured capture POST (docs/v2/00-CONTRACTS.md §6, 01-IDENTITY §6).
+// The content script builds the payload (dl_counts, identity, parts metadata)
+// and sends it here; we persist it and POST it to /api/v2/capture. The v1
+// /api/payload POST above stays untouched for back-compat. The token comes
+// from chrome.storage.local first, then the managed policy store.
+// ---------------------------------------------------------------------------
+function resolveManagedToken() {
+    return new Promise((resolve) => {
+        if (!chrome.storage || !chrome.storage.managed) { resolve(''); return; }
+        chrome.storage.managed.get(['captureToken'], (m) => {
+            if (chrome.runtime.lastError) { resolve(''); return; }
+            resolve((m && m.captureToken) || '');
+        });
+    });
+}
+
+async function postV2Capture(payload) {
+    const s = await getManagerSettings();
+    // storage.local token first, then managed-policy token (same v1 semantics).
+    const token = s.captureToken || await resolveManagedToken();
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['X-Capture-Token'] = token;
+    const resp = await fetch(s.managerUrl.replace(/\/$/, '') + '/api/v2/capture', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload)
+    });
+    const text = await resp.text();
+    let body;
+    try { body = JSON.parse(text); } catch (e) { body = { detail: text }; }
+    if (!resp.ok) {
+        const err = new Error(body.detail || ('HTTP ' + resp.status));
+        err.status = resp.status;
+        throw err;
+    }
+    return body;   // {ok, archive_id, parts, label, export_ts}
+}
+
+function v2PostStatusOk(result) {
+    return {
+        ok: true,
+        archive_id: result.archive_id || null,
+        parts: (result.parts === undefined || result.parts === null) ? null : result.parts,
+        label: result.label || null,
+        export_ts: result.export_ts || null,
+        at: Date.now()
+    };
+}
+
+// Persist a structured capture and POST it. Returns {ok, result, error}.
+async function handleV2Capture(payload) {
+    chrome.storage.local.set({ lastV2Capture: payload, v2CapturedAt: Date.now() });
+    try {
+        const result = await postV2Capture(payload);
+        chrome.storage.local.set({ lastV2PostStatus: v2PostStatusOk(result) });
+        return { ok: true, result: result };
+    } catch (e) {
+        const err = e.message || String(e);
+        chrome.storage.local.set({ lastV2PostStatus: { ok: false, error: err, at: Date.now() } });
+        return { ok: false, error: err };
+    }
+}
+
 async function maybeAutoPost(capture) {
     let s;
     try { s = await getManagerSettings(); } catch (e) { return; }
@@ -465,7 +529,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'getState') {
         chrome.storage.local.get(
             ['hasCapture', 'captureCount', 'lastPostStatus', 'lastError',
-             'managerUrl', 'captureToken', 'autoPost', 'autoRecapture'],
+             'managerUrl', 'captureToken', 'autoPost', 'autoRecapture',
+             'lastV2Capture', 'lastV2PostStatus'],
             (d) => sendResponse({
                 hasCapture: !!d.hasCapture,
                 captureCount: d.captureCount || 0,
@@ -474,7 +539,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 managerUrl: d.managerUrl || DEFAULTS.managerUrl,
                 captureToken: d.captureToken || '',
                 autoPost: d.autoPost !== false,
-                autoRecapture: d.autoRecapture !== false
+                autoRecapture: d.autoRecapture !== false,
+                lastV2Capture: d.lastV2Capture || null,
+                lastV2PostStatus: d.lastV2PostStatus || null
             })
         );
         return true;
@@ -550,6 +617,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Content script reports scraped identity (email/user/authuser).
         chrome.storage.local.set({ accountMeta: msg.meta || {} },
             () => sendResponse({ ok: true }));
+        return true;
+    }
+
+    // --- v2 structured capture (additive; v1 handlers above stay) ----------
+    if (msg.action === 'v2Capture') {
+        // Content script built the structured payload on its cadence
+        // (load / SPA nav / 60 s). Store it and POST to /api/v2/capture.
+        const payload = msg.payload || null;
+        if (!payload) { sendResponse({ ok: false, error: 'no payload' }); return false; }
+        handleV2Capture(payload).then((r) => sendResponse(r));
+        return true;
+    }
+
+    if (msg.action === 'requestPayload') {
+        // Tester hook: return capturePayload() from the live takeout tab, or
+        // the last stored payload if no tab is available. Re-POSTs when fresh.
+        (async () => {
+            try {
+                const tabs = await chrome.tabs.query({ url: 'https://takeout.google.com/*' });
+                if (tabs && tabs.length > 0 && tabs[0].id != null) {
+                    try {
+                        const resp = await chrome.tabs.sendMessage(
+                            tabs[0].id, { action: 'buildCapturePayload' });
+                        if (resp && resp.ok && resp.payload) {
+                            const r = await handleV2Capture(resp.payload);
+                            sendResponse({
+                                ok: true, payload: resp.payload,
+                                result: r.result || null, error: r.error || null
+                            });
+                            return;
+                        }
+                    } catch (e) { /* content script not ready — fall back to stored */ }
+                }
+                const d = await chrome.storage.local.get(['lastV2Capture']);
+                sendResponse({ ok: !!d.lastV2Capture, payload: d.lastV2Capture || null, fromCache: true });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message || String(e) });
+            }
+        })();
         return true;
     }
 });

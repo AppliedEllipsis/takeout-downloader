@@ -106,6 +106,7 @@
     setInterval(() => {
         if (location.href !== lastHref) {
             lastHref = location.href;
+            sendV2Capture();  // v2: re-capture on SPA navigation (§6.2)
             // injectPageSpy(); // DISABLED
         }
     }, 1000);
@@ -288,7 +289,414 @@
     }
 
     // -------------------------------------------------------------------------
+    // v2 structured capture payload (docs/v2/01-IDENTITY-AND-SCRAPE.md §6).
+    //
+    // Every scraped field is produced by a multi-strategy scraper returning
+    // {value, source, ok}; a miss is null + reason, NEVER an empty string that
+    // could silently become a folder name. The winning strategy per field is
+    // recorded in scrape_report so the manager can show provenance. Building
+    // this payload costs zero Google download requests.
+    // -------------------------------------------------------------------------
+    const TAKEOUT_PART_RE = /takeout-(\d{8}T\d{6}Z)-\d+-(\d+)\.zip/i;
+
+    function ok(value, source, ambiguous) {
+        return { value: value, source: source, ok: true, ambiguous: !!ambiguous };
+    }
+    function miss(reason) {
+        return { value: null, ok: false, reason: reason };
+    }
+
+    function decodeTakeoutUri(uri) {
+        if (!uri) return '';
+        return decodeURIComponent(uri.replace(/&amp;/g, '&'));
+    }
+
+    function filenameFromUri(uri) {
+        const decoded = decodeTakeoutUri(uri);
+        return decoded.split('?')[0].split('/').pop() || '';
+    }
+
+    function archiveIdFromUri(uri) {
+        const m = (uri || '').match(/[?&]j=([a-f0-9-]+)/i);
+        return m ? m[1] : null;
+    }
+
+    function filenameIdx(name) {
+        const m = TAKEOUT_PART_RE.exec(name || '');
+        if (!m) return null;
+        const n = parseInt(m[2], 10);
+        return isNaN(n) ? null : n;
+    }
+
+    function sortFilenames(names) {
+        return names.slice().sort(function (a, b) {
+            const ia = filenameIdx(a), ib = filenameIdx(b);
+            if (ia !== null && ib !== null) return ia - ib;
+            return 0;
+        });
+    }
+
+    // Try a field's strategies in order; the first {ok, non-empty} wins.
+    // Returns { value, entry, ambiguous } where entry is the scrape_report row.
+    function scrapeField(field, strategies) {
+        const entry = { field: field, source: null, ok: false, ms: 0 };
+        let lastReason = '';
+        let totalMs = 0;
+        for (let si = 0; si < strategies.length; si++) {
+            const t0 = performance.now();
+            let out;
+            try { out = strategies[si].fn(); } catch (e) { out = miss((e && e.message) || String(e)); }
+            totalMs += performance.now() - t0;
+            if (out && out.ok && out.value !== null && out.value !== undefined && out.value !== '') {
+                entry.source = out.source || strategies[si].name;
+                entry.ok = true;
+                entry.ms = Math.round(totalMs);
+                return { value: out.value, entry: entry, ambiguous: !!out.ambiguous };
+            }
+            lastReason = (out && out.reason) ? out.reason : (strategies[si].name + ' missed');
+        }
+        entry.source = strategies.length ? strategies[strategies.length - 1].name : '';
+        entry.ok = false;
+        entry.ms = Math.round(totalMs);
+        entry.reason = lastReason || 'no strategy produced a value';
+        return { value: null, entry: entry, ambiguous: false };
+    }
+
+    // The normative v2 payload (field names fixed — see docs/v2/01 §6).
+    function capturePayload() {
+        const captured_at = Date.now();
+        const report = [];
+        const pageText = document.body ? document.body.innerText : '';
+
+        // Raw [data-download-uri] buttons (all archives Google may show).
+        const rawRows = [];
+        for (const btn of document.querySelectorAll('[data-download-uri]')) {
+            const uri = decodeTakeoutUri(btn.getAttribute('data-download-uri') || '');
+            const filename = filenameFromUri(uri);
+            if (!filename) continue;
+            const sizeStr = btn.getAttribute('data-size') || '';
+            const size = parseInt(sizeStr, 10);
+            rawRows.push({
+                btn: btn,
+                uri: uri,
+                filename: filename,
+                size: (isNaN(size) || size <= 0) ? null : size
+            });
+        }
+
+        // -- archive_id (the stable job key; never used for display) -----------
+        const archive = scrapeField('archive_id', [
+            { name: 'url-j-param', fn: function () {
+                const v = new URLSearchParams(location.search).get('j');
+                return v ? ok(v, 'url-j-param') : miss('no j= in page URL');
+            } },
+            { name: 'button-j-param', fn: function () {
+                for (const r of rawRows) {
+                    const j = archiveIdFromUri(r.uri);
+                    if (j) return ok(j, 'button-j-param');
+                }
+                return miss('no j= in any data-download-uri');
+            } },
+            { name: 'href-j-param', fn: function () {
+                const m = location.href.match(/[?&]j=([a-f0-9-]+)/i);
+                return m ? ok(m[1], 'href-j-param') : miss('no j= in location.href');
+            } }
+        ]);
+        report.push(archive.entry);
+        if (!archive.value) {
+            // Not on a manage/export view — return a null payload (sender skips
+            // payloads without an archive_id; the manager 400s on them).
+            report.push({ field: 'capture', source: 'pre-check', ok: false, ms: 0,
+                reason: 'no archive_id; page is not an export/manage view' });
+            return {
+                archive_id: null, user: null, authuser: null, parts_expected: null,
+                uris: null, sizes: null, filenames: [], dl_counts: null,
+                account: null, export_ts_raw: null, scrape_report: report,
+                locale_warning: false, captured_at: captured_at
+            };
+        }
+
+        // Buttons belonging to THIS archive only (mirrors scrapePartsFromButtons).
+        const rows = rawRows.filter(function (r) {
+            const j = archiveIdFromUri(r.uri);
+            return j === archive.value || j === null;
+        });
+
+        // Distinct export timestamps among this archive's button filenames.
+        const buttonTs = new Set();
+        for (const r of rows) {
+            const m = TAKEOUT_PART_RE.exec(r.filename);
+            if (m) buttonTs.add(m[1]);
+        }
+        if (buttonTs.size > 1) {
+            console.warn('[takeout-helper] multiple export timestamps among part buttons:',
+                Array.from(buttonTs).join(', '));
+        }
+        const tsFilter = buttonTs.size === 1 ? Array.from(buttonTs)[0] : null;
+
+        // -- parts_expected: "part X of N" -> N, else button count -------------
+        const parts = scrapeField('parts_expected', [
+            { name: 'aria-part-of-n', fn: function () {
+                for (const r of rows) {
+                    const al = r.btn.getAttribute('aria-label') || '';
+                    const m = al.match(/part\s+\d+\s+of\s+(\d+)/i);
+                    if (m) {
+                        const n = parseInt(m[1], 10);
+                        if (!isNaN(n) && n > 0) return ok(n, 'aria-part-of-n');
+                    }
+                }
+                return miss('no "part X of N" aria-label');
+            } },
+            { name: 'numeric-fallback', fn: function () {
+                // Localised totals: "Teil X von N", "X/N", etc.
+                for (const r of rows) {
+                    const al = r.btn.getAttribute('aria-label') || '';
+                    const m = al.match(/(\d+)\s*(?:[/\u2215]|\b(?:of|von|de|sur|da|od|iz|из|де)\b)\s*(\d+)/i);
+                    if (m) {
+                        const n = parseInt(m[2], 10);
+                        if (!isNaN(n) && n > 0) return ok(n, 'numeric-fallback');
+                    }
+                }
+                return miss('no localised part total in aria-label');
+            } },
+            { name: 'button-count', fn: function () {
+                if (rows.length > 0) return ok(rows.length, 'button-count');
+                return miss('no download buttons');
+            } }
+        ]);
+        report.push(parts.entry);
+
+        // -- filenames (union of page text + buttons, in part-index order) ------
+        const textFilenames = Array.from(new Set(pageText.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g) || []));
+        const filteredTextFilenames = tsFilter
+            ? textFilenames.filter(function (f) { return f.indexOf('takeout-' + tsFilter) === 0; })
+            : textFilenames;
+        const filenames = scrapeField('filenames', [
+            { name: 'page-text-plus-buttons', fn: function () {
+                const all = Array.from(new Set(filteredTextFilenames.concat(rows.map(function (r) { return r.filename; }))));
+                if (all.length > 0) return ok(sortFilenames(all), 'page-text-plus-buttons');
+                return miss('no filenames in page text or buttons');
+            } },
+            { name: 'buttons-only', fn: function () {
+                if (rows.length > 0) return ok(sortFilenames(rows.map(function (r) { return r.filename; })), 'buttons-only');
+                return miss('no download buttons');
+            } }
+        ]);
+        report.push(filenames.entry);
+
+        // -- uris {filename: download_uri} --------------------------------------
+        const uris = scrapeField('uris', [
+            { name: 'data-download-uri', fn: function () {
+                const map = {};
+                for (const r of rows) {
+                    if (!map[r.filename]) map[r.filename] = r.uri;
+                }
+                const keys = Object.keys(map);
+                return keys.length > 0 ? ok(map, 'data-download-uri') : miss('no data-download-uri buttons');
+            } },
+            { name: 'anchor-hrefs', fn: function () {
+                const map = {};
+                for (const a of document.querySelectorAll('a[href*="takeout-download.usercontent.google.com"]')) {
+                    const uri = decodeTakeoutUri(a.getAttribute('href') || '');
+                    const filename = filenameFromUri(uri);
+                    if (filename && !map[filename]) map[filename] = uri;
+                }
+                const keys = Object.keys(map);
+                return keys.length > 0 ? ok(map, 'anchor-hrefs') : miss('no anchor hrefs');
+            } }
+        ]);
+        report.push(uris.entry);
+
+        // -- sizes {filename: bytes} (from data-size) ----------------------------
+        const sizes = scrapeField('sizes', [
+            { name: 'data-size', fn: function () {
+                const map = {};
+                for (const r of rows) {
+                    if (r.size !== null && !map[r.filename]) map[r.filename] = r.size;
+                }
+                const keys = Object.keys(map);
+                return keys.length > 0 ? ok(map, 'data-size') : miss('no data-size attributes');
+            } },
+            { name: 'anchor-data-size', fn: function () {
+                const map = {};
+                for (const a of document.querySelectorAll('a[href*="takeout-download.usercontent.google.com"][data-size]')) {
+                    const uri = decodeTakeoutUri(a.getAttribute('href') || '');
+                    const filename = filenameFromUri(uri);
+                    const size = parseInt(a.getAttribute('data-size') || '', 10);
+                    if (filename && !isNaN(size) && size > 0 && !map[filename]) map[filename] = size;
+                }
+                const keys = Object.keys(map);
+                return keys.length > 0 ? ok(map, 'anchor-data-size') : miss('no anchor data-size');
+            } }
+        ]);
+        report.push(sizes.entry);
+
+        // -- dl_counts {filename: n} — Google's OWN attempt counter --------------
+        const dlEng = {};
+        {
+            const re = /(takeout-\d{8}T\d{6}Z-\d+-\d+\.zip)\s*\(Number of times already downloaded:\s*(\d+)\)/gi;
+            let m;
+            while ((m = re.exec(pageText)) !== null) {
+                if (!tsFilter || m[1].indexOf('takeout-' + tsFilter) === 0) {
+                    dlEng[m[1]] = parseInt(m[2], 10);
+                }
+            }
+        }
+        const dlNum = {};
+        {
+            // Numeric fallback: trailing integer of any parenthesised suffix
+            // (non-English UIs, e.g. "(Téléchargements: 5)").
+            const re = /(takeout-\d{8}T\d{6}Z-\d+-\d+\.zip)\s*\(([^)]*)\)/gi;
+            let m;
+            while ((m = re.exec(pageText)) !== null) {
+                if (tsFilter && m[1].indexOf('takeout-' + tsFilter) !== 0) continue;
+                const nums = m[2].match(/\d+/g);
+                if (nums && nums.length > 0) dlNum[m[1]] = parseInt(nums[nums.length - 1], 10);
+            }
+        }
+        const dlCounts = scrapeField('dl_counts', [
+            { name: 'english-counter', fn: function () {
+                const keys = Object.keys(dlEng);
+                return keys.length > 0 ? ok(dlEng, 'english-counter') : miss('no "Number of times already downloaded" text');
+            } },
+            { name: 'numeric-fallback', fn: function () {
+                const keys = Object.keys(dlNum);
+                return keys.length > 0 ? ok(dlNum, 'numeric-fallback') : miss('no parenthesised count in page text');
+            } }
+        ]);
+        report.push(dlCounts.entry);
+
+        // -- account {email, label, label_source} — provenance ladder (doc 01 §4)
+        const emailVal = scrapeAccountEmail();
+        const labelVal = scrapeAccountLabel();
+        const userParam = new URLSearchParams(location.search).get('user');
+        const labelParam = new URLSearchParams(location.search).get('label');
+        const account = scrapeField('account', [
+            { name: 'operator-override', fn: function () {
+                if (labelParam) {
+                    return ok({ email: emailVal, label: labelParam, label_source: 'OPERATOR_OVERRIDE' }, 'operator-override');
+                }
+                return miss('no ?label= operator override');
+            } },
+            { name: 'scraped-email', fn: function () {
+                if (emailVal) {
+                    return ok({ email: emailVal, label: emailVal.split('@')[0] || null, label_source: 'SCRAPED_EMAIL' }, 'scraped-email');
+                }
+                return miss('no account-switcher email');
+            } },
+            { name: 'scraped-label', fn: function () {
+                if (labelVal) {
+                    return ok({ email: emailVal, label: labelVal, label_source: 'SCRAPED_LABEL' }, 'scraped-label');
+                }
+                return miss('no "Google Account:" display name');
+            } },
+            { name: 'gaia-fallback', fn: function () {
+                if (userParam) {
+                    return ok({ email: null, label: 'gaia-' + userParam, label_source: 'GAIA_FALLBACK' }, 'gaia-fallback');
+                }
+                return miss('no user= URL param');
+            } },
+            { name: 'unknown', fn: function () {
+                return ok({ email: null, label: null, label_source: 'UNKNOWN' }, 'unknown');
+            } }
+        ]);
+        report.push(account.entry);
+
+        // -- user / authuser (URL params; deterministic multi-login fallback) ---
+        const user = scrapeField('user', [
+            { name: 'url-user-param', fn: function () {
+                const v = new URLSearchParams(location.search).get('user');
+                return v ? ok(v, 'url-user-param') : miss('no user= URL param');
+            } },
+            { name: 'button-uri-user', fn: function () {
+                for (const r of rows) {
+                    const m = r.uri.match(/[?&]user=([^&]+)/);
+                    if (m) return ok(decodeURIComponent(m[1]), 'button-uri-user');
+                }
+                return miss('no user= in download URI');
+            } }
+        ]);
+        report.push(user.entry);
+        const authuser = scrapeField('authuser', [
+            { name: 'url-authuser-param', fn: function () {
+                const v = new URLSearchParams(location.search).get('authuser');
+                return v ? ok(v, 'url-authuser-param') : ok('0', 'default-0');
+            } }
+        ]);
+        report.push(authuser.entry);
+
+        // -- export_ts_raw: regex over filenames, then URIs, then page text ------
+        const exportTs = scrapeField('export_ts_raw', [
+            { name: 'filenames-regex', fn: function () {
+                const vals = [];
+                for (const f of (filenames.value || [])) {
+                    const m = TAKEOUT_PART_RE.exec(f);
+                    if (m) vals.push(m[1]);
+                }
+                if (vals.length === 0) return miss('no takeout filename on page');
+                const counts = {};
+                for (const v of vals) counts[v] = (counts[v] || 0) + 1;
+                const entries = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
+                if (entries.length > 1) {
+                    console.warn('[takeout-helper] multiple export timestamps among filenames:', entries.join(', '));
+                    return ok(entries[0], 'filenames-regex', true);
+                }
+                return ok(entries[0], 'filenames-regex');
+            } },
+            { name: 'uri-regex', fn: function () {
+                for (const r of rawRows) {
+                    const m = TAKEOUT_PART_RE.exec(r.uri);
+                    if (m) return ok(m[1], 'uri-regex');
+                }
+                return miss('no timestamp in download URIs');
+            } },
+            { name: 'page-text-regex', fn: function () {
+                const m = /takeout-(\d{8}T\d{6}Z)-/.exec(pageText);
+                return m ? ok(m[1], 'page-text-regex') : miss('no timestamp in page text');
+            } }
+        ]);
+        report.push(exportTs.entry);
+
+        // -- locale_warning: English dlCounts / part-X-of-N misses while buttons
+        //    are clearly rendered (non-English UI).
+        const englishDlHit = dlCounts.entry.ok && dlCounts.entry.source === 'english-counter';
+        const englishPartsHit = parts.entry.ok && parts.entry.source === 'aria-part-of-n';
+        const locale_warning = rawRows.length > 0 && (!englishDlHit || !englishPartsHit);
+
+        const payload = {
+            archive_id: archive.value,
+            user: user.value,
+            authuser: authuser.value,
+            parts_expected: parts.value,
+            uris: uris.value,
+            sizes: sizes.value,
+            filenames: filenames.value,
+            dl_counts: dlCounts.value,
+            account: account.value,
+            export_ts_raw: exportTs.value,
+            scrape_report: report,
+            locale_warning: !!locale_warning,
+            captured_at: captured_at
+        };
+        if (exportTs.ambiguous) payload.export_ts_ambiguous = true;
+        return payload;
+    }
+
+    // Build the payload and hand it to the background for storage + POST to
+    // /api/v2/capture. Free: costs zero Google download requests. The background
+    // decides whether the manager is reachable. Never breaks the page.
+    function sendV2Capture() {
+        try {
+            const payload = capturePayload();
+            if (!payload || !payload.archive_id) return;
+            chrome.runtime.sendMessage({ action: 'v2Capture', payload: payload, captured_at: Date.now() })
+                .catch(function () {});
+        } catch (e) { /* non-critical */ }
+    }
+
+    // -------------------------------------------------------------------------
     // Try to fetch the export list from Takeout's internal API.
+    // Each strategy is timed and recorded so the popup can show a play-by-play.
     // -------------------------------------------------------------------------
     async function fetchExportList(capturedUrl) {
         const params = parseUrlParams(capturedUrl || location.href);
@@ -297,8 +705,15 @@
         const user = params.user;
         const rapt = params.rapt;
 
+        const strategies = []; /* { name, ok, detail, elapsedMs } */
+
+        function addStrategy(name, ok, detail, elapsedMs) {
+            strategies.push({ name, ok, detail: detail || '', elapsedMs: elapsedMs || 0 });
+        }
+
         if (!archiveId) {
-            return { ok: false, error: 'no archive ID in captured URL' };
+            addStrategy('pre-check', false, 'no archive ID in captured URL', 0);
+            return { ok: false, error: 'no archive ID in captured URL', strategies };
         }
 
         const query = new URLSearchParams();
@@ -319,17 +734,22 @@
         const debug = [];
 
         // Strategy 1: scrape the visible [data-download-uri] buttons.
-        // The page tells us "Part X of N" up front and each button's
-        // data-size lets the CLI skip the Range probe entirely.
-        // Filter by archive ID so we never leak URLs from other
-        // Takeouts the user has on their account.
+        var t0 = performance.now();
         const buttonParts = scrapePartsFromButtons(capturedUrl);
+        var t1 = performance.now();
         if (buttonParts && buttonParts.urls.length > 0) {
-            debug.push(`buttons: ${buttonParts.urls.length} parts for archive ${buttonParts.archiveId}`);
+            const sizesKnown = (buttonParts.sizes || []).filter(function(s) { return s > 0; }).length;
+            var totalSize = (buttonParts.sizes || []).reduce(function(a,b) { return a + (b||0); }, 0);
+            addStrategy('page buttons', true,
+                buttonParts.urls.length + ' parts, ' + sizesKnown + ' with sizes, ' +
+                (totalSize > 0 ? (totalSize >= 1e9 ? (totalSize/1e9).toFixed(1)+'GB' :
+                 totalSize >= 1e6 ? (totalSize/1e6).toFixed(0)+'MB' : totalSize+'B') + ' total' : 'size unknown'),
+                t1 - t0);
             return {
                 ok: true,
                 urls: buttonParts.urls,
                 debug,
+                strategies: strategies,
                 source: buttonParts.source,
                 meta: {
                     archiveId: buttonParts.archiveId,
@@ -338,39 +758,42 @@
                 }
             };
         }
+        addStrategy('page buttons', false,
+            'no [data-download-uri] buttons found for this archive', t1 - t0);
 
-        // Strategy 2: check the spy cache for URLs, BUT only those
-        // matching the captured archive ID. Unfiltered, the spy cache
-        // picks up URLs from other Takeouts (the manage page makes
-        // calls to /api/v2/manage/archives which returns every archive)
-        // and we used to return all of them — that's how the CLI ended
-        // up showing 10 archives when the user was looking at one
-        // Takeout with 5 parts.
+        // Strategy 2: check the spy cache for URLs.
+        t0 = performance.now();
         const spyUrls = Array.from(spyCache.urls).filter(u => {
             if (!u.includes('takeout-download.usercontent.google.com')) return false;
             try {
-                const u2 = new URL(u);
-                return u2.searchParams.get('j') === archiveId;
+                return new URL(u).searchParams.get('j') === archiveId;
             } catch (e) {
                 return false;
             }
         });
+        t1 = performance.now();
         if (spyUrls.length > 0) {
-            return { ok: true, urls: spyUrls, debug: ['spy cache (filtered)'], source: 'spy' };
+            addStrategy('spy cache', true, spyUrls.length + ' URLs for this archive', t1 - t0);
+            return { ok: true, urls: spyUrls, debug, strategies: strategies, source: 'spy' };
         }
+        addStrategy('spy cache', false,
+            'cache has ' + spyCache.urls.size + ' URLs, none for this archive', t1 - t0);
 
-        // Direct scan: look for <script class="ds:0"> containing filenames.
-        // These are embedded in the page HTML and available immediately.
+        // Strategy 3: <script class="ds:"> embedded filenames.
+        t0 = performance.now();
         const dsScripts = document.querySelectorAll('script[class^="ds:"]');
-        let dsFilenames = [];
-        for (const s of dsScripts) {
+        var dsFilenames = [];
+        for (var si = 0; si < dsScripts.length; si++) {
+            const s = dsScripts[si];
             const text = s.textContent || '';
             const m = text.match(/takeout-\d{8}T\d{6}Z-\d+-\d+\.zip/g);
-            if (m) for (const f of m) dsFilenames.push(f);
+            if (m) for (var fi = 0; fi < m.length; fi++) dsFilenames.push(m[fi]);
         }
         dsFilenames = Array.from(new Set(dsFilenames));
+        t1 = performance.now();
         if (dsFilenames.length > 0 && user) {
-            const reconstructed = dsFilenames.map(filename => {
+            addStrategy('ds-scripts', true, dsFilenames.length + ' filenames', t1 - t0);
+            const reconstructed = dsFilenames.map(function(filename) {
                 const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
                 u.searchParams.set('j', archiveId);
                 u.searchParams.set('i', '1');
@@ -378,14 +801,17 @@
                 u.searchParams.set('authuser', authuser);
                 return u.toString();
             });
-            debug.push(`ds-scripts: ${dsFilenames.length} filenames`);
-            return { ok: true, urls: reconstructed, debug, source: 'ds-scripts' };
+            return { ok: true, urls: reconstructed, debug, strategies: strategies, source: 'ds-scripts' };
         }
+        addStrategy('ds-scripts', false,
+            dsScripts.length + ' script(s) found, ' + dsFilenames.length + ' filenames', t1 - t0);
 
-        // If the spy captured filenames from a batchexecute response but not
-        // full URLs, reconstruct the download URLs from the captured URL template.
+        // Strategy 4: spy-captured filenames (no full URLs).
+        t0 = performance.now();
         if (spyCache.filenames.length > 0 && user) {
-            const reconstructed = spyCache.filenames.map(filename => {
+            t1 = performance.now();
+            addStrategy('spy filenames', true, spyCache.filenames.length + ' filenames', t1 - t0);
+            const reconstructed = spyCache.filenames.map(function(filename) {
                 const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
                 u.searchParams.set('j', archiveId);
                 u.searchParams.set('i', '1');
@@ -393,14 +819,19 @@
                 u.searchParams.set('authuser', authuser);
                 return u.toString();
             });
-            return { ok: true, urls: reconstructed, debug: ['reconstructed from spy filenames'], source: 'spy-filenames' };
+            return { ok: true, urls: reconstructed, debug, strategies: strategies, source: 'spy-filenames' };
         }
+        t1 = performance.now();
+        addStrategy('spy filenames', false, spyCache.filenames.length + ' in cache', t1 - t0);
 
-        // Try page metadata: filenames from visible text + download button data
+        // Strategy 5: page text filenames + button data.
+        t0 = performance.now();
         const meta = scrapePageMetadata(capturedUrl);
+        t1 = performance.now();
         if (meta.filenames.length > 0 && meta.archiveId && meta.user) {
-            // Match filenames with button sizes if available
-            const exports = meta.filenames.map(filename => {
+            addStrategy('page text', true,
+                meta.filenames.length + ' filenames, ' + meta.buttonData.length + ' buttons', t1 - t0);
+            const exports = meta.filenames.map(function(filename) {
                 const u = new URL('https://takeout-download.usercontent.google.com/download/' + filename);
                 u.searchParams.set('j', meta.archiveId);
                 u.searchParams.set('i', '1');
@@ -408,55 +839,74 @@
                 u.searchParams.set('authuser', meta.authuser);
                 return u.toString();
             });
-            debug.push(`page-text filenames: ${meta.filenames.length}, buttons: ${meta.buttonData.length}`);
-            return { ok: true, urls: exports, debug, source: 'page-text', meta };
+            return { ok: true, urls: exports, debug, strategies: strategies, source: 'page-text', meta: meta };
         }
+        addStrategy('page text', false,
+            meta.filenames.length + ' filenames from text', t1 - t0);
 
-        for (const apiUrl of apiUrls) {
+        // Strategy 6: internal API endpoints.
+        var apiStarts = [];
+        for (var ai = 0; ai < apiUrls.length; ai++) {
+            var apiUrl = apiUrls[ai];
+            t0 = performance.now();
             try {
                 const resp = await fetch(apiUrl, {
                     credentials: 'same-origin',
                     headers: { 'Accept': 'application/json,text/html' },
                     redirect: 'follow'
                 });
+                t1 = performance.now();
                 if (!resp.ok) {
-                    debug.push(`${apiUrl} -> ${resp.status}`);
+                    addStrategy('API: ' + apiUrl.split('?')[0], false,
+                        'HTTP ' + resp.status, t1 - t0);
                     continue;
                 }
                 if (resp.url.includes('accounts.google.com')) {
-                    return { ok: false, error: 'cookie expired', debug };
+                    addStrategy('API: ' + apiUrl.split('?')[0], false,
+                        'redirected to sign-in (cookie expired)', t1 - t0);
+                    return { ok: false, error: 'cookie expired', debug: debug, strategies: strategies };
                 }
                 const ctype = resp.headers.get('content-type') || '';
-                let urls = [];
+                var urls = [];
                 if (ctype.includes('json')) {
                     try {
                         const data = await resp.json();
                         urls = extractUrlsFromJson(data);
                     } catch (e) {
-                        debug.push(`${apiUrl} -> JSON parse error: ${e.message}`);
+                        addStrategy('API: ' + apiUrl.split('?')[0], false,
+                            'JSON parse error: ' + e.message, t1 - t0);
                         continue;
                     }
                 } else {
                     const html = await resp.text();
                     urls = extractUrlsFromHtml(html);
                 }
-                debug.push(`${apiUrl} -> ${resp.status} ${ctype} urls=${urls.length}`);
                 if (urls.length > 0) {
-                    return { ok: true, urls, debug, source: apiUrl };
+                    addStrategy('API: ' + apiUrl.split('?')[0], true,
+                        urls.length + ' URLs', t1 - t0);
+                    return { ok: true, urls: urls, debug: debug, strategies: strategies, source: apiUrl };
                 }
+                addStrategy('API: ' + apiUrl.split('?')[0], false,
+                    'HTTP ' + resp.status + ' ' + ctype + ', 0 URLs extracted', t1 - t0);
             } catch (e) {
-                debug.push(`${apiUrl} -> ERROR: ${e.message}`);
+                t1 = performance.now();
+                addStrategy('API: ' + apiUrl.split('?')[0], false,
+                    'fetch error: ' + (e.message || String(e)).slice(0, 60), t1 - t0);
             }
         }
 
-        // Last resort: DOM scrape
+        // Last resort: DOM scrape.
+        t0 = performance.now();
         const domExports = scrapeExports();
-        const domUrls = domExports.map(e => e.url);
+        const domUrls = domExports.map(function(e) { return e.url; });
+        t1 = performance.now();
         if (domUrls.length > 0) {
-            return { ok: true, urls: domUrls, debug: debug.concat(['DOM scrape fallback']), source: 'dom' };
+            addStrategy('DOM scrape', true, domUrls.length + ' URLs', t1 - t0);
+            return { ok: true, urls: domUrls, debug: debug, strategies: strategies, source: 'dom' };
         }
+        addStrategy('DOM scrape', false, 'no download links in page', t1 - t0);
 
-        return { ok: false, error: 'no endpoints returned URLs', debug };
+        return { ok: false, error: 'no strategy returned URLs', debug: debug, strategies: strategies };
     }
 
     // -------------------------------------------------------------------------
@@ -561,6 +1011,16 @@
             }
             return false;
         }
+        if (msg.action === 'buildCapturePayload') {
+            // Tester / background 'requestPayload' — return the live payload.
+            try {
+                const payload = capturePayload();
+                sendResponse({ ok: !!payload, payload: payload || null, at: Date.now() });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message || String(e) });
+            }
+            return false;
+        }
         return false;
     });
 
@@ -579,8 +1039,11 @@
     }
     sendScrape();
     reportAccountMeta();
+    // v2: structured capture payload — build on load, then every 60 s (§6.2).
+    sendV2Capture();
     // setInterval(sendScrape, 5000); // DISABLED: heavy DOM scan
     setInterval(reportAccountMeta, 15000);
+    setInterval(sendV2Capture, 60000);
 
     let scrapeTimer = null;
     /* DISABLED: heavy DOM scanning can hang renderer on large Takeout page

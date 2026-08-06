@@ -147,7 +147,16 @@ def _auth(deps_token: Optional[str], header_token: Optional[str]) -> None:
 
 def create_app(*, store, ledger, engine=None,
                api_token: str = "",
-               capture_token: str = "") -> FastAPI:
+               capture_token: str = "",
+               supervisor=None) -> FastAPI:
+    """Build the v2 control plane.
+
+    ``supervisor`` is an optional :class:`takeout2.runner.RunnerSupervisor`.
+    When present the control routes actually START AND STOP real download
+    threads and a capture auto-starts its job (docs/v2/08-SELF-DRIVING-UX.md).
+    When absent every route still works and simply records intent in the DB,
+    which keeps the API importable in tests and on hosts with no browser.
+    """
     app = FastAPI(title="takeout2", version="2.0.0")
     handler = CaptureHandler(store, ledger)
 
@@ -246,36 +255,146 @@ def create_app(*, store, ledger, engine=None,
             if action == "pause":
                 if job.status in (JobStatus.COMPLETE, JobStatus.FAILED):
                     raise HTTPException(409, "job is terminal")
+                # Stop the thread FIRST, then record the state: the runner
+                # re-reads status each loop, so stopping first means an
+                # in-flight burst cannot flip us back to DOWNLOADING.
+                if supervisor is not None:
+                    supervisor.stop(archive_id)
                 store.set_job_status(archive_id, JobStatus.PAUSED)
             elif action == "resume":
                 if job.status in (JobStatus.COMPLETE, JobStatus.FAILED):
                     raise HTTPException(409, "job is terminal")
                 store.set_job_status(archive_id, JobStatus.DOWNLOADING)
                 store.emit("resume_requested", archive_id)
+                if supervisor is not None:
+                    supervisor.ensure(archive_id).start()
             elif action == "cancel":
                 if job.status in (JobStatus.COMPLETE,):
                     raise HTTPException(409, "job already complete")
+                if supervisor is not None:
+                    supervisor.stop(archive_id)
                 store.set_job_status(archive_id, JobStatus.FAILED,
                                      error="cancelled by operator")
-            return {"ok": True, "archive_id": archive_id, "action": action}
+            elif action == "start":
+                if job.status in (JobStatus.COMPLETE, JobStatus.FAILED):
+                    raise HTTPException(409, "job is terminal")
+                if job.status is JobStatus.BUDGET_EXHAUSTED:
+                    # R6: never auto-spend the last attempt — a human must
+                    # clear the block explicitly.
+                    raise HTTPException(
+                        409, "job is BUDGET_EXHAUSTED — clear the block first")
+                if supervisor is not None:
+                    supervisor.ensure(archive_id).start()
+            snap = None
+            if supervisor is not None:
+                live = supervisor.get(archive_id)
+                snap = live.snapshot() if live is not None else None
+            return {"ok": True, "archive_id": archive_id, "action": action,
+                    "runner": snap}
         return handler
 
-    for action in ("pause", "resume", "cancel"):
+    for action in ("pause", "resume", "cancel", "start"):
         app.add_api_route(
             f"/control/{action}/{{archive_id}}", _control(action),
             methods=["POST"], name=f"control_{action}",
         )
+        # REST-style alias so the overlay/popup can POST
+        # /jobs/{id}/start instead of /control/start/{id}.
+        app.add_api_route(
+            f"/jobs/{{archive_id}}/{action}", _control(action),
+            methods=["POST"], name=f"job_{action}",
+        )
+
+    # -- runner introspection ----------------------------------------------
+    @app.get("/runners")
+    def list_runners():
+        if supervisor is None:
+            return {"runners": [], "supervisor": False}
+        return {"runners": supervisor.snapshot_all(), "supervisor": True}
+
+    @app.get("/jobs/{archive_id}/runner")
+    def runner_state(archive_id: str):
+        if supervisor is None:
+            return {"archive_id": archive_id, "supervisor": False,
+                    "alive": False}
+        runner = supervisor.get(archive_id)
+        if runner is None:
+            return {"archive_id": archive_id, "supervisor": True,
+                    "alive": False}
+        return {"supervisor": True, **runner.snapshot()}
+
+    @app.post("/jobs/{archive_id}/clear-budget-block")
+    def clear_budget_block(archive_id: str,
+                           x_api_token: Optional[str] = Header(None)):
+        """Explicit human unblock (R6).
+
+        BUDGET_EXHAUSTED means parts have burned Google's 5 attempts. Clearing
+        it is deliberately a separate, explicit action so it can never happen
+        as a side effect of an automatic retry.
+        """
+        _auth(api_token, x_api_token)
+        job = store.get_job(archive_id)
+        if not job:
+            raise HTTPException(404, "no such job")
+        store.set_job_status(archive_id, JobStatus.READY,
+                             error="budget block cleared by operator")
+        store.emit("budget_block_cleared", archive_id)
+        return {"ok": True, "archive_id": archive_id,
+                "status": JobStatus.READY.value}
 
     # -- capture sink (the extension's POST) --------------------------------
     @app.post("/capture")
     async def capture(request: Request,
+                      autostart: bool = True,
                       x_capture_token: Optional[str] = Header(None)):
+        """Ingest a capture and (by default) START the download.
+
+        This is the heart of the self-driving flow: clicking Download once in
+        the Takeout page is the ONLY human action a normal run needs.
+
+        Two distinct cases, both handled here:
+
+        * job already parked in NEEDS_COOKIE -> this capture IS the self-heal.
+          Wake the parked runner rather than starting a second one (R1/R3).
+        * new or idle job -> ensure a runner and start it, unless the operator
+          has explicitly PAUSED it or it is BUDGET_EXHAUSTED (R6). Automation
+          must never override those two decisions.
+        """
         _auth(capture_token, x_capture_token)
         try:
             payload = await request.json()
         except json.JSONDecodeError:
             raise HTTPException(400, "invalid JSON body")
-        return handler.ingest(payload)
+        result = handler.ingest(payload)
+
+        if supervisor is not None and autostart:
+            archive_id = (result or {}).get("archive_id") \
+                or str(payload.get("archive_id") or "").strip()
+            if archive_id:
+                try:
+                    job = store.get_job(archive_id)
+                    status = getattr(job, "status", None)
+                    if status in (JobStatus.PAUSED, JobStatus.BUDGET_EXHAUSTED,
+                                  JobStatus.COMPLETE):
+                        result = {**result, "autostart": False,
+                                  "autostart_reason": f"job is {status.value}"}
+                    else:
+                        existing = supervisor.get(archive_id)
+                        if existing is not None and existing.is_alive():
+                            # Self-heal: a live runner parked on a dead cookie.
+                            existing.notify_cookie()
+                            result = {**result, "autostart": True,
+                                      "autostart_reason": "woke parked runner"}
+                        else:
+                            supervisor.ensure(archive_id).start()
+                            result = {**result, "autostart": True,
+                                      "autostart_reason": "runner started"}
+                except Exception as exc:                       # noqa: BLE001
+                    # A capture must NEVER fail because autostart failed: the
+                    # payload is the valuable, time-sensitive part.
+                    result = {**result, "autostart": False,
+                              "autostart_reason": f"error: {exc}"}
+        return result
 
     # -- SSE with resumable cursor ------------------------------------------
     @app.get("/jobs/{archive_id}/events")

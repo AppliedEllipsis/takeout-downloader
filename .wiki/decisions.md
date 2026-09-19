@@ -365,3 +365,50 @@ design inputs.
 
 **Consequences.** Cleanup is gated separately from implementation. The live server
 must not be mutated without an explicit go-ahead.
+
+---
+
+## 2026-09-19 — The extension's tab-flood switch now fails CLOSED
+
+**Context.** Failure mode 1.9, measured: while any v2 job sat in `needs_cookie`, the extension's
+one-minute alarm opened another browser tab, every minute, for about three months. Peak **314 tabs**,
+memory **0 → 4.7 GB**. The live instance was fixed by setting `chrome.storage.local.autoRecapture`
+to `false`.
+
+**The gap.** That fix lived in **storage**, and storage does not survive a profile reset. The code
+default was still `true`, and two config-merge sites read `d.autoRecapture !== false` — which treats a
+*missing* value as **ENABLED**, so any merge that simply omitted the key silently re-armed the spawner.
+`chrome.storage.managed` was measured **empty**, which is why the managed-policy flag documented
+elsewhere was inert: nothing ever wrote it, and this `local` value was the only one that mattered.
+
+**Decision.** Fail closed in all four places: the default becomes `false`, both merge sites require
+`=== true`, and the alarm is created only on an explicit opt-in (it was previously created
+unconditionally, so we polled the manager every minute forever and one bug in the early return would
+resume the flood). v3 needs none of this — it mints over CDP — so the switch costs nothing off.
+
+**Alternatives considered.** (a) Remove the recapture path entirely — deferred to migration step 4, so
+that each v2 stage is disabled before deletion. (b) Leave it and rely on the storage value — rejected:
+a profile reset would silently reinstate a three-month flood.
+
+**Consequences.** A latent production hole is closed on **both** copies of the file, because they are two
+separate working trees and the live Chromium loads the extension from the **main checkout**
+(`--load-extension=/work/helpers`), not the worktree. The worktree carries
+`tests/v3/test_extension_defaults.py`, which pins all four properties textually — this repo has no JS
+harness, and the bug class here is precisely "a guard that silently reverts". The production branch is
+now **3 commits ahead of upstream, unpushed** by deliberate choice.
+
+---
+
+## 2026-09-19 — The v2 removal is disable-then-delete, in five ordered steps
+
+**Decision.** `docs/v3/03-OPERATIONS.md` records the migration as five independently safe steps rather
+than one refactor: (1) spawner fails closed **[done]**; (2) run v3 alongside v2 and confirm a `COMPLETE`
+with the real `takeout-*.zip` filename; (3) stop the manager driving `NEEDS_COOKIE` jobs; (4) delete the
+cookie-replay modules; (5) mark obsolete runbook steps superseded rather than deleting them.
+
+**Why this order.** Step 3 must precede step 4. Until the manager stops re-driving `NEEDS_COOKIE` jobs,
+turning `autoRecapture` back on re-arms the flood — so deleting the extension's half first would leave a
+live spawner with nothing to stop it.
+
+**Consequences.** The measured removal scope (exact files and lines across `takeout2/`, `manager/` and
+`helpers/`) is recorded in the doc, so the deletion is mechanical rather than archaeological.

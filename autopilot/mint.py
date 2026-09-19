@@ -273,9 +273,18 @@ async def mint(
                 continue
 
         # 4. Nothing recognisable — report what we saw rather than guessing.
+        #
+        # This used to print `(from_url, status)` and omit `location`, which is
+        # the only field that identifies where the chain actually went. A real
+        # failure therefore took several round trips to diagnose, so the
+        # destination is now printed for every hop, plus the host we wanted.
         raise MintError(
-            "no file-host URL, no ReAuth, and no archive bounce in the chain; "
-            f"saw {[(_redact(r.from_url), r.status) for r in redirects]}"
+            "no file-host URL, no ReAuth, and no archive bounce in the chain; saw "
+            + " | ".join(
+                f"{_redact(r.from_url)} -> [{r.status}] {_redact(r.location)}"
+                for r in redirects
+            )
+            + f" | looking for file host {FILE_HOST!r}"
         )
 
     await _restore(session, restore_url)

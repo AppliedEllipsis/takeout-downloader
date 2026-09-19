@@ -36,11 +36,17 @@ EXIT_OK = 0
 EXIT_OTHER = 1
 EXIT_NEEDS_REAUTH = 2
 EXIT_EXPIRED = 3
+#: Measured 2026-09-19: Google caps downloads per export (5) and answers further
+#: attempts with `quotaExceeded=true` on the archive-page bounce. Kept distinct
+#: from EXIT_OTHER because the remedy is specific — a NEW export — and a caller
+#: that reads it as a transient failure will retry forever against a dead export.
+EXIT_QUOTA_EXCEEDED = 4
 
 _EXIT_FOR_STATUS = {
     "complete": EXIT_OK,
     "needs_reauth": EXIT_NEEDS_REAUTH,
     "expired_unrecoverable": EXIT_EXPIRED,
+    "quota_exceeded": EXIT_QUOTA_EXCEEDED,
 }
 
 

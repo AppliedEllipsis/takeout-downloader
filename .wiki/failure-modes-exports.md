@@ -1,4 +1,4 @@
-# Failure modes — exports (1.10, 1.14, 1.15)
+# Failure modes — exports (1.10, 1.14, 1.15, 1.19)
 
 Scope: the three export/browser-profile failure modes of `docs/v2/04-FAILURE-MODES-AND-RECOVERY.md`'s index
 that v2 never wrote — archive expiry, partial/corrupt parts, and (grouped here by batch) the stale Chromium
@@ -304,3 +304,69 @@ budget model wrong for its whole life (§1.13).
 4. **Verify before moving to the archive**, not after — a truncation discovered post-upload means
    re-transferring it back through the network filesystem. And **never claim completeness from
    `manifest.json`** until the format is confirmed — measured as unusable.
+
+---
+
+## 1.19 — Export download allowance exhausted
+
+**Measured 2026-09-19, live, on the burn export.** Google caps how many times a single export may be
+downloaded, states the cap in plain words, and refuses every further attempt.
+
+**Symptom.**
+
+```
+**Verdict: BLOCKED — export download allowance exhausted (0/1 held). NOT resumable: create a NEW export.**
+- job status: quota_exceeded        - exit code: 4
+```
+
+The chain, from the ledger's own record:
+
+```
+.../settings/takeout/download?i=0&j=<id>&download=true&rapt=<token>
+  -> [302] .../manage/archive/<id>?download=true&rapt=<token>&quotaExceeded=true
+```
+
+And the archive page says it outright:
+
+> **You can try to download a file only 5 times.**
+> *You've tried to download or have downloaded this file 5 times, which is the maximum number of times
+> you can take this action. You can create a new request at any time.*
+
+**What it is not.** Not ReAuth (§1.9) — the session is fine and the bounce carries a live `rapt`. Not an
+expired export (§1.14) — the export is inside its window and the page still reads `Completed`. Not a
+cookie problem, and not a bug in the mint.
+
+**Why it looked like something else.** Two ways, both now fixed:
+
+1. Before `QuotaExceeded` existed this surfaced as an opaque `MintError` reading *"no file-host URL, no
+   ReAuth, and no archive bounce in the chain"* — wrong on its own terms, because the chain was nothing
+   but bounces, and wrong about the remedy, because the cure is a new export.
+2. **The quota bounce carries a `rapt`.** The refreshed-token retry therefore consumed it and looped
+   toward the hop limit, on course to report a hop-limit error naming an entirely different cause. The
+   quota check now runs *before* the retry, and a test asserts that ordering rather than trusting it.
+
+**Detect it** — the flag rides on the bounce, not on a status code:
+
+```
+QUOTA_FLAG = "quotaExceeded=true"     # autopilot/mint.py
+```
+
+**Fix it.** There is no repair, no retry, and no waiting: create a **new export**. For a small canary that
+is minutes; a full account export is hours to days.
+
+**Attempt cost.** **0** to diagnose, and **0** for every subsequent retry — a bounced request is a measured
+Δ0. The attempts this failure consumes are Google's, not the ledger's.
+
+**The trap that makes it expensive.** **The ledger's attempt count and Google's counter are different
+quantities, and only the latter runs out.** This run printed `mint 0 | transfer 0` while Google's counter
+went from 3 to its maximum of 5, because a bounced mint is never recorded as a spent attempt — measured,
+and correct as telemetry. So a run can truthfully report that it spent nothing while destroying its last
+chance. **Budget diagnostics against the archive's own counter (`dl_counts`, the *"Number of times already
+downloaded: N"* text), never against the ledger's.** The same independence is why `dl_counts` is unusable
+as an invariant (`measured-facts.md`).
+
+**Canary sizing — learned the hard way.** The cap is per *export*, so a small canary reaches it in five
+attempts, i.e. a handful of probes. The burn export was created as a monitoring canary and stood at
+**3 of 5** before this session's diagnostics; it reached **5 of 5** during them. A canary meant for
+repeated measurement must be **re-created on a schedule**, and `dl_counts` read *before* each experiment
+rather than after.

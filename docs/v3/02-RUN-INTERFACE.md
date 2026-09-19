@@ -124,7 +124,11 @@ python -m autopilot report --archive-id ID --ledger PATH [--json]
 ```
 
 * `run` exits **0** on `complete`, **2** on `needs_reauth`, **3** on `expired_unrecoverable`,
-  **1** otherwise — so a shell/cron caller can branch without parsing prose.
+  **4** on `quota_exceeded`, **1** otherwise — so a shell/cron caller can branch without parsing prose.
+  `quota_exceeded` is worth its own code because it is **not resumable**: measured 2026-09-19,
+  Google caps downloads per export (5) and answers every further attempt with
+  `quotaExceeded=true` on the archive-page bounce. A caller that files it under "1 otherwise"
+  will retry forever against an export that can never succeed.
 * `--json` prints the `RunOutcome`/`Report` as JSON instead of markdown.
 * Both must work with `--ledger` pointing at a real local path and must not require
   a browser for `report` (it reads the ledger only).

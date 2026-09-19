@@ -22,7 +22,15 @@ from typing import Optional
 
 from .ledger import LedgerOnFuseMount, open_ledger
 from .report import build_report
-from .run import RunConfig, run_once
+from .run import RunConfig, run_once_sync
+
+# NOTE: `run_once` is async. The CLI must call `run_once_sync`, which wraps it in
+# asyncio.run. Calling `run_once` directly returns a coroutine and every later
+# attribute access fails — measured live 2026-09-19:
+#     AttributeError: 'coroutine' object has no attribute 'report_markdown'
+#     RuntimeWarning: coroutine 'run_once' was never awaited
+# The sync wrapper existed and was tested; nothing tested that the CLI *used* it.
+# tests/v3/test_cli.py now exercises the CLI path itself.
 
 EXIT_OK = 0
 EXIT_OTHER = 1
@@ -81,7 +89,7 @@ def cmd_run(args) -> int:
         verify_hash=args.verify_hash,
         require_mount=not args.allow_unmounted_archive,
     )
-    outcome = run_once(cfg)
+    outcome = run_once_sync(cfg)
 
     if args.json:
         print(json.dumps({

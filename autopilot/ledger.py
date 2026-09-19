@@ -24,6 +24,7 @@ Attempts are recorded per *kind* so a budget can tell the two apart.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +63,28 @@ class AttemptKind:
     MINT = "mint"          # measured Δ1
     TRANSFER = "transfer"  # a fresh full GET — cost UNMEASURED, do not assume 0
     RESUME = "resume"      # measured Δ0
+
+
+#: A real Takeout part filename, e.g. `takeout-20260919T163231Z-1-001.zip`.
+#:
+#: Used to decide whether a name is worth keeping. The scrape cannot produce one
+#: (its source is the redirector basename `download`), so this is how a recorded
+#: real name survives a re-scrape.
+PART_FILENAME_RE = re.compile(r"^takeout-\d{8}T\d{6}Z-\d+-\d+\.zip$", re.I)
+
+
+def looks_like_part_filename(name: str) -> bool:
+    """Whether `name` is a real Takeout part filename rather than a placeholder.
+
+    Pure, so the rule that decides when a recorded filename is preserved is
+    testable without a database.
+    """
+    return bool(PART_FILENAME_RE.match((name or "").strip()))
+
+
+#: A real Takeout part filename, e.g. `takeout-20260919T163231Z-1-001.zip`.
+#: (Kept beside the predicate so both are found together.)
+PART_FILENAME_EXAMPLE = "takeout-20260919T163231Z-1-001.zip"
 
 
 class LedgerError(AutopilotError):
@@ -268,23 +291,29 @@ class Ledger:
         """
         n = 0
         for idx, filename, size in parts:
+            # The scrape's filename comes from the redirector's basename, which is
+            # the literal string `download` for EVERY part (measured 2026-09-19) —
+            # so it carries no part identity and must never replace a name that is
+            # real. `set_part_filename()` records the real one after minting.
+            #
+            # The test is a PATTERN, not the literal `download`. A literal check
+            # was tried first and was too narrow: any other non-name from the page
+            # still clobbered a recorded real name, which is exactly how the
+            # destination-index skip silently failed to fire.
+            incoming = filename or None
+            existing = self.part(archive_id, idx)
+            if existing is not None:
+                current = existing["filename"] or ""
+                if (looks_like_part_filename(current)
+                        and not looks_like_part_filename(incoming or "")):
+                    incoming = current
             self.conn.execute(
                 "INSERT INTO parts (archive_id, idx, filename, size_expected, status) "
                 "VALUES (?,?,?,?,'pending') "
                 "ON CONFLICT(archive_id, idx) DO UPDATE SET "
-                # A scrape can ONLY ever produce the placeholder `download`, because
-                # the redirector path is `takeout/download?j=...` (measured
-                # 2026-09-19). The real part name is knowable only after minting, and
-                # `set_part_filename()` records it then. So the scrape's value must
-                # never overwrite a real one: a plain COALESCE did exactly that,
-                # because the incoming string is always the non-NULL literal
-                # `download`, so every part's name was reset on every re-run.
-                " filename=CASE"
-                "   WHEN excluded.filename IS NULL OR excluded.filename IN ('', 'download')"
-                "   THEN COALESCE(parts.filename, excluded.filename)"
-                "   ELSE excluded.filename END,"
+                " filename=COALESCE(excluded.filename, parts.filename),"
                 " size_expected=COALESCE(excluded.size_expected, parts.size_expected)",
-                (archive_id, idx, filename, size),
+                (archive_id, idx, incoming, size),
             )
             n += 1
         self.conn.commit()

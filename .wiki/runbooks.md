@@ -215,3 +215,67 @@ of acting on unvalidated instruments.
 `Range` resume preserves budget); `resume` = **COSTS 1** destroys Option B's stated advantage and
 favours Option A (browser-native). The `full` row must come out at exactly **1** — if it does not, the
 oracle is wrong and no other row can be trusted.
+
+---
+
+## 8. See the screen and click on it (the VNC desktop)
+
+Chromium in `takeout-webgui` runs against **`DISPLAY=:1`** (Xvfb, live viewport **2142x1372**), served over
+KasmVNC. So the whole desktop is observable and drivable — not just the page DOM. Verified 2026-09-19.
+
+**This is the fallback for anything CDP cannot reach** — native Chrome dialogs, the download shelf, KDE
+notifications — and it gives **pixels as ground truth** when the DOM reports misleadingly. It immediately
+showed something a DOM read had missed: **two tabs** open (`Google Takeout` + `Download history`).
+
+### See the browser viewport (cheapest, needs only CDP)
+
+```bash
+# Page.captureScreenshot -> base64 PNG; no ImageMagick required
+ssh takeout-server 'docker exec takeout-webgui python3 /tmp/tk_sc.py'   # see .recon/probe_see_click.py
+# then read it with a vision model, or just docker cp it out:
+ssh takeout-server 'docker cp takeout-webgui:/config/_screen.png /tmp/_screen.png'
+scp takeout-server:/tmp/_screen.png ./
+```
+
+### See the WHOLE desktop
+
+`xwd` is installed; **ImageMagick, netpbm and ffmpeg are not** — hence `tools/xwd_to_png.py`.
+
+```bash
+ssh takeout-server 'docker exec takeout-webgui sh -c "DISPLAY=:1 xwd -root -silent -out /tmp/d.xwd"'
+scp tools/xwd_to_png.py takeout-server:/tmp/ && \
+ssh takeout-server 'docker cp /tmp/xwd_to_png.py takeout-webgui:/tmp/ >/dev/null && \
+  docker exec takeout-webgui python3 /tmp/xwd_to_png.py /tmp/d.xwd /tmp/d.png'
+```
+
+Expected: `parsed XWD: {bpp: 24, width: 2144, height: 1372, byte_order: 0, ncolors: 256}` then a ~200 KB
+PNG. **Look at the output before trusting it** — a wrong pixel stride produces a diagonally-sheared image
+that still saves without error.
+
+```bash
+# Pillow ships an XwdImagePlugin but it REJECTS Xvfb's dump:
+#   PIL.UnidentifiedImageError: cannot identify image file
+# Use tools/xwd_to_png.py instead.
+```
+
+### Click and type
+
+```bash
+ssh takeout-server 'docker exec takeout-webgui sh -c "DISPLAY=:1 xdotool getdisplaygeometry"'
+ssh takeout-server 'docker exec takeout-webgui sh -c "DISPLAY=:1 xdotool getactivewindow getwindowname"'
+#   -> "Google Takeout - Chromium"
+
+# targeted input: focus the browser window, then move/click/type
+#   DISPLAY=:1 xdotool search --name Chromium windowactivate
+#   DISPLAY=:1 xdotool mousemove X Y click 1
+#   DISPLAY=:1 xdotool type --delay 60 'text here'
+#   DISPLAY=:1 xdotool key Return
+```
+
+**Pitfall (learned the hard way):** `docker exec` does **not** forward stdin without `-i`, so
+`docker exec ctr python3 - <<'PY'` silently does nothing. Write the script to a file,
+`docker cp` it in, and run it by path — the pattern used everywhere above.
+
+**Design consequence for ReAuth:** `xdotool` can type the password step, so the human burden drops from
+*"open the webgui and type a password"* to *"approve a prompt"* — with SMS/prompt 2FA the second factor
+still needs the owner's phone. Worth weighing before implementing the re-auth path.

@@ -144,16 +144,49 @@ One directory per account under `/opt/archives/google-takeout/` (verified):
 Download root is `<storage_root>/google-takeout/<account>/<export-ts>/` (`manager/config.py`,
 `takeout_subdir` via env `TAKEOUT_SUBDIR`).
 
-⚠️ **The Chromium profile is currently LOGGED OUT.** Verified: the `takeout.google.com/manage` tab's
-title is literally `takeout.google.com` (the sign-in interstitial), and every other Google tab is
-titled **"Sign in - Google Accounts"**. A human must sign in before any export can be created or any
-URL minted.
-
 ⚠️ **The v2 ledger sits ON the rclone FUSE mount.** `/opt/archives/google-takeout/` contains
 `state.db`, `state.db-shm` and `state.db-wal` (156 KB WAL) — i.e. the production deployment puts a
 WAL-mode SQLite database on a network-backed FUSE filesystem. This **verifies** the `state.db` hazard
 previously assessed as "partially true": it is not merely a doc example, it is the live
-configuration. Move it to the LUKS volume.
+configuration. Move it to the LUKS volume. *(v3 refuses such a path outright — `autopilot/ledger.py`.)*
+
+✅ **The Chromium profile IS signed in — corrected 2026-09-19.** An earlier reading of "logged out"
+(based on tab *titles* `Sign in - Google Accounts`) was an artifact of stale renderers from a period when
+the session had lapsed. Verified twice since, independently:
+
+1. `Account: Google Account: BrainCreation` read from the archive page's own DOM.
+2. A screenshot of the desktop, read visually, shows the Google Account → Summary page with the export
+   list and **no sign-in prompt**.
+
+So no human sign-in is needed to *read* the manage page. A human *is* still needed to satisfy the ReAuth
+password challenge that minting requires (see `measured-facts.md`).
+
+## The desktop is visible and clickable (X11 + VNC)
+
+The container runs Chromium against **`DISPLAY=:1`** (Xvfb, virtual screen `15360x8640x24`, live viewport
+**2142x1372**), served to the browser over KasmVNC. That means the whole desktop — not just the page DOM —
+is observable and drivable. Verified 2026-09-19.
+
+| Capability | Tool | Status |
+|---|---|---|
+| **See the browser viewport** | CDP `Page.captureScreenshot` → PNG (2146x1145, ~119 KB) | ✅ verified, and read with a vision model |
+| **See the whole desktop** | `xwd -root` → `tools/xwd_to_png.py` → PNG (2144x1372, ~198 KB) | ✅ verified coherent (no stride artifacts) |
+| **Move/click the pointer** | `xdotool mousemove` / `click` | ✅ present, not yet exercised |
+| **Type / send keys** | `xdotool type` / `key` | ✅ present, not yet exercised |
+| **List / target windows** | `xdotool search --name …` | ✅ active window reads as `Google Takeout - Chromium` |
+| **Clipboard** | `xclip` | ✅ present |
+| ImageMagick, netpbm, ffmpeg, numpy | — | ❌ **absent** (hence the converter tool) |
+| Pillow | in container `python3` | ✅ present |
+
+**Why this matters beyond convenience:** it is a *fallback for anything CDP cannot reach* — native Chrome
+dialogs, the download shelf, KDE notifications — and it gives **pixels as ground truth** for state that the
+DOM reports misleadingly. The whole-desktop capture immediately showed something the DOM read had missed:
+**two tabs open** (`Google Takeout` and `Download history`).
+
+**Design consequence for ReAuth (§4.2):** the human burden can drop from *"open the webgui and type a
+password"* to *"approve a prompt"*. `xdotool` can focus the Chromium window and type the password step; with
+SMS/Google-prompt 2FA the second factor still needs the owner's phone. That is a smaller ask than the
+design currently assumes, and is worth weighing before implementing the re-auth path.
 
 ## Open questions
 

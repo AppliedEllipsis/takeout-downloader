@@ -28,6 +28,7 @@ __all__ = [
     "read_archive",
     "pick_rapt_url",
     "recover_rapt_url",
+    "provoke_rapt",
     "page_has_rapt",
     "READ_JS",
 ]
@@ -273,3 +274,44 @@ async def recover_rapt_url(session: CdpSession, archive_id: str) -> Optional[str
 def page_has_rapt(page: ArchivePage) -> bool:
     """True when the scraped page serves at least one tokened download link."""
     return any("rapt=" in (p.redirector or "") for p in (page.parts or []))
+
+
+async def provoke_rapt(session: CdpSession, redirector: str, *,
+                       settle: float = 8.0) -> Optional[str]:
+    """EARN a fresh rapt by navigating the un-tokened redirector once.
+
+    **Measured 2026-09-19, and it is why signing in alone did not help.** A session
+    can be fully authenticated and the archive page still serves untokened links;
+    `recover_rapt_url` only finds a token that already exists somewhere, so it finds
+    nothing. But navigating the redirector *without* a token makes Google bounce back
+    to the archive page carrying a fresh one:
+
+        takeout/download?j=<id>&i=0&user=<uid>          (no rapt)
+          -> 302 -> manage/archive/<id>?user=...&pli=1&rapt=<fresh>
+
+    which is exactly how the project's first successful run happened — done by hand at
+    the time. Without this the orchestrator could only ever work when a human had just
+    clicked through a download, and reported `needs_reauth` otherwise.
+
+    Returns the tokened archive URL, or `None` when the bounce did not yield one (a
+    genuine sign-in demand, or an unrecognisable chain). Costs **Δ0**: a bounced
+    request is measured free — the token is not minted from it.
+
+    Never aborts the request. Aborting breaks the mint (see `mint.py`).
+    """
+    if not redirector:
+        return None
+    try:
+        await session.call("Page.navigate", {"url": redirector}, timeout=25.0)
+    except Exception:
+        # A navigation that starts a download does not always resolve its reply
+        # promptly; the bounce we want still happens.
+        pass
+    await session.drain(settle)
+    try:
+        landed = await session.value("location.href") or ""
+    except Exception:
+        return None
+    if "rapt=" in landed and "accounts.google.com" not in landed:
+        return landed
+    return None

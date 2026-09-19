@@ -52,7 +52,13 @@ from .mover import (
     plan_moves,
 )
 from .report import build_report, parse_expiry
-from .scrape import archive_url, page_has_rapt, read_archive, recover_rapt_url
+from .scrape import (
+    archive_url,
+    page_has_rapt,
+    provoke_rapt,
+    read_archive,
+    recover_rapt_url,
+)
 from .transport import TransferError, RemoteChanged, download
 from .verify import verify_local
 
@@ -379,11 +385,34 @@ async def run_once(
                                 [(p.index, p.filename, _int_size(p.size)) for p in page.parts])
 
             # ---- 3b. a tokened link is REQUIRED to mint --------------------
-            # Measured: a rapt-less redirector bounces to ServiceLogin. That is
-            # not a ReAuth requirement — it means the page was loaded without a
-            # rapt (see the block comment in `scrape.py`). Detecting it here
-            # saves a mint attempt and, more importantly, stops the run from
-            # reporting "ReAuth required" when the session was never at fault.
+            # Measured: a rapt-less redirector bounces to ServiceLogin. That is not a
+            # ReAuth requirement — it means the page was loaded without a rapt (see the
+            # block comment in `scrape.py`). Detecting it here saves a mint attempt and
+            # stops the run reporting "ReAuth required" when the session was never at
+            # fault.
+            #
+            # But detecting it is not enough: a token can be EARNED. Measured
+            # 2026-09-19 — a fully signed-in session still serves untokened links, and
+            # navigating the redirector once bounces back with a fresh token. So the
+            # first response is to go get one, not to demand a human. Previously the
+            # run could only work when someone had just clicked through a download,
+            # and reported `needs_reauth` otherwise — including right after a sign-in.
+            if not page_has_rapt(page):
+                _redirector = next((p.redirector for p in page.parts if p.redirector), "")
+                if _redirector:
+                    _provoked = await provoke_rapt(session, _redirector,
+                                                   settle=cfg.settle)
+                    if _provoked:
+                        page = await read_archive(session, _provoked, settle=cfg.settle)
+                        restore_url = (page.url if "rapt=" in (page.url or "")
+                                       else _provoked)
+                        if page.challenged:
+                            ledger.set_job_status(cfg.archive_id, "needs_reauth",
+                                                  error=f"challenge at {page.url}")
+                            return await _finish(
+                                "needs_reauth",
+                                error=f"the archive page is a sign-in page: {page.url}")
+
             if not page_has_rapt(page):
                 ledger.set_job_status(
                     cfg.archive_id, "needs_reauth",
@@ -391,9 +420,10 @@ async def run_once(
                 return await _finish(
                     "needs_reauth",
                     error=("the archive page served download links carrying no "
-                           f"rapt (loaded {work_url}). Satisfying the ReAuth "
-                           "challenge is what appends a rapt to the archive URL. "
-                           "No download attempt was spent."))
+                           f"rapt, and provoking one by navigating the redirector "
+                           "did not produce a token either (loaded {0}). A human "
+                           "must satisfy the interactive ReAuth challenge. No "
+                           "download attempt was spent.").format(work_url))
 
             # ---- 4. the jar (only the transporter needs it) ----------------
             try:

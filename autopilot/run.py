@@ -47,6 +47,7 @@ from .mover import (
     DestinationIndex,
     MoveRefused,
     assert_destination_ready,
+    assert_staging_ready,
     index_destination,
     move_part,
     plan_moves,
@@ -114,6 +115,15 @@ class RunConfig:
     verify_hash: bool = False
     settle: float = 20.0
     work_url: Optional[str] = None
+    #: Refuse to stage when free space is below this many bytes. `None` = do not check,
+    #: which is the default for tests and development; the CLI supplies a real value.
+    #: v2's equivalent had NO escape and made its own suite unrunnable on a full disk,
+    #: so the guard meant to protect production broke every test.
+    min_headroom: Optional[int] = None
+    #: Watchdog for one file's copy into the archive (seconds), and how long it may make
+    #: no progress before the copy child gives up. See `mover.MOVE_WATCHDOG_SECONDS`.
+    move_timeout: Optional[float] = None
+    move_stall: Optional[float] = None
 
     def resolved_work_url(self) -> str:
         return self.work_url or archive_url(self.archive_id)
@@ -308,6 +318,27 @@ async def run_once(
                       or (f"job is already {_terminal_status}; refusing to re-attempt "
                           "a terminal export — see runbooks 1.14 / 1.19"),
             )
+
+        # ---- 0c. staging must have room --------------------------------
+        # The architecture requires an approved-root and headroom check; the only thing
+        # that existed was `os.makedirs`. Staging shares a volume with rclone's VFS
+        # cache (`--vfs-cache-max-size 100G`) on the box this was written for, so one
+        # full transfer transiently occupies staging PLUS cache, and running out
+        # mid-write wedges a partial (failure mode 1.16).
+        #
+        # `cfg.min_headroom` defaults to None = do not check, deliberately: v2's
+        # hard-coded 20 GiB floor had no escape and made its own suite unrunnable on a
+        # nearly-full development disk, so the guard meant to protect production broke
+        # every test. The escape here is explicit, and the CLI supplies a real value.
+        #
+        # Placed AFTER `_finish` exists — this guard was nearly written next to
+        # `makedirs` above, which would have referenced the closure before it was
+        # created and failed only on the path it was meant to protect.
+        try:
+            assert_staging_ready(cfg.staging_dir, min_headroom=cfg.min_headroom)
+        except MoveRefused as exc:
+            ledger.set_job_status(cfg.archive_id, "failed", error=str(exc))
+            return await _finish("failed", error=f"refusing to stage: {exc}")
 
         # Opening the browser session is the first thing that can fail, and it used
         # to fail UNCAUGHT: `_default_session_factory` fetches `/json/list`, so a
@@ -619,8 +650,11 @@ async def run_once(
 
                 # ---- move (rename last; index kept in memory) --------------
                 ledger.set_job_status(cfg.archive_id, "moving")
-                moved = move_part(staged, cfg.archive_dir, filename=real_name,
-                                  expected_size=expected)
+                moved = move_part(
+                    staged, cfg.archive_dir, filename=real_name,
+                    expected_size=expected,
+                    **{k: v for k, v in (("timeout", cfg.move_timeout),
+                                         ("stall", cfg.move_stall)) if v is not None})
                 if moved.action == "moved":
                     dest_index.names[real_name] = expected or 0
                     ledger.set_part_status(cfg.archive_id, idx, "done")

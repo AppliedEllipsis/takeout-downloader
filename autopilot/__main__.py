@@ -83,6 +83,29 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _env_int(name: str, default):
+    """Read an int from the environment, falling back on anything unparseable."""
+    import os
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(float(raw.strip()))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default):
+    import os
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 def cmd_run(args) -> int:
     cfg = RunConfig(
         archive_id=args.archive_id,
@@ -94,6 +117,13 @@ def cmd_run(args) -> int:
         max_parts=args.max_parts,
         verify_hash=args.verify_hash,
         require_mount=not args.allow_unmounted_archive,
+        # A REAL run stages onto a volume it shares with rclone's VFS cache, so the
+        # library default of "do not check" is wrong here. The library keeps None as its
+        # default because a hard floor with no escape made v2's suite unrunnable on a
+        # nearly-full development disk; a real value belongs in the CLI.
+        min_headroom=_env_int("AUTOPILOT_MIN_HEADROOM", 5 << 30),   # 5 GiB
+        move_timeout=_env_float("AUTOPILOT_MOVE_TIMEOUT", None),
+        move_stall=_env_float("AUTOPILOT_MOVE_STALL", None),
     )
     outcome = run_once_sync(cfg)
 

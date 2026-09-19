@@ -25,16 +25,28 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from .errors import AutopilotError
 from .ledger import _normalize, fuse_mount_for
 
+#: Overall ceiling for ONE file's copy into the archive, and how long it may make no
+#: progress at all before the child gives up. Both generous on purpose: rclone runs
+#: with `--timeout 1h`, so a healthy transfer of a multi-GB part can legitimately take
+#: many minutes, and a tight limit would murder it. The stall guard is the one that
+#: matters for a wedged mount, because a blocked FUSE write never reports progress and
+#: never returns.
+MOVE_WATCHDOG_SECONDS = 1800.0      # 30 min per file
+MOVE_STALL_SECONDS = 300.0          # 5 min with zero bytes written
+
 __all__ = [
     "MovePlanItem",
     "MoveResult",
     "MoveRefused",
+    "assert_staging_ready",
     "index_destination",
     "plan_moves",
     "move_part",
@@ -175,7 +187,9 @@ def plan_moves(sources: Iterable[tuple[str, str, int]],
 def move_part(source: str, dest_dir: str, *,
               filename: Optional[str] = None,
               expected_size: Optional[int] = None,
-              chunk: int = 4 << 20) -> MoveResult:
+              chunk: int = 4 << 20,
+              timeout: float = MOVE_WATCHDOG_SECONDS,
+              stall: float = MOVE_STALL_SECONDS) -> MoveResult:
     """Copy `source` into `dest_dir` under a temp name, then rename.
 
     `filename` is the name to land under, and it is **deliberately not derived**
@@ -202,20 +216,53 @@ def move_part(source: str, dest_dir: str, *,
 
     tmp_path = os.path.join(dest_dir, filename + PARTIAL_SUFFIX)
     final_path = os.path.join(dest_dir, filename)
+
+    # The copy runs in a CHILD PROCESS, with a hard timeout.
+    #
+    # Why a process and not a thread or a socket timeout: the destination is an rclone
+    # FUSE mount, and a wedged write blocks inside the kernel's FUSE layer. That cannot
+    # be interrupted from the thread that issued it — `signal`/`close`/`timeout` do not
+    # reach it — so the only boundary that can actually reclaim the run is process
+    # death. Before this, one stuck write meant the whole run hung with no output and no
+    # diagnosis, which is failure mode 1.16 shape 2.
+    #
+    # The timeout is deliberately GENEROUS and progress-aware rather than tight: rclone
+    # runs with `--timeout 1h`, so a legitimately slow upload can legitimately take a
+    # long time. A tight per-file limit would murder healthy transfers. The operator can
+    # override it per run.
+    moved = 0
     try:
-        with open(source, "rb") as src, open(tmp_path, "wb") as dst:
-            moved = 0
-            while True:
-                block = src.read(chunk)
-                if not block:
-                    break
-                dst.write(block)
-                moved += len(block)
-            dst.flush()
-            os.fsync(dst.fileno())
+        proc = subprocess.run(
+            [sys.executable, "-c", _COPY_CHILD,
+             source, tmp_path, str(chunk), str(stall)],
+            capture_output=True, text=True, timeout=timeout + 30,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            _unlink_quietly(tmp_path)
+            return MoveResult(filename, "failed",
+                              detail=(detail[-1] if detail else
+                                      f"copy child exited {proc.returncode}"))
+        moved = int((proc.stdout or "0").strip() or 0)
+    except subprocess.TimeoutExpired:
+        _unlink_quietly(tmp_path)
+        return MoveResult(
+            filename, "failed",
+            detail=(f"WATCHDOG: the copy to {dest_dir!r} made no progress for "
+                    f"{timeout}s and was killed. A blocked FUSE write cannot be "
+                    f"interrupted in-process, so the child was abandoned rather "
+                    f"than left to wedge the run. Check the rclone mount "
+                    f"(failure mode 1.7/1.16)."),
+        )
+    except FileNotFoundError as exc:
+        _unlink_quietly(tmp_path)
+        return MoveResult(filename, "failed",
+                          detail=f"cannot start the copy child: {exc}")
+
+    try:
         written = os.path.getsize(tmp_path)
         if written != size:
-            os.unlink(tmp_path)
+            _unlink_quietly(tmp_path)
             return MoveResult(filename, "failed",
                               detail=f"short write: {written} != {size}")
         # rename last: a server-side move on rclone, and no truncated file ever
@@ -223,9 +270,75 @@ def move_part(source: str, dest_dir: str, *,
         os.replace(tmp_path, final_path)
         return MoveResult(filename, "moved", bytes_moved=moved)
     except OSError as exc:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
+        _unlink_quietly(tmp_path)
         return MoveResult(filename, "failed", detail=str(exc))
+
+
+#: The child's copy loop. Kept as a literal so the parent can spawn it without
+#: importing this module again in a fresh interpreter (and so the exact bytes that run
+#: are the ones reviewed here).
+#:
+#: argv: source, tmp_path, chunk, stall_seconds
+#: stdout: total bytes written
+_COPY_CHILD = r"""
+import os, sys, time
+src, dst_path, chunk, stall = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+n = 0
+last = time.time()
+with open(src, 'rb') as s, open(dst_path, 'wb') as d:
+    while True:
+        b = s.read(chunk)
+        if not b:
+            break
+        d.write(b)
+        n += len(b)
+        now = time.time()
+        # Progress watchdog INSIDE the child too: a write that returns but never
+        # makes progress would otherwise sit here forever without tripping the
+        # parent's timeout, because the parent only bounds the whole call.
+        if now - last > stall:
+            sys.stderr.write('no progress for %ss after %d bytes\n' % (stall, n))
+            sys.exit(3)
+        last = now
+    d.flush()
+    os.fsync(d.fileno())
+print(n)
+"""
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def assert_staging_ready(path: str, *, min_headroom: Optional[int] = None) -> None:
+    """Refuse to stage where there is no room.
+
+    The architecture requires an approved-root and headroom check, and it did not
+    exist at all: `run_once` called `os.makedirs(cfg.staging_dir)` and nothing else.
+    Staging shares a volume with rclone's VFS cache (`--vfs-cache-max-size 100G`) on the
+    box this was written for, so a full transfer transiently occupies staging **plus**
+    cache, and `ENOSPC` mid-write leaves a wedged partial behind (failure mode 1.16).
+
+    `min_headroom=None` means "do not check" and is the DEFAULT, deliberately. v2 had a
+    hard-coded 20 GiB floor with no escape, which made its own test suite unrunnable on
+    a nearly-full development disk — the guard protecting production broke every test.
+    The escape here is explicit and the caller decides; the CLI supplies a real value
+    for real runs.
+    """
+    if not os.path.isdir(path):
+        raise MoveRefused(f"staging directory does not exist: {path!r}")
+    if min_headroom is None:
+        return
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError as exc:
+        raise MoveRefused(f"cannot measure free space at {path!r}: {exc}") from exc
+    if free < min_headroom:
+        raise MoveRefused(
+            f"staging {path!r} has {free / 2**30:.1f} GiB free, below the "
+            f"{min_headroom / 2**30:.1f} GiB headroom floor"
+        )

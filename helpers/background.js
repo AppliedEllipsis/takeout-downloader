@@ -35,7 +35,14 @@ const DEFAULTS = {
     managerUrl: 'http://127.0.0.1:8080',
     captureToken: '',        // X-Capture-Token; empty => dev/open manager
     autoPost: true,          // POST captures to the manager automatically
-    autoRecapture: true,     // re-capture when the manager asks (needs_cookie)
+    // FAILS CLOSED, deliberately. This was `true`, and that default is what
+    // produced failure mode 1.9: any job stuck in `needs_cookie` made the
+    // one-minute alarm below open another browser tab, every minute, for about
+    // three months (measured peak: 314 tabs, memory 0 -> 4.7 GB). Setting it to
+    // false in *storage* fixed the live instance, but storage does not survive a
+    // profile reset — so on a fresh profile the flood came straight back. The
+    // default must be the safe value, and the opt-in must be explicit.
+    autoRecapture: false,    // re-capture when the manager asks (needs_cookie)
     accountEmail: null,      // best-effort, scraped from the Takeout page DOM
     lastPostStatus: null     // { ok, code, jobId, error, at } of the last POST
 };
@@ -217,7 +224,10 @@ function getManagerSettings() {
                 managerUrl: d.managerUrl || DEFAULTS.managerUrl,
                 captureToken: d.captureToken || '',
                 autoPost: d.autoPost !== false,
-                autoRecapture: d.autoRecapture !== false
+                // `=== true`, NOT `!== false`. The old form treated a missing or
+                // undefined value as ENABLED, so any config merge that omitted
+                // the key silently turned the tab-flood spawner back on.
+                autoRecapture: d.autoRecapture === true
             })
         );
     });
@@ -416,7 +426,16 @@ function notifyManager(title, message) {
 // ---------------------------------------------------------------------------
 const RECAPTURE_ALARM = 'takeout-recapture-poll';
 
-chrome.alarms.create(RECAPTURE_ALARM, { periodInMinutes: 1 });
+// The alarm is only created when the operator has explicitly opted in. Creating
+// it unconditionally meant that even with the feature disabled we still polled
+// the manager every minute forever — so any bug in the early-return below would
+// resume the tab flood (failure mode 1.9). Fail closed, and check at creation
+// time as well as on every tick.
+chrome.storage.local.get(['autoRecapture'], (d) => {
+    if (d.autoRecapture === true) {
+        chrome.alarms.create(RECAPTURE_ALARM, { periodInMinutes: 1 });
+    }
+});
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === RECAPTURE_ALARM) pollRecapturePending();
 });
@@ -424,7 +443,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 async function pollRecapturePending() {
     let s;
     try { s = await getManagerSettings(); } catch (e) { return; }
-    if (!s.autoRecapture) return;
+    if (s.autoRecapture !== true) return;   // strict: only an explicit true proceeds
     try {
         const headers = {};
         if (s.captureToken) headers['X-Capture-Token'] = s.captureToken;
@@ -564,7 +583,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 managerUrl: d.managerUrl || DEFAULTS.managerUrl,
                 captureToken: d.captureToken || '',
                 autoPost: d.autoPost !== false,
-                autoRecapture: d.autoRecapture !== false,
+                autoRecapture: d.autoRecapture === true,   // fail closed; see DEFAULTS
                 lastV2Capture: d.lastV2Capture || null,
                 lastV2PostStatus: d.lastV2PostStatus || null
             })

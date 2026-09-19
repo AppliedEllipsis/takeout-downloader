@@ -134,18 +134,29 @@ class Report:
 
 def build_report(parts, *, archive_id: str, account: Optional[str] = None,
                  status: str = "pending", expiry_at: Optional[str] = None,
-                 now: Optional[datetime] = None) -> Report:
+                 now: Optional[datetime] = None,
+                 attempts: Optional[dict] = None,
+                 dl_counts: Optional[dict] = None) -> Report:
     """Assemble a report from ledger part rows.
 
     `parts` is any iterable of objects with `idx`, `status`, `size_expected`,
     `size_on_disk`, `attempts`, `dl_count_seen` — i.e. `ledger.PartRow`, but not
     tied to it so this stays trivially testable.
+
+    `attempts` is `ledger.attempts_by_kind(archive_id)`. It was originally
+    omitted, which made the report's "Attempts spent" table print **zeros
+    always** — a decorative instrument in a project whose whole lesson is not to
+    print numbers that are not measurements. `tests/v3/test_report.py` now pins
+    that the table reflects real counts.
     """
     now = now or datetime.now(timezone.utc)
     parts = list(parts)
 
     rep = Report(archive_id=archive_id, account=account, status=status,
-                 expiry_at=expiry_at, parts_expected=len(parts))
+                 expiry_at=expiry_at, parts_expected=len(parts),
+                 attempts=dict(attempts or {}))
+    if dl_counts:
+        rep.dl_counts.update(dl_counts)
 
     for p in parts:
         idx = getattr(p, "idx", None)

@@ -500,3 +500,62 @@ distinction.
 `autoCancelDownloads` **restored to `true`** (the hybrid architecture makes the browser downloading
 bytes pure waste; the owner was right). `autoRecapture` remains **`false`** (tab-flood fix).
 Burn-export counter stands at **3**; no further experiments planned on it.
+
+## 2026-09-19 — `UrllibHttpClient` executed against real sockets for the first time
+
+### What changed
+
+New `tests/v3/test_http_client_live.py`. Until now `UrllibHttpClient` was referenced **only** by its
+own definition and `__all__` — `grep -rn 'UrllibHttpClient' . --include=*.py` proved it, and every
+test injected `fake_http.FakeHttpClient`. So `_NoRedirect` and `_UrllibStream` had never run once.
+
+* 6 network tests gated behind `AUTOPILOT_LIVE=1` (`pytest.mark.skipif`). Offline default unchanged.
+* 3 always-on tests, incl. a 127.0.0.1 `http.server` that answers `302 -> accounts.google.com` —
+  the sign-in classification path over a real socket, with a request count proving nothing was chased.
+* Every URL passes `_assert_not_google()` before it is requested (refuses `google.com`,
+  `googleapis.com`, `googleusercontent.com`, …). No test has ever contacted a Google host.
+
+### Commands run
+
+```
+/c/Users/User/anaconda3/python.exe -m pytest tests/v3 -q -p no:cacheprovider
+  -> 99 passed, 6 skipped in 2.41s        (was 96 passed)
+AUTOPILOT_LIVE=1 /c/Users/User/anaconda3/python.exe -m pytest tests/v3 -q -p no:cacheprovider
+  -> 105 passed in 7.54s
+```
+
+### Result — no bug found; the guards work in the real world
+
+`_NoRedirect` genuinely does **not** follow redirects: `httpbingo.org/redirect-to` returns the `302`
+itself with `Location: https://example.com/` intact and an empty body, and `download()` turns it into
+`TransferError` (not `NeedsReauth`). A real `Range: bytes=0-99` on `httpbingo.org/range/1024` returns
+`206` with `Content-Range: bytes 0-99/1024`, and a resume through `download(rewind=0)` reconstructed
+the object byte-for-byte (`resumed_from=100`, `status=complete`). Double `aclose()` is safe.
+
+Only cosmetic note, not a defect: urllib capitalises outgoing header names (`If-Range` -> `If-range`).
+Header names are case-insensitive and the live 206 resume confirms the server honoured it.
+
+Hosts used: `example.com`, `httpbingo.org`, `127.0.0.1`. Nothing else.
+
+## 2026-09-19 — integration test for the orchestrator (`autopilot/run.py`)
+
+**What changed.** Added `tests/v3/test_integration.py` (11 tests) covering the nine numbered
+behavioural rules of the frozen contract `docs/v3/02-RUN-INTERFACE.md`, written to the spec and not
+to the implementation. Fakes: `tests/v3/fake_cdp.py` + `fake_http.py`, plus a local
+`_PageTransport` (expression-dispatched `Runtime.evaluate`) and a `Harness` session factory that
+aggregates navigations across however many CDP sessions the orchestrator opens. Ledger/staging/archive
+are `tmp_path`; `settle=0.01`; `require_mount=False`.
+
+**Result.** Full `tests/v3` suite: **112 passed, 1 failed, 6 skipped** (the 6 skips pre-exist; the 96
+test baseline was already 102 by the time this ran — other agents adding tests concurrently). The one
+failure is `test_rule5_max_parts_bounds_the_work`, a genuine `run.py` defect rather than a test bug:
+on a bounded run `run_once` calls `ledger.set_job_status(archive_id, "incomplete")`, and
+`ledger.JOB_STATUSES` has no `"incomplete"` — so the bounded path raises `LedgerError` instead of
+returning an `incomplete` `RunOutcome`. `incomplete` is an outcome status, not a ledger job status.
+All other rules pass, including rule 9 (no socket / no websocket connect with both fakes injected),
+rule 4 (expired export never navigates to a redirector) and rule 1 (mint then transfer, part `done`,
+job `complete`, file moved onto the archive).
+
+Commands: `/c/Users/User/anaconda3/python.exe -m pytest tests/v3 -q -p no:cacheprovider`
+(112 passed, 1 failed, 6 skipped) and `... --ignore=tests/v3/test_integration.py` (102 passed, 6 skipped —
+nothing pre-existing was broken).

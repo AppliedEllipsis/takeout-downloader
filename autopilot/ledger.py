@@ -44,8 +44,16 @@ __all__ = [
 ]
 
 JOB_STATUSES = (
+    # NOTE: `incomplete` is here because `autopilot.run.RunOutcome.status` and this
+    # vocabulary meet at exactly this point. A pass that ends with work remaining
+    # leaves the job in a state meaning "more to do"; `pending` would imply "not
+    # started", which is false. Found by `tests/v3/test_integration.py` — the
+    # orchestrator wrote its own status straight into the ledger and the two lists
+    # had silently disagreed. No unit test could see it, because `run.py` was
+    # written after them.
     "pending", "scraping", "needs_reauth", "transferring",
-    "verifying", "moving", "complete", "expired_unrecoverable", "failed",
+    "verifying", "moving", "incomplete", "complete",
+    "expired_unrecoverable", "failed",
 )
 PART_STATUSES = ("pending", "active", "partial", "done", "failed", "budget_exhausted")
 

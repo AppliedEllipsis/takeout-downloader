@@ -115,6 +115,11 @@ class RunConfig:
     verify_hash: bool = False
     settle: float = 20.0
     work_url: Optional[str] = None
+    #: Earn every part's URL and stop, without transferring. Measured reason: a minted
+    #: URL outlives the ~45-minute ReAuth window (206 after 81 minutes), and minting is
+    #: what the window gates — so a long pull should mint everything first, then
+    #: transfer on a later pass against the cached URLs.
+    mint_only: bool = False
     #: Refuse to stage when free space is below this many bytes. `None` = do not check,
     #: which is the default for tests and development; the CLI supplies a real value.
     #: v2's equivalent had NO escape and made its own suite unrunnable on a full disk,
@@ -574,6 +579,21 @@ async def run_once(
                     part.filename = real_name
                     ledger.set_part_filename(cfg.archive_id, idx, real_name)
                 staged = os.path.join(cfg.staging_dir, real_name)
+
+                # ---- mint-only: stop after every URL is earned --------------
+                # Measured 2026-09-19: a minted URL still served `206` with real zip
+                # bytes **81 minutes after it was minted**, long past the ~45-minute
+                # ReAuth window. Minting is what the window gates; TRANSFERRING only
+                # needs the jar.
+                #
+                # That matters at real scale. This loop mints per part as it goes, so a
+                # 63-part export taking hours would run out of window part-way and
+                # stop with `needs_reauth` — unable to earn the later URLs. Minting all
+                # of them first, while the window is fresh, makes the long transfer
+                # pass independent of it. Since minted URLs are already cached in the
+                # ledger, a second ordinary run picks them up and never mints again.
+                if cfg.mint_only:
+                    continue
 
                 # ---- transfer (Range resume is free) -----------------------
                 ledger.set_job_status(cfg.archive_id, "transferring")

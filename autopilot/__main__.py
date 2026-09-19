@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--cdp-http", default="http://127.0.0.1:9222")
     run.add_argument("--max-parts", type=int, default=None,
                      help="bound the work (smoke runs)")
+    run.add_argument("--mint-only", action="store_true",
+                     help="earn every part's URL and stop, without transferring. "
+                          "A minted URL outlives the ~45-minute ReAuth window "
+                          "(measured: 206 after 81 minutes), and minting is what the "
+                          "window gates — so a long pull should mint first, then "
+                          "transfer on a later pass against the cached URLs.")
     run.add_argument("--verify-hash", action="store_true",
                      help="hash-verify instead of the cheap header+EOCD check")
     run.add_argument("--allow-unmounted-archive", action="store_true",
@@ -124,6 +130,7 @@ def cmd_run(args) -> int:
         min_headroom=_env_int("AUTOPILOT_MIN_HEADROOM", 5 << 30),   # 5 GiB
         move_timeout=_env_float("AUTOPILOT_MOVE_TIMEOUT", None),
         move_stall=_env_float("AUTOPILOT_MOVE_STALL", None),
+        mint_only=getattr(args, "mint_only", False),
     )
     outcome = run_once_sync(cfg)
 

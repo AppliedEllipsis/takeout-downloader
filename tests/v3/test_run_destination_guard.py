@@ -46,7 +46,7 @@ def test_the_guard_is_applied_when_require_mount_is_true(tmp_path, monkeypatch):
     outcome = go({**s, "cfg": cfg})
 
     assert outcome.status == "failed", f"expected a refusal, got {outcome.status}"
-    assert "mount point" in (outcome.error or ""), outcome.error
+    assert "FUSE mount" in (outcome.error or ""), outcome.error
     # the property that matters: refuse BEFORE transferring anything
     assert s["client"].requests == [], "must refuse before any transfer"
     assert list(dest.iterdir()) == [], "nothing may be written to the unverified path"
@@ -63,7 +63,7 @@ def test_the_escape_hatch_actually_waives_the_check(tmp_path, monkeypatch):
     cfg = replace(s["cfg"], archive_dir=str(dest), require_mount=False)
     outcome = go({**s, "cfg": cfg})
 
-    assert "mount point" not in (outcome.error or ""), (
+    assert "FUSE mount" not in (outcome.error or ""), (
         "the escape hatch did not waive the mount check: " + str(outcome.error))
 
 

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from .errors import AutopilotError
+from .ledger import _normalize, fuse_mount_for
 
 __all__ = [
     "MovePlanItem",
@@ -90,11 +91,20 @@ def is_mount_point(path: str, mounts: Iterable[tuple[str, str]]) -> bool:
 def assert_destination_ready(directory: str, *,
                              mounts: Optional[Iterable[tuple[str, str]]] = None,
                              require_mount: bool = True) -> None:
-    """Refuse to write into a destination that is not the real mount.
+    """Refuse to write into a destination that is not on the real storage mount.
+
+    **Containment, not equality.** The real destination is a *subdirectory* of the
+    mount (`/opt/archives/google-takeout/<account>/<export>/`), so testing whether
+    the path *is* a mount point would refuse the correct path — a guard that blocks
+    normal operation is as bad as one that does nothing. The question is whether the
+    destination currently sits **under** a FUSE mount: when the rclone daemon dies
+    the mount entry leaves the table, `/opt/archives` reverts to an ordinary
+    directory on the root filesystem, and this check then fails, which is exactly
+    what should happen (failure mode 1.7).
 
     `require_mount` exists so tests and local dev can opt out — the same idea as
-    v2's `EngineConfig.require_mount`, which correctly defaults to `False` for
-    dev. Here the *production* caller must pass `True` (v3's scheduler does).
+    v2's `EngineConfig.require_mount`, which correctly defaults to `False` for dev.
+    Here the production caller passes `True` (the CLI does).
     """
     if not os.path.isdir(directory):
         raise MoveRefused(f"destination {directory!r} does not exist")
@@ -105,9 +115,10 @@ def assert_destination_ready(directory: str, *,
         # No mount table available (e.g. Windows): we cannot verify, so say so
         # rather than pretending the check passed.
         return
-    if not is_mount_point(directory, table):
+    containing = fuse_mount_for(directory, table)
+    if containing is None:
         raise MoveRefused(
-            f"destination {directory!r} is not a mount point — the storage mount "
+            f"destination {directory!r} is not on a FUSE mount — the storage mount "
             "is probably detached, and writing here would land on the root "
             "filesystem (failure mode 1.7)"
         )

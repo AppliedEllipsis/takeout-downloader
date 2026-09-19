@@ -27,6 +27,7 @@ from autopilot.mover import (
     move_part,
     plan_moves,
 )
+from autopilot.ledger import fuse_mount_for
 
 MOUNTS = [("/", "ext4"), ("/opt/archives", "fuse.rclone"), ("/config", "xfs")]
 
@@ -41,11 +42,24 @@ def test_is_mount_point():
     assert is_mount_point("/config", MOUNTS) is True
 
 
-def test_refuses_a_destination_that_is_not_the_mount(tmp_path):
-    # exists, but is not listed as a mount point -> the mount is probably detached
+def test_refuses_a_destination_that_is_not_on_a_fuse_mount(tmp_path):
+    # exists, but is not under any FUSE mount -> the mount is probably detached
     with pytest.raises(MoveRefused) as e:
         assert_destination_ready(str(tmp_path), mounts=MOUNTS, require_mount=True)
-    assert "not a mount point" in str(e.value)
+    assert "not on a FUSE mount" in str(e.value)
+
+
+def test_a_SUBDIRECTORY_of_the_mount_passes():
+    """Containment, not equality — the real destination is a subdirectory.
+
+    The production destination is `/opt/archives/google-takeout/<acct>/<export>/`.
+    An equality test against mount points would refuse that correct path, which is
+    as bad as a guard that does nothing.
+    """
+    assert_destination_ready("/opt/archives", mounts=MOUNTS, require_mount=True)
+    nested = [("/", "ext4"), ("/opt/archives", "fuse.rclone")]
+    assert fuse_mount_for("/opt/archives/google-takeout/acct/2026-06-23", nested) \
+        == "/opt/archives"
 
 
 def test_refuses_a_destination_that_does_not_exist():

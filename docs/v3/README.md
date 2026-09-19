@@ -22,9 +22,9 @@ rather than by argument. Read `01-ARCHITECTURE.md` first.
 
 1. **The browser mints; the transporter moves.** Only a real browser can satisfy the password ReAuth
    that produces the `rapt` token — and `rapt` gates minting, not transferring.
-2. **Mint without downloading** — read the redirect `Location` and abandon the request, so no bytes move
-   and there is no race with the auto-cancel. **Goal firm; mechanism unverified** (three candidates,
-   see `01-ARCHITECTURE.md` §4.1) — settle it with one experiment before writing code.
+2. **Mint by navigating the redirector plainly** — observe the redirect `Location` over CDP `Network`
+   events and never abort the request (aborting prevents the mint). The extension cancels the browser's
+   stray download. **Resolved 2026-09-19** — see `01-ARCHITECTURE.md` §4.1.
 3. **`NEEDS_REAUTH` is a first-class state**, alerted and owned — never a `needs_cookie` park that
    spawns a tab a minute for three months.
 4. **Stage on `/config`, verify there, then move** — never write to `/`, never run a SQLite ledger on the

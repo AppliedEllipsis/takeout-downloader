@@ -45,15 +45,12 @@ That is exactly what the one hand-finished 3.08 TB export did by hand. v3 automa
 │   CHROMIUM  ──(CDP 127.0.0.1:9222)──┐                                              │
 │     • holds the Google session      │                                              │
 │     • satisfies ReAuth (a human)    │                                              │
-│     • MINTS signed URLs             │                                              │
-│        via the extension            │                                              │
-│                                     ▼                                              │
-│                              EXTENSION (MV3)                                       │
-│                                • scrapes /manage/archive/<id>                      │
-│                                • drives minting                                    │
-│                                • DETECTS the ReAuth challenge                      │
-│                                • cancels stray native downloads (keep, default ON) │
-│                                • hard tab cap                                      │
+│     • mints signed URLs when the     │                                             │
+│       daemon navigates the redirector│                                             │
+│                                         ▼                                          │
+│                             EXTENSION (helpers/, MV3)                              │
+│          • cancels the browser's stray native downloads (auto-cancel ON)           │
+│       • autoRecapture OFF by default — the tab-flood spawner stays disabled        │
 │                                                                                    │
 │                              AUTOPILOT DAEMON (python)                             │
 │                                • ledger  • scheduler                               │
@@ -84,8 +81,8 @@ a `rapt`*.
               SCRAPE  ◄────────────────────────┘
                   │  read /manage/archive/<id>: parts by i=, sizes, dl_counts
                   ▼
-               MINT     capture the 302 Location via CDP Fetch interception
-                  │     (no download is started — see §4.1)
+               MINT     navigate the redirector; capture the 302 Location from CDP
+                  │     Network events (observe-only — see §4.1)
                   ▼
             TRANSFER    Range requests with the live jar; free retries
                   │     ETag-guarded resume; stall watchdog
@@ -122,20 +119,30 @@ recommendation; recorded so the trade-off is explicit if it is ever revisited.
 
 | Module | Responsibility | Notes |
 |---|---|---|
+| `autopilot/run.py` | The orchestrator: scrape → mint → transfer → verify → move | ReAuth, expiry and quota become statuses, never exceptions. Contract: `02-RUN-INTERFACE.md` |
 | `autopilot/scrape.py` | Read `/manage/archive/<id>` over CDP; build the part list | Key every attribute by the `i=` from `data-download-uri` — **not** by filename (v2's `capturePayload` regression). Assert `distinct(i) == N` before planning |
-| `autopilot/auth.py` | ReAuth: detect the challenge, raise `NeedsReauth`, alert, resume | The `challenge/pwd` URL and the page text *"first verify it's you"* are the detectors |
-| `autopilot/mint.py` | Drive minting; capture the `Location` via CDP `Fetch` interception | Never let a download start (§4.1) |
+| `autopilot/mint.py` | Drive minting; capture the `Location` from CDP `Network` events | Navigate plainly and observe — aborting breaks the mint (§4.1); raises `NeedsReauth`, `QuotaExceeded` |
 | `autopilot/transport.py` | Move bytes: jar from CDP, `Range` resume, ETag validation, stall watchdog | The only module that talks to the file host |
+| `autopilot/cdp.py` | Transport-agnostic CDP client | One background reader routes replies and events; a concurrent reader is mandatory |
+| `autopilot/ws_transport.py` | Real-socket transport for `cdp.py` | The only module that imports a websocket library |
+| `autopilot/jar.py` | Pull the live Google cookie jar from the browser | The jar authenticates *transfers*; only the transporter needs it |
 | `autopilot/ledger.py` | Jobs, parts, attempts, minted-URL cache | **SQLite on local disk.** Never on the rclone FUSE mount (v1 is on it now) |
 | `autopilot/verify.py` | Integrity on local staging | **Reuse v2's `verify.py`** — header + EOCD + optional hash. It is measured-good |
 | `autopilot/mover.py` | Staging → `/opt/archives` | Streaming, idempotent, no `stat` storms (§4.4) |
 | `autopilot/report.py` | Completeness report + alerts | Telegram notifier already exists (`manager/notify.py`) |
-| `autopilot/api.py` | Minimal control surface | Reuse v2's shape and its token convention |
-| `extension/` | Scrape, mint, detect challenge, cancel stray downloads, tab cap | New, small. Strip the capture/replay pipeline entirely |
+| `autopilot/errors.py` | The v3 failure-type family (`NeedsReauth`, `QuotaExceeded`, …) | One import; the distinctions the system depends on are named, not string-matched |
+| `autopilot/__main__.py` | CLI: `run` / `report`; maps statuses to exit codes 0/1/2/3/4 | The shell/cron surface — see `02-RUN-INTERFACE.md` |
+| `helpers/` | MV3 extension: cancels the browser's stray native downloads (auto-cancel stays ON) | Scrape/mint moved to Python over CDP (`scrape.py`/`mint.py`); the extension no longer drives them |
 
-**Deleted outright:** the CDP cookie *capture* pipeline (`takeout2/cookie.py`), the capture→POST→replay
-path, the `needs_cookie` park, and the 1-minute recapture alarm. All four exist to serve a premise that
-is now measured false.
+**Still to be deleted — a plan, not done** (migration step 4; see `03-OPERATIONS.md` §5): the CDP cookie
+*capture* pipeline (`takeout2/cookie.py`, still present at 146 lines), the capture→POST→replay path, the
+`needs_cookie` park (`manager/app.py` still references it), and the 1-minute recapture alarm — which was
+**gated off by default on 2026-09-19** and is no longer created while the opt-in is off, but whose code
+remains. All four exist to serve a premise that is now measured false.
+
+⚠️ **Order matters:** the manager must stop driving `NEEDS_COOKIE` jobs (step 3) *before* the extension's
+half is deleted (step 4). Removing the extension's half first leaves a live spawner with nothing to stop
+it, and re-enabling `autoRecapture` would resume the tab flood.
 
 ## 4. The decisions that matter
 
@@ -227,7 +234,8 @@ Because the counter is untrustworthy and the true per-part cost is unresolved, t
 
 ## 5. Invariants (testable)
 
-1. **The browser never downloads Takeout bytes.** Auto-cancel stays ON; minting uses `Fetch` interception.
+1. **The browser never downloads Takeout bytes.** Auto-cancel stays ON; minting navigates the
+   redirector and observes over CDP `Network`, and never aborts the request (§4.1).
 2. **A replayed cookie is used only for *transferring*, never for *minting*.**
 3. **The ledger file is never on a FUSE mount.**
 4. **Every scraped attribute is keyed by `i=`, and `distinct(i) == N` is asserted before planning.**

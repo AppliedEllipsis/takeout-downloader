@@ -132,11 +132,11 @@ The two sides are configured in **different places**, which is why single-sided 
 
 Two traps that turn a 30-second fix into a lost evening:
 
-1. **The extension only sends the header when it has one** — `helpers/background.js:267`, with
+1. **The extension only sends the header when it has one** — `helpers/background.js:277`, with
    `captureToken: ''` documented at `:36` as "empty => dev/open manager". An empty extension token is
    *silent*, not an error, until the manager demands one.
-2. **`chrome.storage.local` overrides the managed policy** — `background.js:215-218` reads local storage;
-   `:304` only falls through to `resolveManagedToken()` (`:291-297`) when local is empty. Editing the
+2. **`chrome.storage.local` overrides the managed policy** — `background.js:221-225` reads local storage;
+   `:314` only falls through to `resolveManagedToken()` (`:301-306`) when local is empty. Editing the
    policy file alone may change **nothing**.
 
 **Detection.**
@@ -173,6 +173,8 @@ the managed policy.
 ```bash
 # Use the CDP helper convention from .recon/flip_recapture.py (container has `websockets`;
 #     websocket-client is installed nowhere).
+# ⚠️ stale: .recon/set_extension_token.py is NOT in the checkout (checked .recon/ 2026-09-19);
+#     this scp step is UNVERIFIED until that helper is written — adapt flip_recapture.py instead.
 scp .recon/set_extension_token.py takeout-server:/tmp/tk_token.py
 ssh -o BatchMode=yes takeout-server \
   'docker cp /tmp/tk_token.py takeout-webgui:/tmp/tk_token.py >/dev/null \

@@ -7,13 +7,14 @@ updating both.
 ## Purpose
 
 `run.py` is the orchestrator: the thing that turns twelve tested modules into one
-machine. Today `grep -rln 'def run|orchestrat|run_once|def main|__main__' autopilot/`
-finds **nothing** — every module works alone and none work in sequence.
+machine. It now exists — `grep -rln 'def run|orchestrat|run_once|def main|__main__'
+autopilot/` finds `run.py` and `__main__.py` (plus `ledger.py`), so the modules work
+in sequence rather than alone.
 
 ## Public surface (frozen)
 
 ```python
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 @dataclass
@@ -39,12 +40,14 @@ class RunOutcome:
     bytes_moved: int = 0
     report_markdown: str = ""
     error: Optional[str] = None
+    notes: list = field(default_factory=list)   # report warnings
 
 RUN_OUTCOME_STATUSES = (
     "complete",               # every expected part verified and moved
     "needs_reauth",           # a ReAuth challenge was hit; a human must act
     "incomplete",             # ran out of work/budget; resumable
     "expired_unrecoverable",  # the export is gone; a NEW export is the only remedy
+    "quota_exceeded",         # Google's per-export download allowance is spent; terminal
     "failed",                 # anything else; see `error`
 )
 
@@ -78,10 +81,11 @@ any of them.
    * returns `RunOutcome.status == "needs_reauth"` with `error` mentioning the URL,
    * **does not raise**, and **does not** set any part to `failed`.
 
-4. **An expired export is terminal.** If the scraped archive page reports an
+4. **A terminal export is terminal.** If the scraped archive page reports an
    `expiry` in the past (relative to the injected `now`), or the job is already
-   `expired_unrecoverable`, `run_once` returns that status and **stops** — it must
-   not attempt to mint. This is the fix for the three-month tab-flood loop.
+   `expired_unrecoverable` or `quota_exceeded` (`run.TERMINAL_BLOCKED_STATUSES`),
+   `run_once` returns that status and **stops** — it must not attempt to mint.
+   This is the fix for the three-month tab-flood loop.
 
 5. **`max_parts` bounds the work.** With `max_parts=1`, at most one part is
    transferred, and the outcome is `incomplete` unless that was the only part.
@@ -107,13 +111,13 @@ any of them.
 | Called | From | Notes |
 |---|---|---|
 | `read_archive(session, url, settle=)` → `ArchivePage` | `scrape.py` | `page.parts: list[PartLink]` each with `.index`, `.filename`, `.redirector`; `page.challenged`, `page.expiry`, `page.assert_indexed()` |
-| `mint(session, redirector, max_hops=, settle=, restore_url=)` → `MintResult` | `mint.py` | `.url`; raises `NeedsReauth`, `HopLimitExceeded`, `MintError` |
+| `mint(session, redirector, max_hops=, settle=, restore_url=)` → `MintResult` | `mint.py` | `.url`; raises `NeedsReauth`, `QuotaExceeded`, `HopLimitExceeded`, `MintError` |
 | `pull_jar(session)` → `CookieJar` | `jar.py` | `.header`; raises `CookieError` |
 | `download(client, url, dest, jar_header=, expected_size=, etag=, ...)` → `TransferResult` | `transport.py` | `.status` in `complete/partial/already-complete`; raises `NeedsReauth`, `TransferError`, `RemoteChanged` |
 | `verify_local(path, size_expected=, hash_check=)` → `VerifyOutcome` | `verify.py` | `.ok`, `.resumable`, `.corrupt` |
-| `plan_moves(sources, dest_index)` / `move_part(src, dest_dir, expected_size=)` | `mover.py` | `index_destination(dir)`, `assert_destination_ready(dir, mounts=, require_mount=)` |
+| `plan_moves(sources, dest_index)` / `move_part(src, dest_dir, filename=, expected_size=)` | `mover.py` | `index_destination(dir)`, `assert_destination_ready(dir, mounts=, require_mount=)` |
 | `open_ledger(path, mounts=)` → `Ledger` | `ledger.py` | `upsert_job`, `upsert_parts`, `record_mint`, `minted_url`, `needs_mint`, `record_transfer`, `set_part_status`, `set_job_status`, `parts`, `summary` |
-| `build_report(parts, archive_id=, account=, status=, expiry_at=, now=)` → `Report` | `report.py` | `.verdict`, `.as_markdown()` |
+| `build_report(parts, archive_id=, account=, status=, expiry_at=, now=, attempts=, dl_counts=)` → `Report` | `report.py` | `.verdict`, `.as_markdown()` |
 | `WebSocketTransport.connect(url)` | `ws_transport.py` | the only real socket; injectable away |
 
 ## CLI surface (frozen)

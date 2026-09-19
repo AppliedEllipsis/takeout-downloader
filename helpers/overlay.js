@@ -973,26 +973,54 @@
 
     function openMonitor() {
         const url = (cfg.mgrUrl || 'http://127.0.0.1:8080') + '/ui/monitor.html';
-        let sent = false;
+        // Exactly ONE window per request.
+        //
+        // This used to be able to open TWO. `sent` was set only inside the message
+        // callback and the catch, while a 400 ms `setTimeout` opened a window whenever
+        // `sent` was still false — so a callback that was slow would let the timer fire
+        // first and then open its own on top. And because background.js had no
+        // `openMonitor` handler at all, the callback ALWAYS took the fallback branch.
+        // With nothing ever closing them, that is the stacking.
+        //
+        // The timer now exists only to catch a callback that never arrives, and it is
+        // cancelled the moment one does. `opened` is set before any attempt to open, so
+        // the two paths cannot both win.
+        let opened = false;
+        let timer = null;
+
+        function markHandled() {
+            opened = true;
+            if (timer !== null) { try { clearTimeout(timer); } catch (_) {} timer = null; }
+        }
+
+        function openOnce() {
+            if (opened) return;
+            opened = true;
+            if (timer !== null) { try { clearTimeout(timer); } catch (_) {} timer = null; }
+            try {
+                // Fallback only. Normally background.js creates the window and leashes
+                // it so it self-closes after a few seconds; a window opened from here
+                // cannot be leashed, so it is sized as a popup to limit the nuisance.
+                window.open(url, '_blank', 'width=900,height=700');
+            } catch (e) {
+                log('could not open monitor: ' + (e && e.message));
+            }
+        }
+
         try {
             chrome.runtime.sendMessage({ action: 'openMonitor', url: url }, function (res) {
-                try {
-                    // background.js has no 'openMonitor' handler today: it
-                    // returns undefined / sets lastError. Fall back to a plain
-                    // window.open so the button always works.
-                    if (!sent && (chrome.runtime.lastError || !res || !res.ok)) {
-                        sent = true;
-                        window.open(url, '_blank');
-                    }
-                } catch (_) {}
+                if (chrome.runtime.lastError || !res || !res.ok) {
+                    openOnce();
+                } else {
+                    markHandled();   // background.js opened and leashed it
+                }
             });
         } catch (_) {
-            if (!sent) { sent = true; try { window.open(url, '_blank'); } catch (__) {} }
+            openOnce();
         }
-        // Some Chrome builds never invoke the callback for an unknown action.
-        setTimeout(safe(function () {
-            if (!sent) { sent = true; window.open(url, '_blank'); }
-        }), 400);
+
+        // Last resort only: some Chrome builds never invoke a message callback.
+        timer = setTimeout(safe(function () { openOnce(); }), 1200);
     }
 
     /* ---------- render ----------------------------------------------------- */

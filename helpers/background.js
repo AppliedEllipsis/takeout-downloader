@@ -434,10 +434,104 @@ const RECAPTURE_ALARM = 'takeout-recapture-poll';
 chrome.storage.local.get(['autoRecapture'], (d) => {
     if (d.autoRecapture === true) {
         chrome.alarms.create(RECAPTURE_ALARM, { periodInMinutes: 1 });
+    } else {
+        // CLEAR a stale alarm. `chrome.alarms` entries persist across browser
+        // restarts (measured 2026-09-19: `takeout-recapture-poll` survived a full
+        // Chromium restart, and my first reload check wrongly concluded the OLD code
+        // was still running because of it). So an alarm left over from a period when
+        // the opt-in was on keeps waking this service worker every minute forever,
+        // doing nothing. Remove it explicitly.
+        try { chrome.alarms.clear(RECAPTURE_ALARM); } catch (_) {}
     }
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === RECAPTURE_ALARM) pollRecapturePending();
+});
+
+// ---------------------------------------------------------------------------
+// Extension-opened popups get a LEASH
+// ---------------------------------------------------------------------------
+// Every window this extension opens for the operator is meant to be glanced at
+// and dismissed: the monitor page, a capture confirmation. Nothing closed them, so
+// they accumulated — and `overlay.js` could open TWO per click, because its
+// `window.open` fallback ran on a 400 ms timer as well as in the message callback.
+//
+// So: one window per request, and a ONE-SHOT alarm to close it. A one-shot alarm
+// (`when`) rather than a periodic tick, deliberately — a permanent one-minute alarm
+// is exactly what produced the 314-tab flood (failure mode 1.9), and there is no
+// reason to keep polling when no popup is open. The alarm is named per window and
+// cleared on fire, so the set is self-cleaning.
+const POPUP_TTL_MS = 8000;          // inside the requested 5-10 s
+const POPUP_PREFIX = 'takeout-popup-';
+
+function popupTtl() {
+    return new Promise((resolve) => {
+        try {
+            chrome.storage.local.get(['popupTtlMs'], (d) => {
+                const v = parseInt(d && d.popupTtlMs, 10);
+                resolve(Number.isFinite(v) && v >= 2000 && v <= 60000 ? v : POPUP_TTL_MS);
+            });
+        } catch (_) { resolve(POPUP_TTL_MS); }
+    });
+}
+
+/** Open `url` in a popup window that closes itself after the TTL. */
+async function openTrackedPopup(url, opts) {
+    const o = opts || {};
+    const ttl = o.ttlMs || await popupTtl();
+    let win;
+    try {
+        win = await chrome.windows.create({
+            url: url,
+            type: 'popup',
+            focused: o.focused !== false,
+            width: o.width || 900,
+            height: o.height || 700,
+        });
+    } catch (e) {
+        // `windows.create` unavailable: fall back to a tab, which is still one
+        // window and still leashed.
+        win = await chrome.tabs.create({ url: url, active: o.focused !== false });
+    }
+    const id = win && (win.id !== undefined ? win.id : win.windowId);
+    if (id === undefined || id === null) return win;
+    const name = POPUP_PREFIX + id;
+
+    function closeIt() {
+        try { chrome.windows.remove(id); } catch (_) {}
+        try { chrome.tabs.remove(id); } catch (_) {}
+        try { chrome.alarms.clear(name); } catch (_) {}
+    }
+
+    // TWO mechanisms, because either alone fails the requirement.
+    //
+    // MEASURED 2026-09-19 on the live container: `chrome.alarms.create(name, {when:
+    // Date.now() + 1500})` fired after **13,099 ms**. Chrome enforces a minimum alarm
+    // delay, so an alarm CANNOT honour a 5-10 s TTL — the requested behaviour is
+    // unreachable with alarms alone. (The first version of this used only an alarm,
+    // and would have looked correct in review while closing popups ~13 s late.)
+    //
+    // So the precise path is a plain timer, which is accurate for short delays and is
+    // reliable here because the worker is alive having just handled the message. The
+    // alarm is kept only as a BACKSTOP for the case the timer cannot cover — a
+    // service worker suspended before it fires — where late closure still beats none.
+    try { setTimeout(closeIt, ttl); } catch (_) {}
+    try { chrome.alarms.create(name, { when: Date.now() + ttl }); } catch (_) {}
+    return win;
+}
+
+async function closeTrackedPopup(name) {
+    const id = parseInt(String(name).slice(POPUP_PREFIX.length), 10);
+    if (!Number.isFinite(id)) return;
+    try { await chrome.windows.remove(id); } catch (_) {}
+    try { await chrome.tabs.remove(id); } catch (_) {}
+    try { chrome.alarms.clear(name); } catch (_) {}
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name && alarm.name.indexOf(POPUP_PREFIX) === 0) {
+        closeTrackedPopup(alarm.name);
+    }
 });
 
 async function pollRecapturePending() {
@@ -464,21 +558,94 @@ async function triggerRecapture() {
     // Find an existing takeout tab (or open one) and ask the content script to
     // re-click the most recent Download button. A fresh request to the final
     // host fires the capture listener, which then auto-POSTs the new cookie.
+    //
+    // **This used to open a new tab on EVERY tick whenever the session was signed
+    // out.** The check was `tabs.query({url: 'https://takeout.google.com/*'})`, but a
+    // signed-out `/manage` redirects to `accounts.google.com/v3/signin/...`, which
+    // does not match that pattern — so the query missed the very tab the previous
+    // tick had opened and created another. One tab per minute, forever, each parked
+    // on a half-loaded sign-in page. That is the "hanging blank tabs".
+    //
+    // Three defences, and only the FIRST one holds in the signed-out case:
+    //   1. the tab we create is REMEMBERED in storage and reused by id;
+    //   2. a URL query, which works only for hosts we are permitted to read;
+    //   3. at most one tab is created per call.
+    //
+    // Measured 2026-09-19: this extension has neither the `tabs` permission nor host
+    // permission for `accounts.google.com`, so `tab.url` is WITHHELD for sign-in tabs
+    // (observed: url === ''). A hidden URL cannot be matched by any `url:` filter, so
+    // defence 2 cannot see a signed-out tab. Defence 1 can, because `tabs.get(id)`
+    // works without the permission — which is why the remembered id is the fix and a
+    // widened query is not.
     try {
-        const tabs = await chrome.tabs.query({ url: 'https://takeout.google.com/*' });
-        let tab = tabs[0];
-        if (!tab) {
-            tab = await chrome.tabs.create({
-                url: 'https://takeout.google.com/manage', active: false });
-            // give the page a moment to load before messaging
-            await new Promise(r => setTimeout(r, 4000));
-        }
+        const tab = await recaptureTab();
+        if (!tab || tab.id === undefined) return;
         chrome.tabs.sendMessage(tab.id, { action: 'recaptureDownload' }, () => {
             void chrome.runtime.lastError;  // swallow if content script not ready
         });
     } catch (e) {
         // non-fatal; manager will escalate to a human if no cookie arrives
     }
+}
+
+/**
+ * The single tab used for recapture, reused rather than recreated.
+ *
+ * Order: our remembered tab (the load-bearing path), then any VISIBLE tab on either
+ * host, and only then a new one. Never more than one is created.
+ */
+async function recaptureTab() {
+    // 1. the tab we made last time — the mechanism that actually matters.
+    //
+    //    `chrome.tabs.get(id)` works WITHOUT the `tabs` permission: the tab comes
+    //    back, its `url` merely hidden. So a remembered id survives the case that
+    //    defeats every URL-based check — a signed-out tab whose URL this extension may
+    //    not read. This is what stops the accumulation.
+    try {
+        const d = await chrome.storage.local.get(['recaptureTabId']);
+        if (d && d.recaptureTabId != null) {
+            const t = await chrome.tabs.get(d.recaptureTabId);
+            if (t) return t;
+        }
+    } catch (_) { /* gone; fall through */ }
+
+    // 2. ANY VISIBLE tab on takeout (works when signed IN; see the note below).
+    //
+    //    MEASURED 2026-09-19 — this CANNOT cover the signed-out case: the extension
+    //    has neither the `tabs` permission nor host permission for
+    //    `accounts.google.com`, so `tab.url` is WITHHELD for sign-in tabs (observed:
+    //    url === ''), and a hidden URL can never match a `url:` filter. It is kept for
+    //    the signed-in case, where takeout tabs ARE visible. Step 1 is what prevents
+    //    the accumulation. (Adding the `tabs` permission would make this reliable; not
+    //    worth the wider grant for one reuse check.)
+    const tabs = await chrome.tabs.query({
+        url: ['https://takeout.google.com/*', 'https://accounts.google.com/*'],
+    });
+    if (tabs && tabs.length) {
+        try { await chrome.storage.local.set({ recaptureTabId: tabs[0].id }); } catch (_) {}
+        return tabs[0];
+    }
+
+    // 3. nothing to reuse: create exactly one, remember it, let it load
+    const t = await chrome.tabs.create({
+        url: 'https://takeout.google.com/manage', active: false });
+    try { await chrome.storage.local.set({ recaptureTabId: t.id }); } catch (_) {}
+    // Wait for it to settle rather than a blind sleep, so a slow load cannot
+    // provoke a second tab on the next tick.
+    try {
+        await new Promise((resolve) => {
+            let done = false;
+            const finish = () => { if (!done) { done = true; resolve(); } };
+            chrome.tabs.onUpdated.addListener(function listener(id, info) {
+                if (id === t.id && info.status === 'complete') {
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    finish();
+                }
+            });
+            setTimeout(finish, 8000);
+        });
+    } catch (_) {}
+    return t;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +788,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 sendResponse({ ok: false, error: e.message || String(e) });
             }
         });
+        return true;
+    }
+
+    if (msg.action === 'openMonitor') {
+        // This handler did not exist, and its absence was itself a bug: the overlay
+        // sent `openMonitor`, got `lastError`, and fell back to `window.open` — so
+        // every request opened a window AND the fallback timer opened a second one.
+        // Now the extension owns the window, which means it can also leash it.
+        const url = (msg.url) || ((DEFAULTS.managerUrl || 'http://127.0.0.1:8080')
+                                  .replace(/\/$/, '') + '/ui/monitor.html');
+        openTrackedPopup(url, { ttlMs: msg.ttlMs })
+            .then(() => sendResponse({ ok: true, url: url }))
+            .catch((e) => sendResponse({ ok: false, error: (e && e.message) || String(e) }));
         return true;
     }
 

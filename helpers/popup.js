@@ -1565,7 +1565,16 @@ const v2LiveMonitor = (function () {
             if (mon) {
                 mon.addEventListener('click', function (ev) {
                     ev.preventDefault();
-                    chrome.tabs.create({ url: cfg.mgrUrl + '/ui/monitor.html' });
+                    // Route via background.js so the window is tracked and leashed
+                    // (it closes itself after a few seconds) instead of leaving a
+                    // tab behind on every click.
+                    try {
+                        chrome.runtime.sendMessage(
+                            { action: 'openMonitor', url: cfg.mgrUrl + '/ui/monitor.html' },
+                            function () { void chrome.runtime.lastError; });
+                    } catch (_) {
+                        chrome.tabs.create({ url: cfg.mgrUrl + '/ui/monitor.html' });
+                    }
                 });
             }
             loadJobList();

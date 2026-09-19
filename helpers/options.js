@@ -30,7 +30,16 @@ document.addEventListener('DOMContentLoaded', () => {
         // this extension page open.
         els.openMonitorBtn.addEventListener('click', () => {
             const base = resolveManagerUrl().replace(/\/+$/, '');
-            chrome.tabs.create({ url: base + '/ui/monitor.html' });
+            // Ask background.js to open it, so the window is TRACKED and closes
+            // itself after a few seconds. A raw `chrome.tabs.create` left a tab
+            // behind on every click, and clicks accumulate.
+            try {
+                chrome.runtime.sendMessage(
+                    { action: 'openMonitor', url: base + '/ui/monitor.html' },
+                    function () { void chrome.runtime.lastError; });
+            } catch (_) {
+                chrome.tabs.create({ url: base + '/ui/monitor.html' });
+            }
         });
     }
 

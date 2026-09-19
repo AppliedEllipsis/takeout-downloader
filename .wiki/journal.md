@@ -701,3 +701,113 @@ mis-aimed check corroborated it rather than refuting it.
 `#10` closed. All six recon deliverables and all four agent workstreams from this turn are verified.
 **133 tests pass, 6 skipped.** Eight commits pushed to GitHub and to the server. Only `#13` remains, and
 it needs a human.
+
+---
+
+## 2026-09-19 — Finishing the run: two more seam bugs, and a spent export
+
+Asked to finish the run. It could not be finished, and finding out why produced the two most interesting
+defects of the session.
+
+### Bug 8 — the scrape destroyed the token it needed
+
+The run reported `needs_reauth`. **The session was never the problem.** Measured on the live browser,
+authenticated, `challenged == False`, export `Completed`:
+
+```
+.../manage/archive/<id>                 -> takeout/download?j=...&i=0&user=...          has_rapt=False
+.../manage/archive/<id>?user=...&rapt=… -> takeout/download?j=...&i=0&user=...&rapt=…   has_rapt=True
+```
+
+Same page, same session, same export. The difference is only whether the **page request itself** carried a
+rapt — Google embeds the token into the page's download links only when it did. `run.py` navigated to the
+bare URL on every run, so every run minted from untokened links and bounced to `ServiceLogin`, which is
+indistinguishable from a genuine ReAuth demand unless you know this.
+
+It also made `_restore`'s own docstring — *"keeps the rapt-bearing archive page loaded when one is
+supplied"* — unreachable, because the caller passed the bare URL there too. **A documented intent that no
+caller could satisfy is a bug the docs reported and nobody heard.**
+
+Fixed with `pick_rapt_url()` (pure, so the wrong decision is testable without a browser),
+`recover_rapt_url()` (reads the tab's location then its history — the live browser had nine tokened archive
+URLs sitting in it), and `page_has_rapt()`, which now refuses to mint an untokened page instead of spending
+an attempt on a guaranteed bounce.
+
+### Bug 9 — `quotaExceeded=true` had no name
+
+The recovered rapt worked. The redirector answered **302**, not a login bounce. But the chain then went:
+
+```
+.../settings/takeout/download?i=0&j=<id>&download=true&rapt=<token>
+  -> [302] .../manage/archive/<id>?download=true&rapt=<token>&quotaExceeded=true
+```
+
+and the page says it in words: **"You can try to download a file only 5 times."** The export's download
+allowance was spent — the burn export had reached **5 of 5**.
+
+Two things were wrong beyond the missing name. The error text read *"no file-host URL, no ReAuth, and **no
+archive bounce** in the chain"* while the chain was **nothing but bounces** — self-refuting, and it hid the
+`location` field that says where the chain went. And because the quota bounce *carries a rapt*, the
+refreshed-token retry consumed it and looped toward the hop limit, on course to report a hop-limit error
+naming an entirely different cause.
+
+Fixed: `QuotaExceeded(MintError)`, detected **before** the retry (a test asserts that ordering), new job
+status `quota_exceeded`, exit code **4**, report verdict **"NOT resumable: create a NEW export."**
+
+### I spent the export's last attempts
+
+The burn export was created as a monitoring canary and stood at **3 of 5** when this turn began. It is at
+**5 of 5** now. My diagnostics used the remainder.
+
+What made that invisible is worth more than the apology: **the ledger's attempt count and Google's counter
+are different quantities, and only the latter runs out.** The run printed `mint 0 | transfer 0` — correctly,
+because a bounced mint is not a recorded attempt — while Google's counter climbed 3 → 5. A run can
+truthfully report that it spent nothing and still have destroyed its last chance. **Budget diagnostics
+against `dl_counts`, never the ledger's count.** Written into runbook §1.19.
+
+### Bugs 1–9, one shape
+
+| # | Defect | Where |
+|---|---|---|
+| 1 | duplicate-index guard compared list lengths | guard logic |
+| 2 | `os.path.abspath` made the FUSE guard a no-op on Windows | guard logic |
+| 3 | FUSE matching ignored longest-mount shadowing | guard semantics |
+| 4 | destination guard **never called** | the seam |
+| 5 | destination guard tested equality, not containment | guard semantics |
+| 6 | CLI called async `run_once` without awaiting | the seam |
+| 7 | session attached to the browser endpoint, not a page | the seam |
+| 8 | scrape navigated to the URL that discards the rapt | the seam |
+| 9 | quota refusal had no name, and the retry ate it | the seam |
+
+**Six of nine are seams.** Every component correct in isolation; the defect in what one part believed about
+another. Reading the code found exactly none of them.
+
+### Commands run (exact)
+
+```bash
+# the recovery probe that proved a token was still live (free: navigation is Δ0)
+ssh takeout-server 'docker exec -i -w /work/.v3 takeout-webgui python3 -B -' < .recon/_probe_recover_rapt.py
+
+# the run itself
+ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
+  python3 -B -m autopilot run --archive-id f470fe32-... \
+  --ledger /config/v3-selftest/state.db --staging /config/v3-selftest/staging \
+  --archive /opt/archives/_v3-selftest/braincreation --account braincreation"
+```
+
+### Gotchas
+
+- **`.recon/` does not exist on the server.** It is untracked scratch on the workstation; the server has its
+  own clone, so probes must be piped in: `ssh host 'docker exec -i ... python3 -B -' < probe.py`.
+- **CDP is inside the container, not on the host** — `127.0.0.1:9222` from the workstation is nothing. Every
+  docker/CDP command needs the ssh wrapper; several round trips assumed otherwise.
+- **`read_archive` navigating is itself a side effect.** It can invalidate the very state the next call
+  needs, which is why the token is now recovered *before* any navigation.
+
+### State
+
+**159 tests pass, 6 skipped.** 16 commits on `feat/takeout-autopilot`, pushed to GitHub and the server.
+
+`#13` is blocked on **two** things now, not one: a **new export** (this one is spent at 5/5 — measured), and
+a fresh ReAuth to mint against it. Four large exports (62–65 products, created 04:27–07:07) are in progress
+and will become downloadable in hours to days.

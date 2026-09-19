@@ -37,7 +37,14 @@ from .errors import AutopilotError, MintError, NeedsReauth
 from .jar import CookieError, pull_jar
 from .ledger import AttemptKind, Ledger, open_ledger
 from .mint import mint as mint_part
-from .mover import DestinationIndex, index_destination, move_part, plan_moves
+from .mover import (
+    DestinationIndex,
+    MoveRefused,
+    assert_destination_ready,
+    index_destination,
+    move_part,
+    plan_moves,
+)
 from .report import build_report, parse_expiry
 from .scrape import archive_url, read_archive
 from .transport import TransferError, RemoteChanged, download
@@ -227,6 +234,27 @@ async def run_once(
                 return await _finish("needs_reauth", error=str(exc))
 
             # ---- 5. work the parts -----------------------------------------
+            # Assert the destination really is the mount BEFORE indexing it.
+            #
+            # This call was missing at first: `assert_destination_ready` was
+            # implemented and tested, the CLI passed `require_mount` in, and
+            # `cfg.require_mount` was never read — so failure mode 1.7 was
+            # unguarded on the only path that matters. When the rclone daemon dies
+            # the kernel turns /opt/archives into an ordinary empty directory on a
+            # 13 GB root filesystem, and an unguarded mover writes terabytes into
+            # it. A well-tested guard that nothing calls is not a guard.
+            #
+            # Unlike a FUSE *ledger* path (a caller bug, which raises), a detached
+            # destination mount is an environment fault that comes and goes, so it
+            # becomes a `failed` outcome rather than an exception — the operator
+            # gets a clear message and exit 1 instead of a traceback.
+            try:
+                assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
+            except MoveRefused as exc:
+                ledger.set_job_status(cfg.archive_id, "failed", error=str(exc))
+                return await _finish("failed",
+                                     error=f"refusing to write: {exc}")
+
             ledger.set_job_status(cfg.archive_id, "transferring")
             dest_index = index_destination(cfg.archive_dir)
             todo = [p for p in page.parts if _needs_work(ledger, cfg.archive_id, p.index)]

@@ -205,6 +205,20 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
         )
     elif status == "needs_reauth":
         rep.verdict = f"BLOCKED — re-authentication required ({rep.parts_done}/{rep.parts_expected} held)"
+    elif status == "quota_exceeded":
+        # Deliberately NOT "resumable": every retry of this export is refused.
+        # Measured 2026-09-19 — Google caps downloads per export (5) and answers
+        # further attempts with `quotaExceeded=true` on the archive-page bounce.
+        rep.verdict = (
+            f"BLOCKED — export download allowance exhausted "
+            f"({rep.parts_done}/{rep.parts_expected} held). "
+            "NOT resumable: create a NEW export."
+        )
+        rep.warnings.append(
+            "Google caps downloads per export (measured: 5). This does not "
+            "change over time — a new export is required, and the export's own "
+            "counter (`dl_counts`) is independent of the ledger's attempt count."
+        )
     else:
         rep.verdict = (
             f"INCOMPLETE — {rep.parts_done}/{rep.parts_expected} parts; "

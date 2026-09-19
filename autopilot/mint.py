@@ -35,12 +35,13 @@ from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from .cdp import CdpSession
-from .errors import HopLimitExceeded, MintError, NeedsReauth
+from .errors import HopLimitExceeded, MintError, NeedsReauth, QuotaExceeded
 
 __all__ = [
     "ORIGIN",
     "FILE_HOST",
     "ACCOUNTS_HOST",
+    "QUOTA_FLAG",
     "Redirect",
     "MintResult",
     "absolute_uri",
@@ -53,6 +54,10 @@ __all__ = [
 ORIGIN = "https://takeout.google.com"
 FILE_HOST = "takeout-download.usercontent.google.com"
 ACCOUNTS_HOST = "accounts.google.com"
+
+#: Google marks a spent download allowance with this query parameter on its
+#: bounce back to the archive page. Measured 2026-09-19; see `QuotaExceeded`.
+QUOTA_FLAG = "quotaExceeded=true"
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +264,22 @@ async def mint(
             if ACCOUNTS_HOST in r.location:
                 raise NeedsReauth(r.location)
 
+        # 2b. Did Google refuse because the export's download allowance is spent?
+        #
+        # Checked HERE, before the refreshed-rapt retry below, because a quota
+        # refusal is terminal: retrying is guaranteed to fail and merely fills
+        # the tab history with identical bounces. Measured chain:
+        #
+        #   .../settings/takeout/download?...&download=true&rapt=...
+        #     -> [302] .../manage/archive/<id>?download=true&rapt=...&quotaExceeded=true
+        #
+        # Note the bounce DOES carry a rapt, so without this check the retry
+        # logic below treats it as a refreshable token and loops until the hop
+        # limit — reporting a hop-limit error that names the wrong cause.
+        for r in redirects:
+            if QUOTA_FLAG in (r.location or ""):
+                raise QuotaExceeded(r.location, "Google sent quotaExceeded=true")
+
         # 3. Did the redirector hand us a refreshed rapt to retry with?
         refresh = next(
             (r for r in redirects if "/manage/archive/" in r.location), None
@@ -274,18 +295,24 @@ async def mint(
 
         # 4. Nothing recognisable — report what we saw rather than guessing.
         #
-        # This used to print `(from_url, status)` and omit `location`, which is
-        # the only field that identifies where the chain actually went. A real
-        # failure therefore took several round trips to diagnose, so the
-        # destination is now printed for every hop, plus the host we wanted.
-        raise MintError(
-            "no file-host URL, no ReAuth, and no archive bounce in the chain; saw "
-            + " | ".join(
-                f"{_redact(r.from_url)} -> [{r.status}] {_redact(r.location)}"
-                for r in redirects
-            )
-            + f" | looking for file host {FILE_HOST!r}"
+        # Two things were wrong with the message this replaces. It printed
+        # `(from_url, status)` and omitted `location`, the only field that says
+        # where the chain actually went; and it claimed there was "no archive
+        # bounce" even when the chain was nothing BUT bounces with an unusable
+        # token, which is a different diagnosis with a different remedy. Both are
+        # fixed: every hop prints its destination, and a bounce that merely lacks
+        # a usable token is named as such.
+        seen = " | ".join(
+            f"{_redact(r.from_url)} -> [{r.status}] {_redact(r.location)}"
+            for r in redirects
         )
+        if refresh is not None:
+            reason = (f"bounced to the archive page without a usable token "
+                      f"(rapt={bool(parse_query(refresh.location).get('rapt'))}, "
+                      f"j={bool(parse_query(refresh.location).get('j'))})")
+        else:
+            reason = "no file-host URL, no ReAuth demand, and no archive-page bounce"
+        raise MintError(f"{reason}; saw {seen} | looking for file host {FILE_HOST!r}")
 
     await _restore(session, restore_url)
     raise HopLimitExceeded(

@@ -14,6 +14,7 @@ __all__ = [
     "NeedsReauth",
     "MintError",
     "HopLimitExceeded",
+    "QuotaExceeded",
     "NotAuthorised",
 ]
 
@@ -60,6 +61,43 @@ class NotAuthorised(AutopilotError):
 
 class MintError(AutopilotError):
     """Minting failed for a reason that is not a ReAuth demand."""
+
+
+class QuotaExceeded(MintError):
+    """The export's own download allowance is spent. Terminal for this export.
+
+    **Measured 2026-09-19**, from the redirect chain itself:
+
+        .../settings/takeout/download?...&download=true&rapt=...
+          -> [302] .../manage/archive/<id>?download=true&rapt=...&quotaExceeded=true
+
+    and the archive page says so in words:
+
+        "You can try to download a file only 5 times."
+        "You've tried to download or have downloaded this file 5 times, which is
+         the maximum number of times you can take this action."
+        "You can create a new request at any time."
+
+    This is emphatically **not** ReAuth, not an expired export, and not a bug in
+    the cookie jar. Every retry is guaranteed to fail, so retrying is pure waste:
+    the remedy is a NEW export. Before this type existed the condition surfaced
+    as an opaque `MintError` reading "no file-host URL, no ReAuth, and no archive
+    bounce" — which was also self-contradictory, because there *was* a bounce.
+
+    Note the ledger's attempt count and Google's counter are different things,
+    and only the latter runs out.
+    """
+
+    def __init__(self, url: str = "", detail: str = "") -> None:
+        self.url = url
+        self.detail = detail
+        super().__init__(
+            "the export's download allowance is exhausted"
+            + (f" ({detail})" if detail else "")
+            + ". Google caps downloads per export (measured: 5) and refuses every "
+            "further attempt. Create a NEW export; no retry of this one can "
+            "succeed."
+        )
 
 
 class HopLimitExceeded(MintError):

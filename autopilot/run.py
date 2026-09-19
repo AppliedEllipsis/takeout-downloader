@@ -33,7 +33,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from .errors import AutopilotError, MintError, NeedsReauth
+from .errors import (
+    AutopilotError,
+    MintError,
+    NeedsReauth,
+    QuotaExceeded,
+)
 from .jar import CookieError, pull_jar
 from .ledger import AttemptKind, Ledger, open_ledger
 from .mint import mint as mint_part
@@ -354,6 +359,13 @@ async def run_once(
                     except NeedsReauth as exc:
                         ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
                         return await _finish("needs_reauth", error=str(exc))
+                    except QuotaExceeded as exc:
+                        # Terminal for THIS export. Caught before the generic
+                        # handler below so it is never downgraded to a per-part
+                        # failure that a later pass would pointlessly retry.
+                        ledger.set_job_status(cfg.archive_id, "quota_exceeded",
+                                              error=str(exc))
+                        return await _finish("quota_exceeded", error=str(exc))
                     except (MintError, AutopilotError) as exc:
                         ledger.set_part_status(cfg.archive_id, idx, "failed",
                                                error=f"mint failed: {exc}")

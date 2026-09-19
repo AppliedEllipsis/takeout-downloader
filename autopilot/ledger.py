@@ -53,7 +53,7 @@ JOB_STATUSES = (
     # written after them.
     "pending", "scraping", "needs_reauth", "transferring",
     "verifying", "moving", "incomplete", "complete",
-    "expired_unrecoverable", "failed",
+    "expired_unrecoverable", "quota_exceeded", "failed",
 )
 PART_STATUSES = ("pending", "active", "partial", "done", "failed", "budget_exhausted")
 

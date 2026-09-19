@@ -219,6 +219,18 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
             "change over time — a new export is required, and the export's own "
             "counter (`dl_counts`) is independent of the ledger's attempt count."
         )
+    elif status == "failed":
+        # `failed` is a first-class run outcome (`RUN_OUTCOME_STATUSES`) and was the
+        # only member with no branch here, so it fell through to the `else` and was
+        # reported as *resumable* — telling an operator that a hard failure (a dead
+        # browser, an unusable scrape, a rejected destination) would clear itself on
+        # the next run. It may or may not; the report should state what happened
+        # rather than promise a recovery it cannot know about.
+        rep.verdict = (
+            f"FAILED — {rep.parts_done}/{rep.parts_expected} parts held. "
+            "The run stopped on an error; see `error:` above. Do not assume a "
+            "retry will clear it."
+        )
     else:
         rep.verdict = (
             f"INCOMPLETE — {rep.parts_done}/{rep.parts_expected} parts; "

@@ -387,6 +387,13 @@ async def mint(
         # whenever that hop arrived before the file-host hop.
         for r in redirects:
             if is_signin_location(r.location):
+                # Leave the tab somewhere predictable before bailing. `_restore`'s
+                # own docstring promises this and it was only called on the SUCCESS
+                # paths and before the hop limit — so a mint that failed on a
+                # challenge, a quota refusal or an unrecognisable chain left the tab
+                # sitting on a sign-in page, which is exactly where the NEXT run's
+                # `recover_rapt_url` cannot find a token.
+                await _restore(session, restore_url)
                 raise NeedsReauth(r.location)
 
         # 2b. Did Google refuse because the export's download allowance is spent?
@@ -403,6 +410,7 @@ async def mint(
         # limit — reporting a hop-limit error that names the wrong cause.
         for r in redirects:
             if QUOTA_FLAG in (r.location or ""):
+                await _restore(session, restore_url)
                 raise QuotaExceeded(r.location, "Google sent quotaExceeded=true")
 
         # 3. Did the redirector hand us a refreshed rapt to retry with?
@@ -451,6 +459,9 @@ async def mint(
                       f"j={bool(parse_query(refresh.location).get('j'))})")
         else:
             reason = "no file-host URL, no ReAuth demand, and no archive-page bounce"
+        # Restore before raising, for the same reason as the branches above: the tab
+        # must not be left mid-chain for the next run to inherit.
+        await _restore(session, restore_url)
         raise MintError(f"{reason}; saw {seen} | looking for file host {FILE_HOST!r}")
 
     await _restore(session, restore_url)

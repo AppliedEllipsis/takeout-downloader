@@ -16,6 +16,7 @@ __all__ = [
     "HopLimitExceeded",
     "QuotaExceeded",
     "NotAuthorised",
+    "BrowserUnavailable",
 ]
 
 
@@ -49,6 +50,16 @@ class NeedsReauth(AutopilotError):
             f"ReAuth required (hit {url or 'a sign-in page'})"
             + (f": {detail}" if detail else "")
         )
+
+
+class BrowserUnavailable(AutopilotError):
+    """The browser could not be reached, or has no page target to drive.
+
+    Raised by the session factory's own connect, so it means "this job cannot
+    start" rather than "a command failed part-way through". It exists so a dead
+    Chromium becomes a classified failure with a recorded job status instead of an
+    uncaught traceback that leaves the job parked on `scraping` forever.
+    """
 
 
 class NotAuthorised(AutopilotError):

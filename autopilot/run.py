@@ -35,6 +35,7 @@ from typing import Callable, Optional
 
 from .errors import (
     AutopilotError,
+    BrowserUnavailable,
     MintError,
     NeedsReauth,
     QuotaExceeded,
@@ -189,10 +190,24 @@ def _default_session_factory(cdp_http: str, timeout: float = 20.0):
 
     @asynccontextmanager
     async def _factory():
-        targets = await asyncio.to_thread(
-            _get_json, cdp_http.rstrip("/") + "/json/list", timeout)
-        target = pick_page_target(targets)
-        transport = await WebSocketTransport.connect(target["webSocketDebuggerUrl"])
+        # Classify any failure to reach or select a target as `BrowserUnavailable`.
+        #
+        # Without this the connect raised raw `urllib`/socket errors out of
+        # `run_once`, which escaped the CLI as a traceback and left the job parked on
+        # `scraping` with no recorded error. `pick_page_target` already raises
+        # `AutopilotError` for the no-tab case, so only the transport errors need
+        # translating here — and doing it in the factory (rather than a pre-flight in
+        # `run_once`) keeps the injectable seam intact, which is what the tests rely on.
+        try:
+            targets = await asyncio.to_thread(
+                _get_json, cdp_http.rstrip("/") + "/json/list", timeout)
+            target = pick_page_target(targets)
+            transport = await WebSocketTransport.connect(target["webSocketDebuggerUrl"])
+        except AutopilotError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any cause means "no browser"
+            raise BrowserUnavailable(
+                f"{type(exc).__name__}: {exc}") from exc
         async with CdpSession(transport) as session:
             yield session
 
@@ -288,6 +303,18 @@ async def run_once(
                           "a terminal export — see runbooks 1.14 / 1.19"),
             )
 
+        # Opening the browser session is the first thing that can fail, and it used
+        # to fail UNCAUGHT: `_default_session_factory` fetches `/json/list`, so a
+        # Chromium that is down, or that has no page target, raised straight out of
+        # `run_once` past the CLI as a traceback — leaving the job parked on
+        # `scraping` with no error recorded.
+        #
+        # It is classified in `_default_session_factory` (as `BrowserUnavailable`)
+        # and caught at the outer `except` below, NOT by probing `/json/list` here.
+        # A local pre-flight was tried first and was wrong: probing the CDP endpoint
+        # directly bypassed every test's injected `session_factory`, so the suite
+        # made real sockets and 13 tests failed. The factory is the injectable seam —
+        # whatever IT raises is the browser's availability, by definition.
         async with session_factory() as session:
             # ---- 1. scrape -------------------------------------------------
             # Navigate to a *rapt-bearing* archive URL when one is recoverable.
@@ -535,10 +562,15 @@ async def run_once(
                     continue
 
                 kind = AttemptKind.RESUME if transfer.resumed_from else AttemptKind.TRANSFER
-                ledger.record_transfer(cfg.archive_id, idx, kind, transfer.status,
-                                       bytes_moved=transfer.bytes_written,
-                                       size_on_disk=transfer.total_bytes,
-                                       etag=transfer.etag)
+                # `already-complete` means `download()` short-circuited because the
+                # staged file was already the expected size — it made ZERO requests,
+                # so booking it would increment the attempt counter for work that was
+                # not attempted, and the counter is the only budget signal here.
+                if transfer.status != "already-complete":
+                    ledger.record_transfer(cfg.archive_id, idx, kind, transfer.status,
+                                           bytes_moved=transfer.bytes_written,
+                                           size_on_disk=transfer.total_bytes,
+                                           etag=transfer.etag)
 
                 if not transfer.complete:
                     ledger.set_part_status(cfg.archive_id, idx, "partial")
@@ -574,6 +606,17 @@ async def run_once(
             status = "complete" if remaining == 0 and summary["parts"] else "incomplete"
             ledger.set_job_status(cfg.archive_id, status)
             return await _finish(status)
+    except BrowserUnavailable as exc:
+        # A browser that cannot be reached means this job cannot proceed, and it
+        # must not be left mid-flight with no explanation. Narrow on purpose: this
+        # type is raised only by the session factory's own connect, so catching it
+        # here does not swallow defects elsewhere in the run.
+        _why = f"cannot reach the browser at {cfg.cdp_http}: {exc}"
+        try:
+            ledger.set_job_status(cfg.archive_id, "failed", error=_why)
+        except Exception:  # noqa: BLE001 - the ledger itself may be the problem
+            pass
+        return await _finish("failed", error=_why)
     finally:
         ledger.close()
 

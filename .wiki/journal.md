@@ -657,3 +657,47 @@ cd $WT && git push server-final feat/takeout-autopilot
 **133 tests pass, 6 skipped** (live network, gated). Seven commits on `feat/takeout-autopilot`, pushed to
 GitHub and to the server. `#13` (a completed download) is blocked on one human satisfying the ReAuth
 challenge — the irreducible step.
+
+---
+
+## 2026-09-19 — Every reconnaissance deliverable was checked against source. They are not equally trustworthy.
+
+All six recon reports have now been adversarially verified against the files they describe, by
+spot-checking their citations rather than reading their prose. The results are worth recording because
+they are about **this project's own artifacts**, and the pattern is consistent enough to act on:
+
+| Artifact | Checked | Outcome |
+|---|---|---|
+| `02-v2-defects.md` | 8 defect claims | 3 refuted, 2 found worse than reported |
+| `03-infra.md` | 13 `path:line` | **13/13 exact** |
+| `04-docs-archaeology.md` | headline claim | confirmed independently ("Operational Bible" is 2/3 empty) |
+| `05-recovered-research.md` | verbatim briefs | recovered exactly from the saved workflow script |
+| `06-other-projects.md` | **138 claims** | 62 EXACT, 53 PARTLY WRONG, **21 FALSE**, 2 unverifiable |
+| `this journal` / the `.wiki` | agent spot-checks | two stale claims found and corrected |
+
+**`06` is the instructive one.** Its *technical substance is sound* — every quoted passage exists
+verbatim, and **no quotation was fabricated**. Its *citations and provenance are not*:
+
+* **11 of 27 upstream Chromium paths are wrong** — `public/common/` reported as `internal/common/`,
+  `renderer/` as `browser/`. The verifier caught these by reading each file's **self-include** of its own
+  header, a stronger signal than any directory guess.
+* **One function name does not exist** — `BuildParallelRequestSlices`, cited with a line range. The real
+  function is `FindSlicesToDownload`. Independently confirmed: `grep -r` finds no such symbol anywhere.
+* **Line numbers drift 1–37 lines, and 3 point past end-of-file.**
+* **Its own corrective claim was the error.** It "corrected" the file count from 37 to 38 by counting the
+  `pol/` **directory** as a file. `find .research_tmp -type f` returns **37**; the original was right.
+
+**Practical rule:** these reports are reliable for *what Chrome does* and unreliable for *where to find
+it*. Anyone using `06` to locate those files upstream would be sent to the wrong directory 11 times in
+27. Treat quotations as good evidence; treat citations as needing a check.
+
+I verified the verifier on five of its own verdicts — a wrong verifier is worse than none — and all five
+held, including `BuildParallelRequestSlices` not existing and the `public/` vs `internal/` split. The one
+check I got wrong was a guess at which function name it meant; that turned out to be an EXACT row, so my
+mis-aimed check corroborated it rather than refuting it.
+
+### State
+
+`#10` closed. All six recon deliverables and all four agent workstreams from this turn are verified.
+**133 tests pass, 6 skipped.** Eight commits pushed to GitHub and to the server. Only `#13` remains, and
+it needs a human.

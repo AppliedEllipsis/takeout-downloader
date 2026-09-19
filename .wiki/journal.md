@@ -926,3 +926,82 @@ ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeou
 
 **171 tests pass, 6 skipped.** 19 commits on `feat/takeout-autopilot`, pushed to GitHub and the server.
 `#13` closed. The export still has **3 of its 5 attempts** left for further verification.
+
+---
+
+## 2026-09-19 (evening) — A token is EARNED, not held. Post-change run validated.
+
+### The finding that mattered
+
+Asked whether we were ready for a real pull, I checked rather than guessed, and found the browser
+**fully signed out**. The user signed in. The canary then *still* refused:
+
+```
+needs_reauth  ·  mint 0 | transfer 0  ·  exit 2
+"the archive page served download links carrying no rapt"
+
+i=0 size=36670 rapt=NO        <- a SIGNED-IN session serves untokened links
+dl_counts: 3  (2 of 5 attempts left)
+```
+
+It was right to refuse — it spent nothing — but it also could not proceed, **immediately after a
+sign-in**. The reason is a distinction nobody had written down:
+
+> **`recover_rapt_url` only finds a token that already exists. Nothing ever produced one.**
+
+A token is not something you *have*, it is something you **earn**:
+
+```
+takeout/download?j=<id>&i=0&user=<uid>          (no rapt)
+  -> 302 -> manage/archive/<id>?user=...&pli=1&rapt=<fresh>
+```
+
+Navigating the un-tokened redirector once returns a fresh token. **That is exactly how this project's
+first successful run happened — I did it by hand** (`.recon/_burn_check_new.py`), which is precisely
+why nobody noticed the daemon could not do it for itself. A manual workaround that works is a
+capability gap in disguise.
+
+New `scrape.provoke_rapt()`, called by `run_once` before it gives up. Costs **Δ0** — a bounced request
+is measured free. This is the difference between a pipeline that needs a human to have just clicked a
+download, and one that can start from a signed-in browser on its own.
+
+### The post-change run, validated
+
+```
+**Verdict: COMPLETE — every expected part verified on disk**
+- parts: 1/1   bytes: 36670 of 36670   attempts: mint 1 | transfer 1 | resume 0   EXIT=0
+- landed: /opt/archives/_v3-selftest/braincreation5/takeout-20260919T163231Z-1-001.zip
+- sha256 identical to the staged copy; PK header; testzip() None; 8 members
+```
+
+This closes the verification debt from the nine critical-path changes: scrape → **provoke** → mint
+(new ReAuth classifier, new file-host status filter) → transfer (new resume-validator and OSError
+classification) → verify → move (real filename) → report. The token was earned by the daemon itself.
+
+**228 tests pass, 6 skipped.** 28 commits.
+
+### Why a FULL pull is still not possible
+
+Not a code problem. Checked on the live system:
+
+| Export | Products | State |
+|---|---|---|
+| `f9a17be0…` | 3 | Completed — the canary, **2 attempts left** |
+| `f470fe32…` | 3 | Completed but **spent (5/5)** |
+| `69f95248…` | 65 | **Failed** |
+| — | 20, 21, 62, 64 | **still generating**, 11+ hours in, may take days |
+
+**There is no large completed export to pull.** The multi-part path has still never run live — only
+1-part exports have.
+
+### Storage facts that only matter at scale
+
+- `/opt/archives` is the rclone FUSE mount and rclone is running; existing archives hold **387 GB**.
+- Staging `/config` has **293 GB free** on a 300 GB LUKS volume — and rclone runs
+  `--vfs-cache-mode full --vfs-cache-max-size 100G`, so **the VFS cache shares that same volume**.
+- `/` has only **14 GB free**; v3 correctly does not stage there.
+
+Which is why the four remaining review findings (`#18`) stop being theoretical for a real pull: the
+mover's FUSE write has **no watchdog**, so a wedged write hangs a multi-GB part indefinitely; the
+staging guard does not exist; the CDP event list grows unbounded over a multi-hour run; and the CDP
+reader dies silently. At 36 KB none of these could bite. At real part sizes they can.

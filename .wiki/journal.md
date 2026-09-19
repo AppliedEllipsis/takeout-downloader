@@ -1005,3 +1005,78 @@ Which is why the four remaining review findings (`#18`) stop being theoretical f
 mover's FUSE write has **no watchdog**, so a wedged write hangs a multi-GB part indefinitely; the
 staging guard does not exist; the CDP event list grows unbounded over a multi-hour run; and the CDP
 reader dies silently. At 36 KB none of these could bite. At real part sizes they can.
+
+---
+
+## 2026-09-19 (night) — All four hardened; and a minted URL outlives the window
+
+### The mover question, answered with measurements rather than opinion
+
+Asked whether the mover should "just use rclone directly" instead of writing through the FUSE
+mount. Three independent reasons say no, each measured:
+
+1. **It isn't available.** The rclone config is **fully encrypted** and no service unit or env file
+   exposes the password — a second `rclone` call dies at an interactive password prompt (observed).
+   Hard-coding that password into v3 would be worse than the mount dependency.
+2. **JuiceFS is not the same data.** I first claimed `/opt/storage.jfs002/google-takeout` and the
+   mount's tree were the same bytes. **Wrong** — they share a name and hold different contents
+   (`andrew, braincreation, _retired-bookkeeping, state.db` versus
+   `andrew-novakrus-com, appliedellipsis, braincreation, cyd-sheri-gmail, …`). Writing there would
+   file archives in the wrong tree.
+3. **`--dir-cache-time 9999h` with no `--rc` — the clincher.** Anything written behind the mount is
+   invisible to it essentially forever, and there is no RC endpoint to invalidate it.
+   `index_destination` scandirs the mount, so the idempotency guard would go blind.
+
+So the fix is a **process boundary**, not a different mechanism: a wedged FUSE write cannot be
+interrupted from the thread that issued it, so the copy runs in a **child process** with a stall guard
+inside it and a ceiling in the parent, both overridable. Validated live against the real mount:
+**96 MB moved, sha256 matched, 0.16 s.**
+
+Corrections to my own earlier reporting, both mine: an initial "cache = 0 MB" was a **permission
+artifact** (the dir is `drwx------ root`), and the first experiment's "remote_bytes" column was
+**meaningless** because that rclone call died at the password prompt. And a `find` across a 1 PB
+JuiceFS mount timed out and leaked a probe file that had to be cleaned up by hand — the broad-scan
+trap, made by me, having just warned about it.
+
+### The finding that changes how a full pull works
+
+```
+minted at 2026-09-19T18:04:18Z   ·   tested ~19:25   ·   HTTP 206   ·   first bytes PK\x03\x04
+```
+
+**A minted URL outlives the ~45-minute ReAuth window** — 81 minutes, still serving real zip bytes on a
+`Range` request (a measured Δ0, so proving it cost nothing).
+
+Minting is what the window gates; **transferring needs only the jar** — which is why that URL worked
+with a jar pulled at 19:25 while the browser could not mint at all.
+
+That matters because the loop minted **per part, interleaved with transfers**. Each mint needs a live
+window; a 63-part multi-GB export takes hours. **Late parts would fail to earn their URLs and the pull
+would stop part-way — unable to finish in one pass.** Visible only at real scale.
+
+New `--mint-only` earns every URL while the window is fresh and stops. An ordinary run then finds them
+all cached in the ledger and transfers without minting again. The caching already existed; only the
+phase was missing.
+
+### The last two long-run defects
+
+- **The event list grew without bound.** One session per run, a fresh mark per hop, dozens of
+  `Network` events per navigation. Capped, with offset accounting so `event_count()` stays monotonic
+  and absolute indices still resolve.
+- **The reader died silently.** `except Exception: return` set no flag, so every later `call()` waited
+  out its full 30 s timeout and a run whose socket had dropped **appeared to hang**. Now the death is
+  recorded, in-flight calls fail at once, later calls raise without waiting. Reconnecting is
+  deliberately not attempted — a new target has a different UUID, so resuming would silently
+  re-attach to a different page. New `CdpError` joins the error family, and `run_once` gained an outer
+  `except AutopilotError` so an escaped classified failure is reported rather than traced back.
+
+### State
+
+**254 tests pass, 6 skipped. 32 commits.** All four review findings closed.
+
+The canary remains `needs_reauth` (correctly: exit 2, 0 attempts) because the window lapsed again —
+`provoke_rapt` earned a token and Google still demanded a challenge, which is the honest signal that
+a fresh sign-in is needed at the moment of minting.
+
+**A full pull is now feasible in three steps:** fresh sign-in → `--mint-only` (earn every URL while
+the window is fresh) → the transfer pass (hours, jar only, window-independent).

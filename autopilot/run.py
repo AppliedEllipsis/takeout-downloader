@@ -119,20 +119,53 @@ def _get_json(url: str, timeout: float) -> dict:
         return json.load(resp)
 
 
-def _default_session_factory(cdp_http: str, timeout: float = 20.0):
-    """Connect to the browser-level CDP endpoint.
+def pick_page_target(targets, *, prefer_host: str = "takeout.google.com"):
+    """Choose which page target to drive. Pure, so it is testable offline.
 
-    The bare `ws://host:port` is rejected with HTTP 404 — measured — so the
-    endpoint must be discovered from `/json/version`, and its UUID changes on
-    every browser restart.
+    Prefer a tab already on the Takeout host (the session cookie is right there
+    and the page is warm); otherwise any page target will do.
+
+    Raises if there is no page target at all: a browser with no tab cannot be
+    navigated, and the browser-level endpoint cannot substitute (see below).
+    """
+    pages = [t for t in (targets or [])
+             if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+    if not pages:
+        raise AutopilotError(
+            "no page target available — the browser has no tab to drive. "
+            "The browser-level CDP endpoint cannot be used instead: measured "
+            "2026-09-19, it rejects Page.navigate, Network.enable and "
+            "Runtime.evaluate with \"wasn't found\" (only Storage.getCookies works)."
+        )
+    preferred = [t for t in pages if prefer_host in (t.get("url") or "")]
+    return (preferred or pages)[0]
+
+
+def _default_session_factory(cdp_http: str, timeout: float = 20.0):
+    """Attach to a **page target**, not the browser endpoint.
+
+    Measured 2026-09-19, and this was a live failure rather than a theory:
+
+        CmdError: Page.navigate failed: 'Page.navigate' wasn't found
+
+    The `Page`, `Network` and `Runtime` domains belong to a page target. On the
+    browser-level endpoint every one of them fails with "wasn't found" — so a
+    browser-level session can read cookies but cannot drive anything. A page
+    target does **both** (`Storage.getCookies` returned the same 28 cookies), so
+    one session suffices.
+
+    `ws://host:port` bare is rejected with HTTP 404, so the URL must come from
+    `/json/list` (per-target) and its UUID changes on every browser restart.
     """
     from .cdp import CdpSession
-    from .ws_transport import WebSocketTransport, browser_endpoint
+    from .ws_transport import WebSocketTransport
 
     @asynccontextmanager
     async def _factory():
-        info = await asyncio.to_thread(_get_json, cdp_http.rstrip("/") + "/json/version", timeout)
-        transport = await WebSocketTransport.connect(browser_endpoint(info))
+        targets = await asyncio.to_thread(
+            _get_json, cdp_http.rstrip("/") + "/json/list", timeout)
+        target = pick_page_target(targets)
+        transport = await WebSocketTransport.connect(target["webSocketDebuggerUrl"])
         async with CdpSession(transport) as session:
             yield session
 

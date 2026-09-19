@@ -559,3 +559,101 @@ job `complete`, file moved onto the archive).
 Commands: `/c/Users/User/anaconda3/python.exe -m pytest tests/v3 -q -p no:cacheprovider`
 (112 passed, 1 failed, 6 skipped) and `... --ignore=tests/v3/test_integration.py` (102 passed, 6 skipped —
 nothing pre-existing was broken).
+
+---
+
+## 2026-09-19 — The orchestrator, and the first full pipeline run
+
+### What changed
+
+The orchestrator did not exist. `grep -rln 'def run|orchestrat|run_once|def main|__main__' autopilot/`
+found **nothing** — twelve tested modules and no way to run them in sequence.
+
+Added `autopilot/run.py` (scrape → mint-if-uncached → transfer → verify → move → report, ledgering after
+each step), `autopilot/__main__.py` (CLI with exit codes 0/2/3/1), and
+`docs/v3/02-RUN-INTERFACE.md` — the contract, **frozen before the work was split** so a test agent could
+build against it in parallel. Four agents ran concurrently on genuinely separate workstreams; each was
+verified against source afterwards.
+
+### The first real run — and it failed the RIGHT way
+
+Deployed non-destructively to a worktree inside the repo root (`$R/.v3`, visible in the container as
+`/work/.v3`) so the live deployment on `feat/internal-downloader` was never disturbed.
+
+```
+**Verdict: BLOCKED — re-authentication required (0/1 held)**
+- job status: needs_reauth        - parts: 0/1
+- export expiry: September 26, 2026 at 4:58 AM
+- Attempts spent: mint 0 | transfer 0 | resume 0
+error: ReAuth required (hit accounts.google.com/ServiceLogin?continue=...takeout/download?j=...)
+```
+
+Scraped the page (1 part, 261259 bytes), attempted the mint, hit the ReAuth redirect, and **stopped
+cleanly** — no exception, no `needs_cookie` park, no tab storm. **Zero attempts spent**, matching the
+measured `Δ0` for a bounced request. Nothing written to staging or the destination.
+
+**That is the first full pipeline run in this project's history, and it failed in the designed way rather
+than the historical way.** The old behaviour for this exact situation was to park the job forever and open
+a browser tab every minute for three months — failure mode 1.9. v3 demonstrated it does not happen.
+
+The cause is the measured root cause exactly: the redirector needs a `rapt` only an interactive session
+can mint, and the session's had lapsed.
+
+### Seven bugs, every one in a seam
+
+| # | Bug | Defect lived in |
+|---|---|---|
+| 1 | duplicate-index guard compared list lengths (always equal when all share an index) | guard logic |
+| 2 | `os.path.abspath` rewrote POSIX paths on Windows → FUSE guard never fired | guard logic |
+| 3 | FUSE matching ignored longest-mount shadowing | guard semantics |
+| 4 | destination guard **never called** by the orchestrator | **the seam** |
+| 5 | destination guard tested equality, not containment → would refuse the real path | guard semantics |
+| 6 | CLI called async `run_once` without awaiting it | **the seam** |
+| 7 | session attached to the browser endpoint; `Page.navigate` not found | **the seam** |
+
+Plus `UnicodeEncodeError` on the CLI's primary output path (the Δ notation vs a cp1252 console), the
+report's attempts table printing hardcoded zeros (`build_report` had no `attempts` parameter), and
+`incomplete` being a valid run outcome but an invalid job status.
+
+**Each component was correct in isolation. Reading the code found none of them.** Five of the seven were
+found only by running the thing; the other two by asking what the real inputs look like.
+
+### Verified before running, not assumed
+
+- container import chain: all 13 submodules under python 3.13.5, the `autopilot.verify → takeout2.verify`
+  bridge, and the FUSE guard **refusing `/var/rclone_vfs`** on the real box
+- `UrllibHttpClient` — previously referenced only by its own definition — against real sockets, 9/9,
+  including redirects surfaced rather than followed
+- the deploy agent's "server left pristine" claim, checked against the server: no extra worktrees, clean
+  working tree, main checkout still on its branch
+
+### Commands run (exact)
+
+```bash
+# deploy (non-destructive: worktree INSIDE the repo root, the only path bind-mounted in)
+ssh takeout-server "cd $R && git fetch origin && git worktree add --detach $R/.v3 origin/feat/takeout-autopilot"
+ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui python3 -B -m autopilot --help"
+
+# the run
+ssh takeout-server "docker exec -w /work/.v3 ... python3 -B -m autopilot run \
+  --archive-id f470fe32-... --ledger /config/v3-selftest/state.db \
+  --staging /config/v3-selftest/staging --archive /opt/archives/_v3-selftest/braincreation"
+
+# push fallback when GitHub DNS failed: the server has an SSH remote
+cd $WT && git push server-final feat/takeout-autopilot
+```
+
+### Gotchas worth keeping
+
+- **The container runs as root**, so container-written files land root-owned in `/work` and the host user
+  cannot delete them. Always `python3 -B` / `PYTHONDONTWRITEBYTECODE=1` to avoid root-owned `__pycache__`.
+- **`autopilot.verify` resolves `takeout2` from cwd**, so a `PYTHONPATH`-only deploy would silently bind
+  to the live `/work/takeout2` (identical today, not guaranteed later).
+- **Only the repo root is bind-mounted** into the container. A worktree or clone outside it is invisible.
+- `pytest` is absent in the container, so the suite cannot run there — it is a workstation suite.
+
+### State
+
+**133 tests pass, 6 skipped** (live network, gated). Seven commits on `feat/takeout-autopilot`, pushed to
+GitHub and to the server. `#13` (a completed download) is blocked on one human satisfying the ReAuth
+challenge — the irreducible step.

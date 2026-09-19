@@ -811,3 +811,118 @@ ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeou
 `#13` is blocked on **two** things now, not one: a **new export** (this one is spent at 5/5 — measured), and
 a fresh ReAuth to mint against it. Four large exports (62–65 products, created 04:27–07:07) are in progress
 and will become downloadable in hours to days.
+
+---
+
+## 2026-09-19 — **`#13` CLOSED. The first completed download.**
+
+```
+**Verdict: COMPLETE — every expected part verified on disk**
+- archive  : f9a17be0-65e2-4b1f-a9c6-04c840204419
+             (3 products: Alerts, Android Device Configuration Service, Google Feedback)
+- parts    : 1/1 (100%)            - bytes: 36670 of 36670
+- attempts : mint 1 | transfer 1 | resume 0          - exit: 0
+- landed   : /opt/archives/_v3-selftest/braincreation2/takeout-20260919T163231Z-1-001.zip
+```
+
+Verified independently rather than trusting the report: `PK\x03\x04` magic, `zipfile.testzip()` clean,
+**8 members**, and a sha256 **identical between staging and the archive**. First time in this project's
+history that a run has gone scrape → mint → transfer → verify → move → exit 0 unaided.
+
+### The burn export
+
+Created through the Takeout UI over CDP: `Deselect all`, then 3 deliberately tiny products, then verify the
+delivery page (email / once / .zip / 2 GB) **before** the one account-affecting click. It completed in
+under two minutes. The previous canary's remaining attempts were spent by my own diagnostics, so this one
+replaced it. The 5-attempt cap is per export, which is why runbook 1.19 now says to read `dl_counts`
+*before* an experiment rather than after.
+
+### Bugs 10 and 11 — surfaced only by a run that SUCCEEDED
+
+Both were invisible while the pipeline was failing: success is not merely the absence of the old failure,
+it is a new set of preconditions.
+
+**10. A live rapt was thrown away because the bounce omitted `j`.** Driving the redirector without a token
+returned
+
+```
+.../manage/archive/<id>?user=...&pli=1&rapt=<fresh>
+```
+
+— a fresh token and **no `j`**. The retry branch demanded `params.get("rapt") and params.get("j")`, so it
+discarded the token and reported *"no archive bounce in the chain"* for an export that was immediately
+mintable. The archive id was never in question: it is in the path. **This was the bug standing between the
+project and its first successful run** — the run that finally worked did so because the tab happened to hold
+a rapt URL that `recover_rapt_url` could reuse, sidestepping the broken retry.
+
+Notably, **no interactive ReAuth was needed at all**: hitting the redirector once issued a rapt. The
+"irreducible human step" the whole design was built around turns out to be reachable non-interactively for
+a fresh export. That deserves re-examination before the next design assumes it.
+
+**11. Every part was named `download`.** The redirector path is `takeout/download?j=...`, so the scraped
+basename is the literal string `download` **for every part of every export**. `run.py` staged under it and
+`move_part` re-derived the destination name from the source basename — so every part landed as `download`,
+and because the destination index is keyed by filename, each later part was reported present or
+size-mismatched. **A 63-part export would have landed one file and looked plausible doing it.** The real
+name was on the minted URL all along:
+
+```
+.../usercontent.google.com/download/takeout-20260919T163231Z-1-001.zip?j=...
+```
+
+Fixed with `part_filename_from_url()`, a new `set_part_filename()` on the ledger (the scrape *cannot* know
+the name — it is only knowable after minting), and an explicit `filename` parameter on `move_part`.
+Verified live: the second run landed `takeout-20260919T163231Z-1-001.zip`, not `download`.
+
+Also found: `mint.py` used `re` without importing it.
+
+### Bugs 1–11
+
+| # | Defect | Where |
+|---|---|---|
+| 1 | duplicate-index guard compared list lengths | guard logic |
+| 2 | `os.path.abspath` made the FUSE guard a no-op on Windows | guard logic |
+| 3 | FUSE matching ignored longest-mount shadowing | guard semantics |
+| 4 | destination guard **never called** | the seam |
+| 5 | destination guard tested equality, not containment | guard semantics |
+| 6 | CLI called async `run_once` without awaiting | the seam |
+| 7 | session attached to the browser endpoint, not a page | the seam |
+| 8 | scrape navigated to the URL that discards the rapt | the seam |
+| 9 | quota refusal had no name; the retry ate it | the seam |
+| 10 | live rapt discarded because the bounce omitted `j` | the seam |
+| 11 | every part named `download` | the seam |
+
+**Eight of eleven are seams.** Not one was found by reading the code; every one by running it — and two
+(#10, #11) were only findable *after* something worked.
+
+### Commands run (exact)
+
+```bash
+# create a fresh canary over CDP (deselect-all, 3 tiny products, verify, then click)
+ssh takeout-server 'docker exec -i -w /work/.v3 takeout-webgui python3 -B -' < .recon/_burn_select.py
+ssh takeout-server 'docker exec -i -w /work/.v3 takeout-webgui python3 -B -' < .recon/_burn_create.py
+
+# detached poll for completion (never block the main loop)
+ssh takeout-server 'cat > /tmp/p.py && docker cp /tmp/p.py takeout-webgui:/tmp/p.py && \
+  docker exec -d takeout-webgui sh -c "cd /work/.v3 && nohup python3 -B /tmp/p.py >/tmp/p.out 2>&1"'
+
+# the clean-slate verification run
+ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
+  python3 -B -m autopilot run --archive-id f9a17be0-... \
+  --ledger /config/v3-selftest/state2.db --staging /config/v3-selftest/staging2 \
+  --archive /opt/archives/_v3-selftest/braincreation2 --account braincreation"
+```
+
+### Gotchas
+
+- **A 5-attempt export is exhausted by roughly five probes.** Read `dl_counts` before, not after.
+- **The Takeout UI is a SPA that changes no URL per step**, so verify each step by reading the DOM rather
+  than by watching the address bar.
+- **`/manage` truncates its export list** — there were 6 requests where a 4,000-character read showed 4.
+  Never conclude "only N exist" from a truncated page dump.
+- **A synthetic click can fire with no visible effect**; always re-read state afterwards.
+
+### State
+
+**171 tests pass, 6 skipped.** 19 commits on `feat/takeout-autopilot`, pushed to GitHub and the server.
+`#13` closed. The export still has **3 of its 5 attempts** left for further verification.

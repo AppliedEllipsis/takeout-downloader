@@ -184,3 +184,37 @@ heartbeat" is the ReAuth window. Neither was ever named correctly.
 
 The one export that ever finished (3.08 TB, by hand) worked because a human satisfied the challenge and
 `curl` then transferred with the jar — **exactly the hybrid this measurement now prescribes.**
+
+---
+
+## Corrections and additions — 2026-09-19, after the first successful run
+
+**A rapt is issued by hitting the redirector, with no interactive challenge.** Measured on the fresh export
+`f9a17be0-…`: navigating the redirector `takeout/download?j=…&i=0&user=…` — carrying no token at all —
+returned
+
+```
+302 -> .../manage/archive/<id>?user=...&pli=1&rapt=<fresh>
+```
+
+**No password prompt, no `challenge/pwd` page.** The archive page then served tokened download links and the
+mint succeeded (Δ1). This **qualifies the founding misdiagnosis below**: the ReAuth challenge is what you
+hit when the *existing* session is stale, but a fresh export hands out a rapt on first contact. Any design
+treating the human step as unconditional is wrong for a first run.
+
+Three further measurements from the same session:
+
+* **Google caps downloads per export at 5.** The refusal arrives as `quotaExceeded=true` on the
+  archive-page bounce, and the page states it: *"You can try to download a file only 5 times."* Terminal —
+  a retry is guaranteed to fail. See runbook 1.19.
+* **The ledger's attempt count and Google's counter are different quantities, and only the latter runs
+  out.** A run reported `mint 0 | transfer 0` while Google's counter went 3 → 5, because a bounced mint is
+  never recorded as a spent attempt. Budget diagnostics against `dl_counts`, never the ledger.
+* **A scraped part filename is always the literal string `download`.** The redirector path is
+  `takeout/download?j=…`, so the basename carries no part identity — a multi-part export collides on one
+  name. The real name appears only on the *minted* URL
+  (`…/download/takeout-20260919T163231Z-1-001.zip?j=…`), which is why it cannot be recorded at scrape time.
+
+**A completed run, for reference** (archive `f9a17be0-65e2-4b1f-a9c6-04c840204419`, 3 products, 1 part):
+verdict `COMPLETE`, exit 0, `36670 of 36670` bytes, mint 1 / transfer 1 / resume 0, landed as
+`takeout-20260919T163231Z-1-001.zip` with a sha256 **identical between staging and the archive mount**.

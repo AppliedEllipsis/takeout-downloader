@@ -35,7 +35,9 @@ Each guard corresponds to a way this project actually lost data or wasted days:
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Protocol
 
@@ -246,6 +248,20 @@ async def download(
         with open(dest, "r+b") as fh:
             fh.truncate(start)
 
+    # **No validator, no resume.** Fixed 2026-09-19: `If-Range` used to be sent only
+    # when an etag was supplied, so a resume with no recorded etag sent a bare
+    # `Range` and the server had no way to say "this object was replaced". If the
+    # replacement happened to be the SAME SIZE, the new object's tail would land on
+    # the old object's prefix, the byte count would match, and `verify_local` would
+    # accept the hybrid as structurally fine — silent corruption, no error anywhere.
+    #
+    # A resume costs Δ0 attempts and a fresh acquisition costs Δ1, so this is a real
+    # trade — but bandwidth is recoverable and a corrupt archive is not. Decided
+    # BEFORE the headers are built, so no `Range` is sent at all in this case.
+    resumed = start > 0 and bool(etag)
+    if start > 0 and not resumed:
+        start = 0
+
     headers = {
         "Cookie": jar_header,
         "User-Agent": "Mozilla/5.0",
@@ -255,10 +271,10 @@ async def download(
     }
     if start > 0:
         headers["Range"] = f"bytes={start}-"
-        if etag:
-            # If the validator no longer matches, the server answers 200 with the
-            # whole body instead of a 206 — the correct signal to start over.
-            headers["If-Range"] = etag
+        # `If-Range` is always sent on a resume, because `resumed` requires it: if the
+        # validator no longer matches, the server answers 200 with the whole body
+        # instead of a 206, which is the correct signal to start over.
+        headers["If-Range"] = etag
 
     stream = await client.get(url, headers)
     try:
@@ -283,6 +299,24 @@ async def download(
                     f"remote total {total} != expected {expected_size} "
                     f"(Content-Range: {cr!r})"
                 )
+            # The Content-Range START must also be honoured: a body that does not
+            # begin where we asked would be appended at the wrong offset. Checked
+            # because only the total used to be parsed, so a mis-ranged 206 was
+            # written into the file at whatever offset the server chose.
+            rng_start = _start_from_content_range(cr)
+            if rng_start is not None and rng_start != start:
+                raise RemoteChanged(
+                    f"Content-Range starts at {rng_start}, not the requested {start} "
+                    f"(Content-Range: {cr!r})"
+                )
+            # And when we did send a validator, the response must still agree with
+            # it. Storing the new etag without comparing let a replaced object pass
+            # as a continuation of the old one.
+            resp_etag = hdrs.get("etag")
+            if etag and resp_etag and resp_etag != etag:
+                raise RemoteChanged(
+                    f"etag changed mid-download: {etag!r} -> {resp_etag!r}"
+                )
             mode, write_from = "ab", start
         elif status == 200:
             # Server ignored Range, or If-Range said the object changed. Either
@@ -297,17 +331,39 @@ async def download(
             raise TransferError(f"unexpected HTTP {status} from the file host")
 
         written = 0
-        with open(dest, mode) as fh:
-            while True:
-                block = await stream.read(chunk)
-                if not block:
-                    break
-                fh.write(block)
-                written += len(block)
-                if on_progress:
-                    on_progress(write_from + written, expected_size or 0)
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Disk errors must be CLASSIFIED, not allowed to escape.
+        #
+        # Fixed 2026-09-19: there was no handler here, and `AutopilotError`
+        # subclasses `Exception`, not `OSError` — so an `ENOSPC` mid-write
+        # propagated straight out of `download()`, past `run.py`'s
+        # `except (TransferError, AutopilotError)`, past the CLI (which caught only
+        # `LedgerOnFuseMount` and `KeyboardInterrupt`), and surfaced as an uncaught
+        # traceback. The ledger recorded NOTHING: the part kept whatever status it
+        # had and the job stayed in `transferring` indefinitely, and the partial file
+        # was left behind with no explanation. That is failure mode 1.16 producing a
+        # silent wedge instead of a diagnosis.
+        try:
+            with open(dest, mode) as fh:
+                while True:
+                    block = await stream.read(chunk)
+                    if not block:
+                        break
+                    fh.write(block)
+                    written += len(block)
+                    if on_progress:
+                        on_progress(write_from + written, expected_size or 0)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise TransferError(
+                    f"out of disk space after {written} bytes written to {dest!r} "
+                    f"(failure mode 1.16): {exc}"
+                ) from exc
+            raise TransferError(
+                f"disk write failed after {written} bytes to {dest!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
     finally:
         await stream.aclose()
 
@@ -330,3 +386,14 @@ def _total_from_content_range(value: str) -> Optional[int]:
         return None
     tail = value.rsplit("/", 1)[-1].strip()
     return int(tail) if tail.isdigit() else None
+
+
+def _start_from_content_range(value: str) -> Optional[int]:
+    """`bytes 1024-2047/261259` -> 1024. `None` when unparseable.
+
+    Companion to `_total_from_content_range`, which parsed only the total — so a
+    `206` whose body began somewhere other than the requested offset was appended
+    at whatever offset the server chose, and nothing noticed.
+    """
+    m = re.match(r"\s*bytes\s+(\d+)-\d+/\s*(?:\d+|\*)\s*$", value or "")
+    return int(m.group(1)) if m else None

@@ -272,7 +272,17 @@ class Ledger:
                 "INSERT INTO parts (archive_id, idx, filename, size_expected, status) "
                 "VALUES (?,?,?,?,'pending') "
                 "ON CONFLICT(archive_id, idx) DO UPDATE SET "
-                " filename=COALESCE(excluded.filename, parts.filename),"
+                # A scrape can ONLY ever produce the placeholder `download`, because
+                # the redirector path is `takeout/download?j=...` (measured
+                # 2026-09-19). The real part name is knowable only after minting, and
+                # `set_part_filename()` records it then. So the scrape's value must
+                # never overwrite a real one: a plain COALESCE did exactly that,
+                # because the incoming string is always the non-NULL literal
+                # `download`, so every part's name was reset on every re-run.
+                " filename=CASE"
+                "   WHEN excluded.filename IS NULL OR excluded.filename IN ('', 'download')"
+                "   THEN COALESCE(parts.filename, excluded.filename)"
+                "   ELSE excluded.filename END,"
                 " size_expected=COALESCE(excluded.size_expected, parts.size_expected)",
                 (archive_id, idx, filename, size),
             )
@@ -371,6 +381,43 @@ class Ledger:
             f"UPDATE parts SET {', '.join(sets)} WHERE archive_id=? AND idx=?", args)
         self._attempt(archive_id, idx, kind, outcome, bytes_moved, None)
         self.conn.commit()
+
+    def record_failed_transfer(self, archive_id: str, idx: int, exc: Exception) -> None:
+        """Book a transfer attempt that FAILED.
+
+        Fixed 2026-09-19. `record_transfer` sits *after* the try/except in
+        `run_once`, so every failure path skipped it — meaning a failed file-host
+        GET made a real HTTP request and left no `attempts` row and no counter
+        bump. The report then printed `transfer 0` for runs that had genuinely
+        contacted Google, and the attempt count is the only budget signal here.
+
+        The kind is recorded as `transfer` rather than `resume` deliberately: a
+        request that failed tells us nothing about whether it was a resume, and
+        claiming the cheap kind would understate the cost.
+        """
+        message = f"{type(exc).__name__}: {exc}"
+        self.conn.execute(
+            "UPDATE parts SET attempts=attempts+1 WHERE archive_id=? AND idx=?",
+            (archive_id, idx),
+        )
+        self._attempt(archive_id, idx, AttemptKind.TRANSFER, "failed", 0, message[:200])
+        self.conn.commit()
+
+    def failed_transfer_count(self, archive_id: str, idx: int) -> int:
+        """How many transfer attempts for this part have failed.
+
+        Used to bound how long a cached minted URL is retried before it is
+        discarded: re-minting costs Δ1 and an export allows only 5 attempts in
+        total, so one transient blip must not trigger a fresh mint — but neither
+        may a genuinely dead URL be retried forever.
+        """
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE archive_id=? AND idx=? "
+            "AND kind=? AND outcome='failed'",
+            (archive_id, idx, AttemptKind.TRANSFER),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
 
     def observe_dl_count(self, archive_id: str, idx: int, value: int) -> None:
         """Record the manage-page counter. Telemetry only — rule 3.

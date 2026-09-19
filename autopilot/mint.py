@@ -43,6 +43,8 @@ __all__ = [
     "FILE_HOST",
     "ACCOUNTS_HOST",
     "QUOTA_FLAG",
+    "SIGNIN_MARKERS",
+    "is_signin_location",
     "Redirect",
     "MintResult",
     "absolute_uri",
@@ -51,6 +53,8 @@ __all__ = [
     "archive_id_from_archive_url",
     "part_filename_from_url",
     "extract_redirects",
+    "file_host_hits",
+    "response_urls",
     "mint",
 ]
 
@@ -61,6 +65,48 @@ ACCOUNTS_HOST = "accounts.google.com"
 #: Google marks a spent download allowance with this query parameter on its
 #: bounce back to the archive page. Measured 2026-09-19; see `QuotaExceeded`.
 QUOTA_FLAG = "quotaExceeded=true"
+
+#: Substrings that identify a **genuine interactive sign-in demand**.
+SIGNIN_MARKERS = (
+    "/servicelogin",
+    "/v3/signin/",
+    "/signin/",
+    "interactivelogin",
+    "/challenge/",
+)
+
+#: `accounts.google.com` paths that are a NORMAL part of a SUCCESSFUL mint.
+#:
+#: Measured (`docs/v3/01-ARCHITECTURE.md`): the healthy chain is
+#:
+#:     302 takeout/download -> archive 302 -> RotateCookiesPage?rot=3
+#:       -> 302 takeout-download.usercontent.google.com/...zip -> 200
+#:
+#: so the accounts host appears on the path to success. Treating any
+#: `accounts.google.com` hop as a ReAuth demand therefore misclassifies a working
+#: mint as an auth failure — which is exactly what the old
+#: `ACCOUNTS_HOST in r.location` test did. It only appeared to work because the
+#: file-host check happens to run first when both hops arrive in one batch, so the
+#: bug was TIMING-DEPENDENT: a slower chain delivering the RotateCookiesPage hop a
+#: batch earlier would report `needs_reauth` for an export that was minting fine.
+BENIGN_ACCOUNTS_PATH_MARKERS = (
+    "/rotatecookiespage",
+)
+
+
+def is_signin_location(url: str) -> bool:
+    """True only for a URL that really demands an interactive challenge.
+
+    Pure, so the classification that decides `needs_reauth` is testable offline.
+    A hop to the accounts host is NOT sufficient — see
+    `BENIGN_ACCOUNTS_PATH_MARKERS`.
+    """
+    low = (url or "").lower()
+    if ACCOUNTS_HOST not in low:
+        return False
+    if any(marker in low for marker in BENIGN_ACCOUNTS_PATH_MARKERS):
+        return False
+    return any(marker in low for marker in SIGNIN_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +246,10 @@ def extract_redirects(events) -> list[Redirect]:
 
 def response_urls(events) -> list[str]:
     """URLs of responses seen, for the case where the file host answers directly
-    without us catching its `Location`."""
+    without us catching its `Location`.
+
+    Deliberately unfiltered — see `file_host_hits()` for the status-checked form.
+    """
     urls = []
     for method, params in events:
         if method == "Network.responseReceived":
@@ -208,6 +257,36 @@ def response_urls(events) -> list[str]:
             if isinstance(resp, dict) and resp.get("url"):
                 urls.append(resp["url"])
     return urls
+
+
+def file_host_hits(events) -> list[tuple[str, int]]:
+    """`(url, status)` for every FILE_HOST response that actually SUCCEEDED.
+
+    **Fixed 2026-09-19.** The mint's step 1 previously consulted
+    `response_urls()` — which has no status filter — and did so BEFORE the
+    ReAuth/quota/refresh branches. So a file host answering
+    `302 -> accounts.google.com/ServiceLogin` appeared as a file-host *response*,
+    the mint reported SUCCESS, and the dead URL was written into the ledger's mint
+    cache. Every later run then re-used that URL and failed — exactly the "park
+    forever" shape this project spent three months in.
+
+    Only a 2xx from the file host means a URL was minted. Redirects and errors do
+    not, and must fall through so the ReAuth/quota handling can classify them.
+    """
+    hits: list[tuple[str, int]] = []
+    for method, params in events:
+        if method != "Network.responseReceived":
+            continue
+        resp = params.get("response")
+        if not isinstance(resp, dict):
+            continue
+        url = resp.get("url") or ""
+        if FILE_HOST not in url:
+            continue
+        status = resp.get("status")
+        if isinstance(status, int) and 200 <= status < 300:
+            hits.append((url, status))
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -290,16 +369,24 @@ async def mint(
                                     chain=chain, refreshed_rapt=refreshed)
                 await _restore(session, restore_url)
                 return result
-        for url in response_urls(observed):
-            if FILE_HOST in url:
-                result = MintResult(url=url, redirector=redirector, hops=hop,
-                                    chain=chain, refreshed_rapt=refreshed)
-                await _restore(session, restore_url)
-                return result
+        # Only a 2xx from the file host counts as a mint. A file host answering
+        # `302 -> accounts.google.com` is NOT a successful mint, and treating it as
+        # one cached a dead URL that every later run then re-used. Checked here,
+        # before the ReAuth/quota branches, so those can classify it instead.
+        for url, _status in file_host_hits(observed):
+            result = MintResult(url=url, redirector=redirector, hops=hop,
+                                chain=chain, refreshed_rapt=refreshed)
+            await _restore(session, restore_url)
+            return result
 
         # 2. Did Google demand ReAuth?
+        #
+        # `is_signin_location`, NOT `ACCOUNTS_HOST in location`: the measured
+        # SUCCESSFUL chain routes through `accounts.google.com/RotateCookiesPage`,
+        # so matching the host alone turned healthy mints into `needs_reauth`
+        # whenever that hop arrived before the file-host hop.
         for r in redirects:
-            if ACCOUNTS_HOST in r.location:
+            if is_signin_location(r.location):
                 raise NeedsReauth(r.location)
 
         # 2b. Did Google refuse because the export's download allowance is spent?

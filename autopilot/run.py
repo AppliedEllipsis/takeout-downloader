@@ -68,8 +68,30 @@ RUN_OUTCOME_STATUSES = (
     "needs_reauth",
     "incomplete",
     "expired_unrecoverable",
+    # Added when the quota condition was named. It was missing from this tuple for a
+    # while after `run_once` began RETURNING it — `JOB_STATUSES` and
+    # `_EXIT_FOR_STATUS` were both updated and this one was forgotten, which is the
+    # same vocabulary drift that once broke `incomplete` (see `ledger.py`).
+    # `docs/v3/02-RUN-INTERFACE.md` points readers here as the canonical list, so a
+    # missing member is a contract violation rather than a cosmetic gap. Found by
+    # three independent reviewers; a test now asserts that every status the
+    # orchestrator can return appears here.
+    "quota_exceeded",
     "failed",
 )
+
+#: Statuses that must STOP a run rather than drive it. An export that has expired or
+#: spent its download allowance cannot be rescued by trying again, and the frozen
+#: contract's rule 4 requires `run_once` to honour the recorded status even when the
+#: page no longer renders the evidence (e.g. `Available until` disappears).
+TERMINAL_BLOCKED_STATUSES = ("expired_unrecoverable", "quota_exceeded")
+
+#: How many failed transfers against a CACHED minted URL before it is discarded.
+#: One failure may be a transient blip, and re-minting costs Δ1 against an export
+#: that allows only 5 attempts in total — so a single blip must not trigger a fresh
+#: mint. But a URL that has failed this many times is dead, and without a bound the
+#: part stays wedged on it forever (`RemoteChanged` used to be the only invalidation).
+MAX_CACHED_URL_FAILURES = 3
 
 
 @dataclass
@@ -201,6 +223,34 @@ async def run_once(
     # rclone mount). It raises rather than returning an outcome: a bad ledger path
     # is a caller bug, not a run result.
     ledger: Ledger = open_ledger(cfg.ledger_path)
+
+    # ---- 0a. capture any TERMINAL status NOW, before anything overwrites it ----
+    #
+    # The frozen contract's rule 4 requires `run_once` to stop when the job is
+    # already `expired_unrecoverable`, or has spent its download allowance, and to
+    # never mint against it. Two earlier attempts at this guard were silently inert,
+    # so both are recorded here:
+    #
+    #   1. It was first written before `_finish` existed (it is a closure created
+    #      further down), so it would have raised `NameError` on exactly the path it
+    #      protected. No test exercised that path, so nothing noticed.
+    #   2. It was then placed after the closure — but the line
+    #      `ledger.set_job_status(cfg.archive_id, "scraping")` runs between them and
+    #      overwrites the status, so the guard compared "scraping" against the
+    #      terminal set and never fired.
+    #
+    # Hence: read the row FIRST, and act on the snapshot after `_finish` exists. The
+    # `set_job_status("scraping")` call is what defeated the naive version, so the
+    # snapshot has to be taken on this side of it.
+    _prior = ledger.job(cfg.archive_id)
+    _terminal_status: Optional[str] = None
+    _terminal_error: Optional[str] = None
+    _terminal_expiry: Optional[str] = None
+    if _prior is not None and _prior["status"] in TERMINAL_BLOCKED_STATUSES:
+        _terminal_status = _prior["status"]
+        _terminal_error = _prior["error"]
+        _terminal_expiry = _prior["expiry_at"]
+
     try:
         ledger.upsert_job(cfg.archive_id, account=cfg.account,
                           output_dir=cfg.archive_dir)
@@ -224,6 +274,19 @@ async def run_once(
             )
 
         _expiry_seen: Optional[str] = None
+
+        # ---- 0b. act on the terminal snapshot captured above ---------------
+        # Placed here because `_finish` is a closure created just above; the
+        # snapshot itself was taken before `set_job_status("scraping")` could
+        # overwrite it. See the comment at the top of `run_once`.
+        if _terminal_status is not None:
+            _expiry_seen = _terminal_expiry
+            return await _finish(
+                _terminal_status,
+                error=(_terminal_error or "").strip()
+                      or (f"job is already {_terminal_status}; refusing to re-attempt "
+                          "a terminal export — see runbooks 1.14 / 1.19"),
+            )
 
         async with session_factory() as session:
             # ---- 1. scrape -------------------------------------------------
@@ -340,6 +403,40 @@ async def run_once(
             if cfg.max_parts is not None:
                 todo = todo[: max(0, cfg.max_parts)]
 
+            # ---- consult the destination index BEFORE minting anything -----
+            #
+            # `index_destination` and `plan_moves` were written for exactly this and
+            # the orchestrator never called them: the index was built here, written
+            # to later, and never READ. So a part whose bytes were already in the
+            # archive could still be re-minted (Δ1 against a 5-attempt allowance) and
+            # re-transferred. `test_moving_is_idempotent_by_planning` proved the
+            # mechanism correct in isolation while nothing in the run used it —
+            # a test that gave false confidence about production behaviour.
+            #
+            # Only parts whose REAL name is already recorded can be checked here,
+            # because the scrape can only ever produce the placeholder `download`
+            # (the redirector basename). For a fresh ledger the name is not knowable
+            # until after minting, so this prevents duplicate work on re-runs and on
+            # a ledger that lost its part rows — which is exactly when it matters.
+            already_present = []
+            _name_to_idx: dict = {}
+            for _p in todo:
+                _row = ledger.part(cfg.archive_id, _p.index)
+                _name = (_row["filename"] if _row else None) or ""
+                _size = _int_size(_p.size)
+                if _name and _name != "download" and _size is not None:
+                    _name_to_idx[_name] = _p.index
+                    already_present.append(
+                        (_name, os.path.join(cfg.staging_dir, _name), _size))
+            _skipped: set = set()
+            for _item in plan_moves(already_present, dest_index):
+                if _item.action == "skip-present" and _item.filename in _name_to_idx:
+                    _idx = _name_to_idx[_item.filename]
+                    ledger.set_part_status(cfg.archive_id, _idx, "done")
+                    _skipped.add(_idx)
+            if _skipped:
+                todo = [p for p in todo if p.index not in _skipped]
+
             for part in todo:
                 idx = part.index
                 # NOTE: `part.filename` is the *redirector* basename, which is the
@@ -400,16 +497,40 @@ async def run_once(
                         etag=ledger.part(cfg.archive_id, idx)["etag"],
                     )
                 except NeedsReauth as exc:
+                    # A transfer that is rejected for auth means THIS URL did not
+                    # work — session-wide or URL-expiry, we cannot tell which. It
+                    # was the only failure path that neither recorded the attempt
+                    # nor dropped the cached URL, so after a human re-authed, the
+                    # next run re-used the same rejected URL, failed identically,
+                    # and set `needs_reauth` again: a status a human could never
+                    # leave. Observed by two independent reviewers; it is the exact
+                    # v2 "park forever" shape this rebuild exists to remove.
+                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
+                    ledger.clear_mint(cfg.archive_id, idx)
                     ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
                     return await _finish("needs_reauth", error=str(exc))
                 except RemoteChanged as exc:
                     # the remote object is not what we planned against: the cached
                     # URL is useless, so drop it and let a later pass re-mint
+                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
                     ledger.clear_mint(cfg.archive_id, idx)
                     ledger.set_part_status(cfg.archive_id, idx, "partial",
                                            error=f"remote changed: {exc}")
                     continue
                 except (TransferError, AutopilotError) as exc:
+                    # A failed GET is still a GET. It used to book nothing, so the
+                    # ledger reported `transfer 0` for runs that had made real
+                    # requests — and the counter is the only budget signal this
+                    # project has.
+                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
+                    # A cached URL that just failed is not evidence of a working
+                    # URL, but neither is a transient blip: re-minting costs Δ1 and
+                    # the export's allowance is only 5. So retry the cached URL a
+                    # bounded number of times, then drop it rather than wedge the
+                    # part on it forever (the only other invalidation was
+                    # RemoteChanged).
+                    if ledger.failed_transfer_count(cfg.archive_id, idx) >= MAX_CACHED_URL_FAILURES:
+                        ledger.clear_mint(cfg.archive_id, idx)
                     ledger.set_part_status(cfg.archive_id, idx, "failed", error=str(exc))
                     continue
 

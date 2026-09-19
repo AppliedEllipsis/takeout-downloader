@@ -701,6 +701,21 @@ async def run_once(
         except Exception:  # noqa: BLE001 - the ledger itself may be the problem
             pass
         return await _finish("failed", error=_why)
+    except AutopilotError as exc:
+        # A classified failure that escaped a specific handler still becomes a REPORTED
+        # status rather than a traceback. Without this, a CDP session whose reader died
+        # mid-run (now `CdpError`, which is an `AutopilotError`) propagated straight out
+        # of `run_once`, past the CLI, and left the job parked on whatever status it held
+        # with no record of why.
+        #
+        # Deliberately scoped to the project's own error family: a `TypeError` or
+        # `KeyError` is a defect and SHOULD surface as a traceback.
+        _why = f"{type(exc).__name__}: {exc}"
+        try:
+            ledger.set_job_status(cfg.archive_id, "failed", error=_why)
+        except Exception:  # noqa: BLE001 - the ledger itself may be the problem
+            pass
+        return await _finish("failed", error=_why)
     finally:
         ledger.close()
 

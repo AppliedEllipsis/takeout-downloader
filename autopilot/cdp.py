@@ -28,7 +28,20 @@ import asyncio
 import json
 from typing import Any, Iterable, Optional, Protocol
 
-__all__ = ["Transport", "CdpSession", "CmdError"]
+from .errors import AutopilotError
+
+__all__ = ["Transport", "CdpSession", "CmdError", "CdpError", "MAX_EVENTS"]
+
+#: How many events to retain. The reader used to append every event forever and nothing
+#: ever trimmed: `run_once` opens ONE session for a whole run, `mint` takes a fresh mark
+#: per hop, and each navigation emits dozens of `Network` events — so a many-part,
+#: multi-hour export grew this list without bound for no benefit, since a mark is only
+#: ever taken immediately before the action it measures.
+#:
+#: The cap is generous (a few MB of dicts) because trimming is only safe when the
+#: caller's window is far smaller than the buffer, which it is: dozens of events versus
+#: tens of thousands.
+MAX_EVENTS = 50_000
 
 
 class Transport(Protocol):
@@ -46,6 +59,20 @@ class CmdError(RuntimeError):
         self.method = method
         self.error = error
         super().__init__(f"{method} failed: {error.get('message', error)}")
+
+
+class CdpError(AutopilotError):
+    """The session is unusable: the connection died, or it was closed.
+
+    Deliberately part of the project's error family so `run_once` can turn it into a
+    job status instead of a traceback. Raised the moment the reader task dies so that
+    in-flight and subsequent calls FAIL FAST rather than each waiting out its own
+    timeout — a run whose browser connection dropped should report that, not hang.
+
+    Reconnecting is not attempted on purpose: a new CDP target has a different UUID,
+    so resuming would silently re-attach to a possibly different page and continue
+    against state nobody has verified. Reporting is the honest option.
+    """
 
 
 class CdpSession:
@@ -69,8 +96,14 @@ class CdpSession:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._events: list[tuple[str, dict]] = []
+        #: Events trimmed off the front of `_events`. Kept so `event_count()` stays
+        #: monotonic and `events_since(i)` can still map an absolute index onto the
+        #: retained window.
+        self._dropped = 0
         self._reader: Optional[asyncio.Task] = None
         self._closed = False
+        #: Set when the reader dies. Any later call raises immediately.
+        self._dead: Optional[BaseException] = None
 
     # -- lifecycle ---------------------------------------------------------
     async def __aenter__(self) -> "CdpSession":
@@ -103,7 +136,15 @@ class CdpSession:
                 raw = await self._transport.recv()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - any failure here is fatal
+                # This used to `return` silently. The consequence: `_closed` stayed
+                # False and `_reader` non-None, so nothing restarted it and nothing
+                # marked the session dead — every later `call()` simply waited out its
+                # full timeout, and a run whose socket had dropped appeared to hang with
+                # no diagnosis. Now the death is recorded, in-flight calls are failed
+                # at once, and later calls raise without waiting.
+                self._dead = exc
+                self._fail_pending(exc)
                 return
             try:
                 msg = json.loads(raw)
@@ -117,6 +158,19 @@ class CdpSession:
             method = msg.get("method")
             if method:
                 self._events.append((method, msg.get("params") or {}))
+                if len(self._events) > MAX_EVENTS:
+                    drop = len(self._events) - MAX_EVENTS
+                    del self._events[:drop]
+                    self._dropped += drop
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Fail every in-flight call at once, so nobody waits out a timeout."""
+        err = CdpError(f"the CDP reader died ({type(exc).__name__}: {exc}); "
+                       "this session is unusable")
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(err)
+        self._pending.clear()
 
     # -- commands ----------------------------------------------------------
     async def call(
@@ -126,14 +180,31 @@ class CdpSession:
         *,
         timeout: Optional[float] = None,
     ) -> dict:
-        """Send a command and await its reply. Raises `CmdError` on CDP error."""
+        """Send a command and await its reply. Raises `CmdError` on CDP error.
+
+        Raises `CdpError` immediately if the session is closed or its reader has died —
+        fail fast rather than waiting out a timeout on a socket that is already gone.
+        """
+        if self._closed:
+            raise CdpError("the CDP session is closed")
+        if self._dead is not None:
+            raise CdpError(
+                f"the CDP reader died earlier ({type(self._dead).__name__}: "
+                f"{self._dead}); this session is unusable")
         self._next_id += 1
         msg_id = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
-        await self._transport.send(
-            json.dumps({"id": msg_id, "method": method, "params": params or {}})
-        )
+        try:
+            await self._transport.send(
+                json.dumps({"id": msg_id, "method": method, "params": params or {}})
+            )
+        except Exception as exc:  # noqa: BLE001 - a send failure is fatal for the session
+            self._pending.pop(msg_id, None)
+            self._dead = exc
+            raise CdpError(
+                f"cannot send {method} on the CDP connection "
+                f"({type(exc).__name__}: {exc})") from exc
         try:
             reply = await asyncio.wait_for(
                 fut, timeout=timeout if timeout is not None else self._default_timeout
@@ -162,19 +233,31 @@ class CdpSession:
 
     # -- event observation -------------------------------------------------
     def event_count(self) -> int:
-        """Number of events seen so far — record this before an action."""
-        return len(self._events)
+        """Number of events seen so far — record this before an action.
+
+        Monotonic even after trimming: it counts events *observed*, not events retained.
+        """
+        return self._dropped + len(self._events)
 
     def events_since(self, index: int) -> list[tuple[str, dict]]:
         """Events observed since `index`. Index-based rather than draining, so
-        nothing is lost if the reader consumed an event before we looked."""
-        return self._events[index:]
+        nothing is lost if the reader consumed an event before we looked.
+
+        `index` is an absolute count from `event_count()`, so it is translated onto the
+        retained window here. Events trimmed between a mark and this call are gone —
+        safe in practice because callers take a fresh mark immediately before the action
+        they measure, and the window is tens of events against a cap of `MAX_EVENTS`.
+        """
+        start = index - self._dropped
+        if start < 0:
+            start = 0
+        return self._events[start:]
 
     def find_events(
         self, index: int, *methods: str
     ) -> Iterable[tuple[str, dict]]:
         wanted = set(methods)
-        for method, params in self._events[index:]:
+        for method, params in self.events_since(index):
             if method in wanted:
                 yield method, params
 

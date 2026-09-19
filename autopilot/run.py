@@ -46,7 +46,7 @@ from .mover import (
     plan_moves,
 )
 from .report import build_report, parse_expiry
-from .scrape import archive_url, read_archive
+from .scrape import archive_url, page_has_rapt, read_archive, recover_rapt_url
 from .transport import TransferError, RemoteChanged, download
 from .verify import verify_local
 
@@ -222,12 +222,36 @@ async def run_once(
 
         async with session_factory() as session:
             # ---- 1. scrape -------------------------------------------------
-            page = await read_archive(session, cfg.resolved_work_url(), settle=cfg.settle)
+            # Navigate to a *rapt-bearing* archive URL when one is recoverable.
+            #
+            # This was the bug that killed the first real run. The bare URL
+            # `.../manage/archive/<id>` serves `data-download-uri` links with no
+            # `rapt`, even on an authenticated session with the export marked
+            # Completed — because the rapt is embedded into the page's links
+            # only when the page request itself carried one. The redirector
+            # minted from such a link bounces to ServiceLogin, which is
+            # indistinguishable from "ReAuth required" unless you know this.
+            #
+            # The browser's own tab keeps those URLs in its navigation history,
+            # and reusing one costs nothing (navigation is a measured Δ0).
+            work_url = cfg.resolved_work_url()
+            rapt_url = None
+            if not cfg.work_url:
+                rapt_url = await recover_rapt_url(session, cfg.archive_id)
+                if rapt_url:
+                    work_url = rapt_url
+
+            page = await read_archive(session, work_url, settle=cfg.settle)
             if page.challenged:
                 ledger.set_job_status(cfg.archive_id, "needs_reauth",
                                       error=f"challenge at {page.url}")
                 return await _finish("needs_reauth",
                                      error=f"the archive page is a sign-in page: {page.url}")
+
+            # Keep the tokened page loaded. `_restore`'s docstring promises this,
+            # and it is worth having: a tab left on the rapt page is what lets the
+            # *next* run recover the token for free instead of needing ReAuth.
+            restore_url = page.url if "rapt=" in (page.url or "") else work_url
 
             _expiry_seen = page.expiry
             exp = parse_expiry(page.expiry)
@@ -258,6 +282,23 @@ async def run_once(
 
             ledger.upsert_parts(cfg.archive_id,
                                 [(p.index, p.filename, _int_size(p.size)) for p in page.parts])
+
+            # ---- 3b. a tokened link is REQUIRED to mint --------------------
+            # Measured: a rapt-less redirector bounces to ServiceLogin. That is
+            # not a ReAuth requirement — it means the page was loaded without a
+            # rapt (see the block comment in `scrape.py`). Detecting it here
+            # saves a mint attempt and, more importantly, stops the run from
+            # reporting "ReAuth required" when the session was never at fault.
+            if not page_has_rapt(page):
+                ledger.set_job_status(
+                    cfg.archive_id, "needs_reauth",
+                    error="archive page served un-tokened download links")
+                return await _finish(
+                    "needs_reauth",
+                    error=("the archive page served download links carrying no "
+                           f"rapt (loaded {work_url}). Satisfying the ReAuth "
+                           "challenge is what appends a rapt to the archive URL. "
+                           "No download attempt was spent."))
 
             # ---- 4. the jar (only the transporter needs it) ----------------
             try:
@@ -309,7 +350,7 @@ async def run_once(
                     try:
                         result = await mint_part(session, part.redirector,
                                                  settle=cfg.settle,
-                                                 restore_url=cfg.resolved_work_url())
+                                                 restore_url=restore_url)
                     except NeedsReauth as exc:
                         ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
                         return await _finish("needs_reauth", error=str(exc))

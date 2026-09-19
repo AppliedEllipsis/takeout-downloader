@@ -26,6 +26,9 @@ __all__ = [
     "ArchivePage",
     "archive_url",
     "read_archive",
+    "pick_rapt_url",
+    "recover_rapt_url",
+    "page_has_rapt",
     "READ_JS",
 ]
 
@@ -191,3 +194,82 @@ async def read_archive(session: CdpSession, url: str, *, settle: float = 6.0) ->
 def _origin_of(url: str) -> str:
     parts = url.split("/")
     return "/".join(parts[:3]) if len(parts) >= 3 else "https://takeout.google.com"
+
+
+# ---------------------------------------------------------------------------
+# The rapt trap
+# ---------------------------------------------------------------------------
+# **Measured 2026-09-19, and this cost the very first real run.**
+#
+# `https://takeout.google.com/manage/archive/<id>` (bare) and
+# `https://takeout.google.com/manage/archive/<id>?user=…&rapt=…` are NOT the same
+# page as far as downloads are concerned. Navigating to the bare URL returns a
+# page whose `data-download-uri` attributes carry **no `rapt`** — even on a fully
+# authenticated session with `challenged == False` and the export marked
+# `Completed`:
+#
+#     bare      -> takeout/download?j=…&i=0&user=…              has_rapt=False
+#     with rapt -> takeout/download?j=…&i=0&user=…&rapt=…        has_rapt=True
+#
+# The redirector then bounces to `accounts.google.com/ServiceLogin`, which reads
+# as "needs ReAuth" when the session was never the problem. **The scrape's own
+# navigation destroyed the token it needed.**
+#
+# So: never navigate to the bare URL while a rapt-bearing variant is known. The
+# browser keeps those URLs in its per-tab navigation history, and reusing one is
+# free (navigation is a measured Δ0).
+
+
+def _is_rapt_archive_url(url: str, archive_id: str) -> bool:
+    return (ARCHIVE_PATH + archive_id) in (url or "") and "rapt=" in (url or "")
+
+
+def pick_rapt_url(candidates, archive_id: str) -> Optional[str]:
+    """First rapt-bearing archive URL for `archive_id`, in the order given.
+
+    Pure on purpose: the choice is the part that was wrong, so it is the part
+    that must be testable without a browser. Callers pass candidates
+    newest-first; the first match wins.
+
+    Only the *presence* of a `rapt` param is judged here — whether Google still
+    honours it cannot be known without navigating, and a stale one simply
+    yields an un-tokened page, which the caller detects and handles.
+    """
+    for url in candidates or []:
+        if _is_rapt_archive_url(url or "", archive_id):
+            return url
+    return None
+
+
+async def recover_rapt_url(session: CdpSession, archive_id: str) -> Optional[str]:
+    """Find a live rapt-bearing archive URL for `archive_id`.
+
+    Looks at the tab's current location first, then its navigation history
+    newest-first. Costs nothing: this reads state and never navigates.
+
+    A history entry whose rapt has expired is harmless — it yields an
+    un-tokened page, which `read_archive` reports via `PartLink.has_rapt`.
+    """
+    candidates: list[str] = []
+    try:
+        here = await session.value("location.href")
+        if here:
+            candidates.append(here)
+    except Exception:
+        pass
+
+    try:
+        hist = await session.call("Page.getNavigationHistory")
+        entries = ((hist.get("result") or hist).get("entries")) or []
+        candidates.extend((e.get("url") or "") for e in reversed(entries))
+    except Exception:
+        # History is a convenience, not a requirement: a browser that refuses it
+        # still works, it just cannot recover a token.
+        pass
+
+    return pick_rapt_url(candidates, archive_id)
+
+
+def page_has_rapt(page: ArchivePage) -> bool:
+    """True when the scraped page serves at least one tokened download link."""
+    return any("rapt=" in (p.redirector or "") for p in (page.parts or []))

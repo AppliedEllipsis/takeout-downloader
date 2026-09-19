@@ -173,14 +173,23 @@ def plan_moves(sources: Iterable[tuple[str, str, int]],
 # the move
 # ---------------------------------------------------------------------------
 def move_part(source: str, dest_dir: str, *,
+              filename: Optional[str] = None,
               expected_size: Optional[int] = None,
               chunk: int = 4 << 20) -> MoveResult:
     """Copy `source` into `dest_dir` under a temp name, then rename.
 
+    `filename` is the name to land under, and it is **deliberately not derived**
+    from `source`. Measured 2026-09-19: the staged path came from the scraped
+    redirector basename, which is the literal string `download` for every part of
+    every export. Deriving the destination from the source therefore named every
+    part `download`, and because the destination index is keyed by filename, a
+    multi-part export collapsed into one file with the rest reported as already
+    present. The caller supplies the real name from the minted URL.
+
     `expected_size` is the staged file's size; it is re-checked after the copy so
     a short write on a flaky remote cannot be renamed into place.
     """
-    filename = os.path.basename(source)
+    filename = filename or os.path.basename(source)
     try:
         size = os.path.getsize(source)
     except OSError as exc:

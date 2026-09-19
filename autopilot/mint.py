@@ -30,6 +30,7 @@ extension's auto-cancel handles it (failure mode 1.9 keeps that switch ON).
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -47,6 +48,8 @@ __all__ = [
     "absolute_uri",
     "parse_query",
     "build_redirector",
+    "archive_id_from_archive_url",
+    "part_filename_from_url",
     "extract_redirects",
     "mint",
 ]
@@ -76,6 +79,41 @@ def absolute_uri(raw: str, origin: str = ORIGIN) -> str:
     if raw.startswith("http://") or raw.startswith("https://"):
         return raw
     return origin.rstrip("/") + "/" + raw.lstrip("/")
+
+
+def archive_id_from_archive_url(url: str) -> Optional[str]:
+    """The `<id>` in `/manage/archive/<id>`.
+
+    Pure, and needed because the refresh bounce does not always carry `j` —
+    measured 2026-09-19. The id is in the path either way.
+    """
+    m = re.search(r"/manage/archive/([^/?#]+)", url or "")
+    return m.group(1) if m else None
+
+
+def part_filename_from_url(url: str) -> str:
+    """The real part filename, taken from the minted file-host URL.
+
+    **Measured 2026-09-19 — this was a silent multi-part data-loss bug.** The
+    redirector path is `takeout/download?j=...`, so the *scraped* basename is
+    always the literal string `download` for every part. Staging files under that
+    name means a multi-part export writes `download` over and over, and the
+    destination index — which is keyed by filename — then reports every later
+    part as already present. A 63-part export would land one file.
+
+    The minted URL carries the true name in its path:
+
+        https://takeout-download.usercontent.google.com/download/
+            takeout-20260919T163231Z-1-001.zip?j=...
+
+    Returns `""` when the path yields nothing archive-like, so the caller decides;
+    it never invents a name.
+    """
+    path = urlsplit(url or "").path or ""
+    name = path.rstrip("/").split("/")[-1] if path else ""
+    if not name or name.lower() in ("download", "takeout"):
+        return ""
+    return name
 
 
 def parse_query(url: str) -> dict:
@@ -281,15 +319,29 @@ async def mint(
                 raise QuotaExceeded(r.location, "Google sent quotaExceeded=true")
 
         # 3. Did the redirector hand us a refreshed rapt to retry with?
+        #
+        # `j` is NOT required to retry. Measured 2026-09-19 on a fresh export:
+        # the bounce carries a live `rapt` but omits `j` entirely —
+        #
+        #   .../manage/archive/<id>?user=...&pli=1&rapt=<fresh>
+        #
+        # and demanding `j` there discarded a perfectly good token, turning a
+        # mintable export into "no archive bounce in the chain". The archive id
+        # is already known: it is in the path, and in the redirector in use.
         refresh = next(
             (r for r in redirects if "/manage/archive/" in r.location), None
         )
         if refresh is not None:
             params = parse_query(refresh.location)
-            if params.get("rapt") and params.get("j"):
-                current = build_redirector(
-                    params["j"], params.get("i", 0), params.get("user", ""), params["rapt"]
-                )
+            current_params = parse_query(current)
+            rapt = params.get("rapt")
+            archive_id = (params.get("j")
+                          or current_params.get("j")
+                          or archive_id_from_archive_url(refresh.location))
+            user = params.get("user") or current_params.get("user", "")
+            index = params.get("i", current_params.get("i", 0))
+            if rapt and archive_id:
+                current = build_redirector(archive_id, index, user, rapt)
                 refreshed = True
                 continue
 

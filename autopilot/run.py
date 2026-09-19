@@ -41,7 +41,7 @@ from .errors import (
 )
 from .jar import CookieError, pull_jar
 from .ledger import AttemptKind, Ledger, open_ledger
-from .mint import mint as mint_part
+from .mint import mint as mint_part, part_filename_from_url
 from .mover import (
     DestinationIndex,
     MoveRefused,
@@ -342,6 +342,10 @@ async def run_once(
 
             for part in todo:
                 idx = part.index
+                # NOTE: `part.filename` is the *redirector* basename, which is the
+                # literal string `download` for every part of every export — so it
+                # is never used to name a file. The real name comes off the minted
+                # URL below and is threaded through staging, ledger and move.
                 staged = os.path.join(cfg.staging_dir, part.filename or f"part-{idx}.zip")
                 expected = _int_size(part.size)
 
@@ -372,6 +376,19 @@ async def run_once(
                         continue
                     minted_url = result.url
                     ledger.record_mint(cfg.archive_id, idx, minted_url)
+
+                # ---- the real filename, from the minted URL ----------------
+                # Measured 2026-09-19: the scraped name is `download` for EVERY
+                # part, so staging and the destination index both collapsed a
+                # multi-part export onto one filename. The file host's URL path
+                # carries the true name, e.g. `takeout-20260919T163231Z-1-001.zip`.
+                real_name = (part_filename_from_url(minted_url)
+                             or (part.filename if part.filename not in ("", "download") else "")
+                             or f"part-{idx}.zip")
+                if real_name != part.filename:
+                    part.filename = real_name
+                    ledger.set_part_filename(cfg.archive_id, idx, real_name)
+                staged = os.path.join(cfg.staging_dir, real_name)
 
                 # ---- transfer (Range resume is free) -----------------------
                 ledger.set_job_status(cfg.archive_id, "transferring")
@@ -419,9 +436,10 @@ async def run_once(
 
                 # ---- move (rename last; index kept in memory) --------------
                 ledger.set_job_status(cfg.archive_id, "moving")
-                moved = move_part(staged, cfg.archive_dir, expected_size=expected)
+                moved = move_part(staged, cfg.archive_dir, filename=real_name,
+                                  expected_size=expected)
                 if moved.action == "moved":
-                    dest_index.names[part.filename or os.path.basename(staged)] = expected or 0
+                    dest_index.names[real_name] = expected or 0
                     ledger.set_part_status(cfg.archive_id, idx, "done")
                 else:
                     # Verified but not moved: the part is NOT done — it is still

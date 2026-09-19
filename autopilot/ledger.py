@@ -301,6 +301,24 @@ class Ledger:
         )
         self.conn.commit()
 
+    def set_part_filename(self, archive_id: str, idx: int, filename: str) -> None:
+        """Record the part's REAL filename once it is known.
+
+        The scrape can only see the redirector path, whose basename is the
+        literal string `download` for every part of every export — measured
+        2026-09-19. The true name only becomes knowable after minting, when the
+        file host's URL exposes it, so it is written here rather than at upsert
+        time. Without this the ledger would describe every part of a multi-part
+        export by the same name.
+        """
+        if not filename:
+            return
+        self.conn.execute(
+            "UPDATE parts SET filename=? WHERE archive_id=? AND idx=?",
+            (filename, archive_id, idx),
+        )
+        self.conn.commit()
+
     # -- the minted-URL cache (rule 2) --------------------------------------
     def record_mint(self, archive_id: str, idx: int, url: str,
                     *, etag: Optional[str] = None) -> None:

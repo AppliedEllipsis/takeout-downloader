@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -129,6 +130,14 @@ class RunConfig:
     #: no progress before the copy child gives up. See `mover.MOVE_WATCHDOG_SECONDS`.
     move_timeout: Optional[float] = None
     move_stall: Optional[float] = None
+    #: Delete each staged part once its archive copy is verified. Staging is scratch and
+    #: the archive is the copy of record, but keeping both costs a full duplicate of the
+    #: export — on the 64-product pull that is 131.6 GB of a 300 GB volume which must
+    #: also hold rclone's 100 GB VFS cache (measured 2026-09-21: 194 GB free vs ~232 GB
+    #: wanted, so the default cannot fit a full pull). Opt-in, because the staged copy
+    #: is the only way to re-verify without re-downloading. Never fires before a move
+    #: has been verified.
+    clean_staging: bool = False
 
     def resolved_work_url(self) -> str:
         return self.work_url or archive_url(self.archive_id)
@@ -679,6 +688,23 @@ async def run_once(
                 if moved.action == "moved":
                     dest_index.names[real_name] = expected or 0
                     ledger.set_part_status(cfg.archive_id, idx, "done")
+                    # Free the staged copy once the archive copy is verified.
+                    #
+                    # Staging is scratch; the archive is the copy of record. Keeping
+                    # both costs a full duplicate of the export, and on the 64-product
+                    # pull that is 131.6 GB of a 300 GB volume that must also hold
+                    # rclone's 100 GB VFS cache — i.e. it does not fit (measured
+                    # 2026-09-21: 194 GB free vs ~232 GB wanted). OPT-IN because the
+                    # staged copy is the only way to re-verify without re-downloading,
+                    # and for a small export that safety net is worth its size.
+                    # Only ever after a verified move, never before.
+                    if cfg.clean_staging:
+                        try:
+                            os.unlink(staged)
+                        except OSError as exc:
+                            print(f"warning: part {idx}: moved and verified, but the "
+                                  f"staged copy could not be removed ({exc})",
+                                  file=sys.stderr)
                 else:
                     # Verified but not moved: the part is NOT done — it is still
                     # only staged, and saying otherwise would overstate completeness.

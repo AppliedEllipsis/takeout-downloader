@@ -33,7 +33,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
 from .cdp import CdpSession
 from .errors import HopLimitExceeded, MintError, NeedsReauth, QuotaExceeded
@@ -154,12 +154,23 @@ def part_filename_from_url(url: str) -> str:
 
     Returns `""` when the path yields nothing archive-like, so the caller decides;
     it never invents a name.
+
+    **Percent-decoding is not cosmetic.** Observed live 2026-09-21 on the 64-product
+    export, part 18:
+
+        .../download/All%20mail%20Including%20Spam%20and%20Trash-002.mbox?j=...
+
+    Left encoded, that part would land on the archive as
+    `All%20mail%20Including%20Spam%20and%20Trash-002.mbox` — a name no human wrote and
+    that no later tool would match against Google's own listing. Note too that this
+    part is an `.mbox`, NOT a `.zip`: Google serves non-zip parts, so this function
+    must not assume an extension.
     """
     path = urlsplit(url or "").path or ""
     name = path.rstrip("/").split("/")[-1] if path else ""
     if not name or name.lower() in ("download", "takeout"):
         return ""
-    return name
+    return unquote(name)
 
 
 def parse_query(url: str) -> dict:

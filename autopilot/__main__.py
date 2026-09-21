@@ -72,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--cdp-http", default="http://127.0.0.1:9222")
     run.add_argument("--max-parts", type=int, default=None,
                      help="bound the work (smoke runs)")
+    run.add_argument("--clean-staging", action="store_true",
+                     help="delete each staged part once its archive copy is verified. "
+                          "Staging is scratch and the archive is the copy of record, but "
+                          "keeping both duplicates the export: the 64-product pull is "
+                          "131.6 GB, and this volume must also hold rclone's 100 GB VFS "
+                          "cache (measured 194 GB free vs ~232 GB wanted — it does not "
+                          "fit). Opt-in, because the staged copy is the only way to "
+                          "re-verify without re-downloading.")
     run.add_argument("--mint-only", action="store_true",
                      help="earn every part's URL and stop, without transferring. "
                           "A minted URL outlives the ~45-minute ReAuth window "
@@ -133,6 +141,7 @@ def cmd_run(args) -> int:
         move_timeout=_env_float("AUTOPILOT_MOVE_TIMEOUT", None),
         move_stall=_env_float("AUTOPILOT_MOVE_STALL", None),
         mint_only=getattr(args, "mint_only", False),
+        clean_staging=getattr(args, "clean_staging", False),
     )
     outcome = run_once_sync(cfg)
 

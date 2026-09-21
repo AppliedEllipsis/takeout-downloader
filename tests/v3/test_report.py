@@ -140,11 +140,36 @@ def test_the_attempts_table_marks_transfer_as_unmeasured():
 
 def test_flags_the_v2_signature_of_attempts_spent_with_zero_bytes():
     """v2 booked NETWORK_ERROR attempts for parts that had no URL and never sent
-    a request. Attempts > 0 with 0 bytes on disk is that signature."""
+    a request. A TRANSFER booked with 0 bytes on disk is that signature.
+
+    The kind is required, not implied: a MINT also books an attempt and moves zero
+    bytes, entirely legitimately. See the regression test below."""
+    rep = build_report(parts({"idx": 0, "status": "failed", "attempts": 2,
+                              "size_on_disk": 0}),
+                       archive_id="a1", now=NOW,
+                       attempt_kinds={0: {"transfer"}})
+    assert any("zero bytes" in w for w in rep.warnings)
+
+
+def test_a_MINT_is_not_the_v2_signature():
+    """Regression, found live 2026-09-21: a 5-part `--mint-only` run warned about
+    EVERY part, because a mint books an attempt and moves no bytes. Nineteen false
+    alarms on the 19-part export would have read as nineteen failures."""
+    rep = build_report(parts({"idx": 0, "status": "pending", "attempts": 1,
+                              "size_on_disk": 0}),
+                       archive_id="a1", now=NOW,
+                       attempt_kinds={0: {"mint"}})
+    assert not any("zero bytes" in w for w in rep.warnings), (
+        "a mint moves no bytes by design and must not be reported as a phantom transfer")
+
+
+def test_without_kind_information_the_warning_is_suppressed_rather_than_guessed():
+    """A bare count cannot tell a legitimate mint from a phantom transfer, so the
+    report declines to guess instead of emitting a warning that may be false."""
     rep = build_report(parts({"idx": 0, "status": "failed", "attempts": 2,
                               "size_on_disk": 0}),
                        archive_id="a1", now=NOW)
-    assert any("zero bytes" in w for w in rep.warnings)
+    assert not any("zero bytes" in w for w in rep.warnings)
 
 
 def test_unparseable_expiry_warns_instead_of_assuming():

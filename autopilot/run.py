@@ -296,7 +296,8 @@ async def run_once(
             rows = ledger.parts(cfg.archive_id)
             report = build_report(rows, archive_id=cfg.archive_id, account=cfg.account,
                                   status=status, expiry_at=_expiry_seen, now=now,
-                                  attempts=ledger.attempts_by_kind(cfg.archive_id))
+                                  attempts=ledger.attempts_by_kind(cfg.archive_id),
+                                  attempt_kinds=ledger.attempt_kinds_by_part(cfg.archive_id))
             summary = ledger.summary(cfg.archive_id)
             return RunOutcome(
                 archive_id=cfg.archive_id,

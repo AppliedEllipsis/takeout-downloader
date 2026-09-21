@@ -98,8 +98,15 @@ ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeou
     --account $ACCT"
 ```
 
-Expected: a report with `Verdict: INCOMPLETE` and `Exited 0`. **`incomplete` is correct** —
-urls are earned, bytes are not moved yet, and nothing may claim otherwise.
+Expected: a report with `Verdict: INCOMPLETE`, and **exit code 1**.
+
+> **Exit 1 here is success, not failure** — and this matters when scripting. `incomplete`
+> means "work remains", which is true: URLs are earned, bytes are not moved. Only
+> `complete` exits 0. So a chained `--mint-only && transfer` would never run the
+> transfer; use `;` or `||true`, or check the report rather than the code.
+> (Observed 2026-09-21 on the 5-part test export.)
+
+`incomplete` is the CORRECT verdict at this step. Nothing may claim the pull is done.
 
 Do this immediately after signing in. It is fast (Δ1 per part) and it is the only step
 that needs the window.

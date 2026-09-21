@@ -77,7 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "A minted URL outlives the ~45-minute ReAuth window "
                           "(measured: 206 after 81 minutes), and minting is what the "
                           "window gates — so a long pull should mint first, then "
-                          "transfer on a later pass against the cached URLs.")
+                          "transfer on a later pass against the cached URLs. "
+                          "NOTE: exits 1 on SUCCESS, because work remains (no bytes "
+                          "moved yet) — do not chain it with &&.")
     run.add_argument("--verify-hash", action="store_true",
                      help="hash-verify instead of the cheap header+EOCD check")
     run.add_argument("--allow-unmounted-archive", action="store_true",

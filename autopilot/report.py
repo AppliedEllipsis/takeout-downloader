@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from .ledger import AttemptKind
+
 __all__ = ["Report", "build_report", "parse_expiry"]
 
 #: Expiry strings as the manage page renders them, plus ISO for tests.
@@ -136,7 +138,8 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
                  status: str = "pending", expiry_at: Optional[str] = None,
                  now: Optional[datetime] = None,
                  attempts: Optional[dict] = None,
-                 dl_counts: Optional[dict] = None) -> Report:
+                 dl_counts: Optional[dict] = None,
+                 attempt_kinds: Optional[dict] = None) -> Report:
     """Assemble a report from ledger part rows.
 
     `parts` is any iterable of objects with `idx`, `status`, `size_expected`,
@@ -175,11 +178,25 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
         if getattr(p, "size_on_disk", None):
             rep.bytes_on_disk += int(p.size_on_disk)
 
-        # the v2 signature: an attempt was booked but nothing was sent
-        if getattr(p, "attempts", 0) and not getattr(p, "size_on_disk", 0) \
+        # The v2 signature: a TRANSFER was booked but nothing was ever sent.
+        #
+        # This used to fire on `attempts > 0 and size_on_disk == 0`, which a MINT
+        # satisfies — and a mint legitimately books an attempt while moving zero bytes.
+        # Observed live 2026-09-21: a 5-part `--mint-only` run warned about **all five**
+        # parts ("an attempt booked with no request sent"), which reads as five failures
+        # when the run had done exactly what was asked. On the 19-part export that would
+        # have been 19 false alarms.
+        #
+        # So the KIND now decides. `attempt_kinds` maps idx -> set of kinds; when it is
+        # not supplied the warning is suppressed rather than guessed, because a bare
+        # count cannot distinguish a legitimate mint from a phantom transfer.
+        _kinds = ((attempt_kinds or {}).get(int(idx), set())
+                  if attempt_kinds is not None else set())
+        _moved = _kinds & {AttemptKind.TRANSFER, AttemptKind.RESUME}
+        if _moved and getattr(p, "attempts", 0) and not getattr(p, "size_on_disk", 0) \
                 and pstatus in ("failed", "pending"):
             rep.warnings.append(
-                f"part {idx}: {p.attempts} attempt(s) spent with zero bytes on disk "
+                f"part {idx}: attempt(s) spent with zero bytes on disk "
                 "— the v2 NETWORK_ERROR signature (an attempt booked with no "
                 "request sent)"
             )

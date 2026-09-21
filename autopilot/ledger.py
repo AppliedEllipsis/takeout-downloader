@@ -474,6 +474,21 @@ class Ledger:
             (archive_id,))
         return {r["kind"]: r["n"] for r in cur.fetchall()}
 
+    def attempt_kinds_by_part(self, archive_id: str) -> dict:
+        """`idx -> set(attempt kinds)`, for the report's zero-bytes warning.
+
+        That warning exists for the v2 signature — a TRANSFER booked without a request
+        ever being sent. A MINT also books an attempt and moves zero bytes, entirely
+        legitimately, so a bare count cannot distinguish the two. Observed live
+        2026-09-21: a 5-part `--mint-only` run warned about every single part.
+        """
+        cur = self.conn.execute(
+            "SELECT idx, kind FROM attempts WHERE archive_id=?", (archive_id,))
+        out: dict = {}
+        for row in cur.fetchall():
+            out.setdefault(int(row["idx"]), set()).add(row["kind"])
+        return out
+
     def summary(self, archive_id: str) -> dict:
         rows = self.parts(archive_id)
         by_status: dict[str, int] = {}

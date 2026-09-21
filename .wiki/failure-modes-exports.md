@@ -370,3 +370,64 @@ attempts, i.e. a handful of probes. The burn export was created as a monitoring 
 **3 of 5** before this session's diagnostics; it reached **5 of 5** during them. A canary meant for
 repeated measurement must be **re-created on a schedule**, and `dl_counts` read *before* each experiment
 rather than after.
+
+
+---
+
+## 1.20 — Percent-encoded part filename
+
+**Advertised cost: 0. Actual cost: 0 attempts — but the archive silently holds a name
+Google never used, and a later completeness check calls a present part missing.**
+
+### Symptom
+
+The archive contains a file like:
+
+```
+All%20mail%20Including%20Spam%20and%20Trash-002.mbox
+```
+
+No human wrote that name. The real one is `All mail Including Spam and Trash-002.mbox`.
+Nothing errors; the part verifies, sizes match, the run reports `COMPLETE`.
+
+It surfaces later as a **false missing part**: a comparison against Google's listing
+reports the decoded name absent while the encoded file sits right there — observed
+2026-09-21, where a 19-part export read as 18/19 complete despite being exactly complete.
+
+### Cause
+
+`part_filename_from_url` took the basename of the minted URL's path verbatim:
+
+```
+https://takeout-download.usercontent.google.com/download/
+    All%20mail%20Including%20Spam%20and%20Trash-002.mbox?j=...
+```
+
+The path segment is percent-encoded because a URL cannot contain a raw space.
+
+### Recovery
+
+`unquote()` the basename — **and not the whole URL**, which would corrupt the query
+string that the signature checks depend on.
+
+**A literal `+` must survive.** Only `%XX` decodes; a filesystem has no query semantics,
+so `unquote_plus` is wrong here.
+
+### Prevention
+
+Pinned by `tests/v3/test_filename_encoding.py`: the real live string decodes, a non-zip
+extension survives, `+` is untouched, and the redirector basename `download` is still
+rejected (that rejection is the multi-part data-loss guard from `docs/v3/01-ARCHITECTURE.md`).
+
+**Cross-check that caught it:** v2 pulled the same export and wrote the *decoded* name. Two
+downloaders disagreeing on what to call the same file is a correctness bug, not cosmetics.
+When two implementations of one job disagree, one of them is wrong — find out which before
+trusting either.
+
+### The neighbouring trap
+
+This part is an **`.mbox`, not a `.zip`**. Google serves non-zip parts, and the largest
+single part of the 64-product export is that 13.58 GB mbox. Anything that assumes a `.zip`
+suffix — completeness counting, verification, globbing — will mis-handle it. Note also that
+a size-up that sums only `.zip` parts understates the export by 13.58 GB (141.28 GB actual
+vs ~131.6 GB estimated).

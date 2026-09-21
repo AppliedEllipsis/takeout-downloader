@@ -255,3 +255,56 @@ VFS stall of arbitrary length is **UNVERIFIED**.
    local staging, moving to `/opt/archives`").
 4. **Budget the three LUKS consumers as one pool.** `/config`, `/work` and the VFS cache share
    293 G; the engine must subtract the other two before promising a part's worth of space.
+
+
+---
+
+## 1.21 — Staging never freed → `ENOSPC` on a large pull
+
+**Advertised cost: 0 to diagnose. Actual cost: blocks the pull before it can finish, and
+the arithmetic is invisible until you do it.**
+
+### Symptom
+
+A pull of an export larger than roughly half the staging volume dies part-way with
+`ENOSPC`. Each part individually verifies and moves; the failure arrives late, once the
+cumulative staging has grown past what the volume can hold.
+
+### Cause — the arithmetic, measured 2026-09-21
+
+The mover copies a staged part into the archive and verifies it, but **never removes the
+staged copy**. Staging is therefore a full duplicate of the export. On this host that
+duplicate shares a 300 GB volume with rclone's VFS cache:
+
+| consumer | 64-product export |
+|---|---|
+| staging — 19 parts, all retained | 131.6 GB |
+| rclone VFS cache (`--vfs-cache-max-size 100G`) | ~100 GB |
+| **wanted** | **~232 GB** |
+| **actually free** | **194 GB** |
+
+It does not fit, and nothing warns you: the run is perfectly healthy until it is not.
+
+### Recovery
+
+- `--clean-staging` unlinks each staged part **after** its archive copy is verified. Staging
+  then holds one part at a time (max 12.6 GB here) and the total is ~120 GB — it fits.
+- Failing that, stage onto a volume that is not shared with the VFS cache.
+
+### Prevention
+
+- Do the arithmetic **before** starting, with the per-part sizes from the ledger — never
+  from a directory listing, which misses non-zip parts.
+- Budget the VFS cache explicitly. It held **97 GB** of the 100 GB maximum when measured,
+  so "free space" for staging is not what `df` reports.
+- `AUTOPILOT_MIN_HEADROOM` (the CLI wires it to 5 GiB) refuses to start when free space is
+  already low, but it cannot see growth during a run. Raise it for a large pull.
+- The `distinguish-attempts` habit applies here too: measure the growth, do not infer it.
+
+### Why `--clean-staging` is opt-in and not default
+
+The staged copy is the only way to re-verify a part **without re-downloading it**, and the
+allowance is 5 attempts per part. For a small export that safety net is worth its bytes. For
+a 141 GB one it is not. The unlink happens only after a verified move, never before, and a
+failed unlink is reported on stderr without failing the part — the bytes are already safe in
+the archive.

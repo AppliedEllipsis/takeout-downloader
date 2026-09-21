@@ -1080,3 +1080,125 @@ a fresh sign-in is needed at the moment of minting.
 
 **A full pull is now feasible in three steps:** fresh sign-in → `--mint-only` (earn every URL while
 the window is fresh) → the transfer pass (hours, jar only, window-independent).
+
+
+## 2026-09-21 — the multi-part path works; the full backup was already done
+
+### Step 2, test export (20 products, 5 parts, 2.65 GB) — PASSED
+
+`--mint-only`, then a separate transfer pass:
+
+```
+mint 5 | transfer 5 | resume 0
+Verdict: COMPLETE — every expected part verified on disk
+bytes: 2648686666 of 2648686666            EXIT=0
+
+takeout-20260919T163036Z-1-001.zip   1,022,944,900
+takeout-20260919T163036Z-1-002.zip     826,715,923
+takeout-20260919T163036Z-1-003.zip     794,863,912
+takeout-20260919T163036Z-2-001.zip       3,804,728
+takeout-20260919T163036Z-2-002.zip         357,203
+```
+
+The first time multi-part indexing, real part filenames, the destination index and the
+mover at ~1 GB have all been exercised **together**. The transfer pass minted nothing —
+window-independent, as designed.
+
+### Step 2, the 64-product export (19 parts, 141.28 GB) — 19/19 URLs earned
+
+```
+mint 19 | minted_url NOT NULL: 19 | job: incomplete
+```
+
+`incomplete` is the correct verdict there: URLs are earned, bytes are not moved. **Exit
+code is 1, not 0** — only `complete` maps to 0, so a scripted `--mint-only && transfer`
+would never run the transfer. Documented in runbook 04-FULL-PULL and in the option's own
+help text; use `;` instead.
+
+### Two defects the real workflow found
+
+Found by *running it*, not by reading it.
+
+**1. A mint is not the v2 NETWORK_ERROR signature.** The report warned about **every
+part** of the 5-part run — "1 attempt(s) spent with zero bytes on disk — the v2
+NETWORK_ERROR signature (an attempt booked with no request sent)". The heuristic was
+`attempts > 0 and size_on_disk == 0 and status in (failed, pending)`, which a mint
+satisfies — and a mint legitimately books an attempt while moving zero bytes. On the
+19-part export this would have been **19 false alarms reading as 19 failures**, during
+the run an operator is watching. `ledger.attempt_kinds_by_part()` now feeds the attempt
+KIND to the report, and only transfer/resume attempts can raise the warning. Without kind
+information the warning is suppressed rather than guessed.
+
+**2. A percent-encoded filename.** Part 18 of the 64-product export came back from the
+file host as `All%20mail%20Including%20Spam%20and%20Trash-002.mbox`. The basename was
+taken without percent-decoding, so the part would have landed on the archive under a name
+no human wrote and that no later tool would match against Google's own listing. Now
+`unquote`d. The same part is an **`.mbox`, not a `.zip`** — Google serves non-zip parts,
+so nothing may assume the extension.
+
+### The discovery: the 64-product full backup was already complete
+
+v2 was pulling that same export while the test ran. By 09:16 it had finished:
+
+```
+=== is anything still downloading? (20s window) ===
+  no file grew in 20s · mtimes unchanged
+
+=== exact size vs Google's listing ===
+  exact: 19    mismatched: 0    absent: 0
+
+=== whole-file check ===
+  zips whole: 18    truncated: 0
+
+=== total ===
+  on disk : 141278352495 bytes (141.28 GB)
+  expected: 141278352495 bytes (141.28 GB)      VERDICT: COMPLETE
+```
+
+Every part's byte count matches Google's listing exactly; all 18 zips still carry their
+end-of-archive record; the mbox is valid at both ends (`From … X-GM-THRID` head, clean
+MIME multipart terminator).
+
+**The v3 transfer was therefore called off rather than run.** The allowance is 5 attempts
+PER PART, and v2 had already spent its attempts on this export — a competing pull could
+have burned the remainder and produced two half-copies. The export needed nothing.
+
+Note the real layout is `<account>/<export-timestamp>/`, and v2 saved the mbox under its
+**decoded** name — v2 got right what v3 had got wrong.
+
+### What "COMPLETE" means here, precisely
+
+Verified: byte counts against Google's listing, zip end-of-archive records, mbox
+structure. **Not** verified at that point: the CRC of every zip *member*, which requires
+reading all 127 GB. A background CRC pass was launched, because this account already
+yielded three truncated archives in an earlier audit.
+
+### Commands run
+
+```bash
+# mint the test export (5 parts)
+docker exec -w /work/.v3 takeout-webgui python3 -B -m autopilot run \
+  --archive-id 16d8663e-b3d0-4067-9df8-e91fef85faee --mint-only \
+  --ledger /config/v3-selftest/test20.db --staging /config/v3-selftest/stage20 \
+  --archive /opt/archives/_v3-selftest/test20 --account braincreation
+
+# transfer it (no mint — the URLs are cached)
+docker exec -w /work/.v3 takeout-webgui python3 -B -m autopilot run \
+  --archive-id 16d8663e-b3d0-4067-9df8-e91fef85faee \
+  --ledger /config/v3-selftest/test20.db --staging /config/v3-selftest/stage20 \
+  --archive /opt/archives/_v3-selftest/test20 --account braincreation    # EXIT=0
+
+# mint the 64-product export (19 parts, 141.28 GB)
+docker exec -w /work/.v3 takeout-webgui python3 -B -m autopilot run \
+  --archive-id da982753-42dc-4a58-bba0-a9d3605759dd --mint-only \
+  --ledger /config/v3-selftest/full64.db --staging /config/v3-selftest/stage64 \
+  --archive /opt/archives/_v3-selftest/full64 --account braincreation
+
+# is it already on disk? (read-only)
+docker exec takeout-webgui python3 /tmp/_v64f.py
+```
+
+### State
+
+**261 tests pass, 6 skipped.** Defects 1 and 2 are fixed, tested and deployed.
+`20b5d61` on `feat/takeout-autopilot`, pushed to `origin` and `server-final`.

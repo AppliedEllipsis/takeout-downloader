@@ -412,3 +412,78 @@ live spawner with nothing to stop it.
 
 **Consequences.** The measured removal scope (exact files and lines across `takeout2/`, `manager/` and
 `helpers/`) is recorded in the doc, so the deletion is mechanical rather than archaeological.
+
+
+## 2026-09-21 — Do not race v2 for an export it is already pulling
+
+**Context.** The plan was: test the workflow on the 20-product export, then pull the
+64-product "full backup" last. A readiness sweep found v2's manager actively writing into
+`google-takeout/braincreation/2026-09-19-04-27-12/` — the very export v3 had just minted.
+By the time the mint pass finished, v2 had completed it: 19/19 parts, 141.28 GB, every
+byte count matching Google's listing.
+
+**Decision.** The v3 transfer was **cancelled**, not run. The export is declared complete
+on the strength of a read-only check, and v3's minted URLs for it are simply left cached.
+
+**Why.** The download allowance is **5 attempts per PART**, not per export. v2 had already
+spent attempts on these parts. Running v3 concurrently would have competed for the same
+allowance: at best it would re-download bytes already on disk, at worst it would exhaust
+the remaining attempts and leave two partial copies and no reclaimable allowance. Neither
+outcome is a backup. Minting was harmless (Δ1 each, URLs cached); transferring was not.
+
+**Consequences.** A pull must be preceded by a check of what is already on disk, and the
+check must decode filenames before comparing — the first comparison reported a false
+"missing" part purely because v3's ledger held a percent-encoded name while v2 had written
+the decoded one. **A completeness comparison is only as good as its name matching.**
+
+## 2026-09-21 — The attempt KIND, not the count, decides the zero-bytes warning
+
+**Context.** `--mint-only` triggered the v2 NETWORK_ERROR warning on **every** part: "1
+attempt(s) spent with zero bytes on disk". The heuristic was `attempts > 0 and
+size_on_disk == 0 and status in (failed, pending)`.
+
+**Decision.** `ledger.attempt_kinds_by_part()` returns `idx -> set(kinds)`, `build_report`
+takes it as `attempt_kinds`, and only `transfer`/`resume` attempts can raise the warning.
+When the kinds are not supplied the warning is **suppressed**, not guessed.
+
+**Why.** A mint legitimately books an attempt while moving zero bytes — that is what
+minting is. The v2 signature being looked for is a *transfer* booked with no request ever
+sent. A bare count cannot tell them apart, and a warning that fires on correct behaviour is
+worse than no warning: it trains the operator to ignore the channel. Nineteen false alarms
+on the 64-product export would have done exactly that.
+
+**Consequences.** A caller that does not supply kinds loses the warning. Accepted: the only
+real caller does supply them, and silence is safer than a false alarm here.
+
+## 2026-09-21 — Part filenames are percent-decoded
+
+**Context.** The 64-product export's part 18 is
+`All%20mail%20Including%20Spam%20and%20Trash-002.mbox`. `part_filename_from_url` took the
+URL basename verbatim.
+
+**Decision.** `unquote()` the basename.
+
+**Why.** The archive would otherwise hold a name no human wrote, unreconcilable with
+Google's own listing — and v2, pulling the same export, wrote the decoded name. Two
+downloaders disagreeing on what to call the same file is a correctness bug, not cosmetics.
+
+**Consequences.** Pinned by tests: the real live string decodes; a non-zip extension
+survives; a literal `+` is **not** turned into a space, because a filesystem has no query
+semantics.
+
+## 2026-09-21 — `--clean-staging`, opt-in
+
+**Context.** The mover copies and verifies but never removes the staged file. Measured on
+the server: staging (19 parts retained) 131.6 GB + rclone VFS cache (100 G max) ≈ **232 GB**
+wanted against **194 GB** free. A full pull would hit ENOSPC mid-run.
+
+**Decision.** Add `--clean-staging`, which unlinks each staged part **after** its archive
+copy is verified. Off by default.
+
+**Why opt-in.** The staged copy is the only way to re-verify without re-downloading, and
+for a small export that safety net is worth its bytes. For a 141 GB pull it is not.
+
+**Consequences.** With it, staging holds one part at a time (max 12.6 GB) and the total is
+~120 GB — it fits. A failure to unlink is reported on stderr and does **not** fail the
+part, because the bytes are already safe in the archive. The unlink happens only after a
+verified move, never before.

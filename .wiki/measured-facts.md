@@ -218,3 +218,32 @@ Three further measurements from the same session:
 **A completed run, for reference** (archive `f9a17be0-65e2-4b1f-a9c6-04c840204419`, 3 products, 1 part):
 verdict `COMPLETE`, exit 0, `36670 of 36670` bytes, mint 1 / transfer 1 / resume 0, landed as
 `takeout-20260919T163231Z-1-001.zip` with a sha256 **identical between staging and the archive mount**.
+
+
+## Measured 2026-09-21
+
+* **The full 64-product export is 141.28 GB in 19 parts**, not the ~131.6 GB an earlier
+  size-up reported — that estimate summed only the `.zip` parts and omitted the 13.58 GB
+  `.mbox`. Exact totals come from Google's own per-part sizes, so read them from the
+  ledger, never from a directory listing.
+* **The download allowance is 5 attempts PER PART, not per export.** Page text: "You can
+  try to download a file only 5 times", with per-zip counters. A 19-part export therefore
+  carries 95 attempts, and a competing pull spends the same allowance as the original.
+* **A minted URL is not the only way to get bytes, but it is the only way to get them
+  without the browser.** The transfer pass consumes no minting, so it is genuinely
+  window-independent: the 5-part test transferred 2.65 GB with `mint 0` on that pass.
+* **v2 wrote the mbox as `All mail Including Spam and Trash-002.mbox`** — decoded. v3
+  produced the percent-encoded form, which is how the filename bug was found.
+* **`/opt/archives/google-takeout/<account>/` directories are named for the export
+  timestamp** (`2026-09-19-04-27-12` for `takeout-20260919T042712Z`), not for the archive
+  id. Pairing an archive id to its directory requires the timestamp from the part names.
+* **rclone's VFS cache held 97 GB** (`/opt/local_cache_crypt/rclone_vfs`, `drwx------ root`)
+  against `--vfs-cache-max-size 100G`, on the same 300 GB volume as staging. Any staging
+  plan must budget for it: 194 GB free vs ~232 GB wanted for a naive full pull.
+* **`--mint-only` exits 1, not 0.** Only `complete` maps to 0; `incomplete` means work
+  remains, which is true after minting.
+* **A 20-second no-growth window plus exact per-part byte counts is enough to say a pull
+  has stopped**, without reading the data: no file grew, and 19/19 sizes matched exactly.
+* **`zipfile.testzip()` reads every byte** — ~10+ minutes on 127 GB of JuiceFS, and it is
+  not needed to answer "is the file whole?". A truncated zip loses its EOCD, so two seeks
+  per file is the right instrument. The heavy CRC check is a separate, deliberate pass.

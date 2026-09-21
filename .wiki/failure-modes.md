@@ -24,6 +24,12 @@ Every attempt cost below is either the index's advertised figure or a **measurem
 | 1.16 | `ENOSPC` mid-write | 0 directly; 1/part for streams it kills | [failure-modes-storage.md](failure-modes-storage.md) |
 | 1.17 | Server reboot | **1**/part in flight | [failure-modes-runtime.md](failure-modes-runtime.md) |
 | **1.18** | **Container OOM** | **1**/part in flight | **below** |
+| 1.20 | Percent-encoded part filename | **0** — but silently misnames the archive | [failure-modes-exports.md](failure-modes-exports.md) |
+| 1.21 | Staging never freed → `ENOSPC` on a large pull | 0 to diagnose; **blocks the pull** | [failure-modes-storage.md](failure-modes-storage.md) |
+
+> `1.19` (export download allowance exhausted) lives in
+> [failure-modes-exports.md](failure-modes-exports.md). `1.20` and `1.21` were added
+> 2026-09-21, found by minting and transferring the real exports rather than by review.
 
 ---
 

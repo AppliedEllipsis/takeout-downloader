@@ -28,7 +28,49 @@ cannot finish in one pass**. Hence: mint everything first, then transfer.
 
 ---
 
-## Step 0 — reach the browser and sign in
+## Step 0 — check what is ALREADY on disk before you pull anything
+
+**Do this first, every time.** On 2026-09-21 the whole 141.28 GB export had already been
+pulled by v2 while a v3 pull was being planned. The v3 transfer was cancelled. Running it
+would have re-downloaded bytes already present and spent an allowance that was already
+partly gone.
+
+**The allowance is 5 attempts per PART, not per export** — page text: *"You can try to
+download a file only 5 times"*, with per-zip counters. Two downloaders racing the same
+export share that allowance, so a race can leave two partial copies and nothing left to
+finish either with.
+
+List what Google says exists, then compare against the directory:
+
+```bash
+docker exec takeout-webgui python3 /tmp/_diff_full64.py     # see .recon/_verify_full64_fast.py
+```
+
+The comparison has one trap, paid for once already: **decode filenames before matching.**
+v3's ledger held `All%20mail%20Including%20Spam%20and%20Trash-002.mbox` while v2 had
+written the decoded `All mail Including Spam and Trash-002.mbox`. The file was present and
+exact, and the first comparison called it missing. A completeness comparison is only as
+good as its name matching.
+
+Decide an export is complete only on all of:
+
+| check | how | why |
+|---|---|---|
+| exact byte count, **every** part | against Google's per-part sizes in the ledger | a size-up from a directory listing misses non-zip parts — the `.mbox` is 13.58 GB of a 141.28 GB total |
+| nothing still being written | `stat` twice, ~20 s apart | a large file can match its final size only at the end |
+| each `.zip` still whole | EOCD present in the last 64 KB | a truncated zip loses it |
+| a non-zip part | head and tail are sane | an mbox needs a `From ` line and a MIME terminator |
+
+Byte counts, EOCD and structure are **not** a CRC check of the members. That requires
+reading every byte — do it deliberately as a separate pass (`.recon/_crc_full64.py`),
+because this account has produced truncated archives before.
+
+If the export is already complete: **stop.** Do not transfer. v3's minted URLs can be left
+cached; minting cost Δ1 each and is harmless on its own.
+
+---
+
+## Step 1 — reach the browser and sign in
 
 The browser lives inside the container. Its desktop is exposed as a **KasmVNC portal on
 port 3000**, published to the server's loopback only:
@@ -60,7 +102,7 @@ things:**
 
 ---
 
-## Step 1 — readiness, before spending anything
+## Step 2 — readiness, before spending anything
 
 ```bash
 ssh takeout-server 'docker exec -i -w /work/.v3 \
@@ -85,7 +127,7 @@ correctly, because a detached mount turns `/opt/archives` into an ordinary direc
 
 ---
 
-## Step 2 — mint every URL while the window is fresh
+## Step 3 — mint every URL while the window is fresh
 
 ```bash
 ID=<archive id>;  ACCT=<account>
@@ -113,7 +155,7 @@ that needs the window.
 
 ---
 
-## Step 3 — the transfer pass
+## Step 4 — the transfer pass
 
 ```bash
 ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
@@ -137,7 +179,7 @@ expired · `4` allowance spent (new export required) · `1` other, read the `err
 
 ---
 
-## Step 4 — confirm the result
+## Step 5 — confirm the result
 
 ```bash
 ssh takeout-server "docker exec takeout-webgui sh -c \

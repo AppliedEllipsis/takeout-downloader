@@ -124,3 +124,19 @@ everything visible through the mount is already in the remote.
   worth keeping as evidence of what was attempted.
 - `manifest.json` in both exports parses with **0 entries** — the manifest format the verifier expects
   is not what these files contain. Worth checking before v3 relies on it as the completeness oracle.
+
+
+## Updated 2026-09-21 — the 64-product export is complete
+
+`da982753-42dc-4a58-bba0-a9d3605759dd` (64 products) landed at
+`/opt/archives/google-takeout/braincreation/2026-09-19-04-27-12/`:
+
+* **19/19 parts, 141,278,352,495 bytes (141.28 GB)** — every part's size matches Google's
+  listing exactly.
+* All 18 zips carry a valid end-of-archive record; the `.mbox` is valid at head and tail.
+* Nothing was still being written when checked.
+* Downloaded by **v2**, not v3 — see `.wiki/decisions.md`, 2026-09-21.
+* A separate CRC pass over the zip *members* was launched because this account has
+  produced truncated archives before.
+
+The 3 previously-identified truncated parts elsewhere in this account remain unopenable.

@@ -431,3 +431,64 @@ single part of the 64-product export is that 13.58 GB mbox. Anything that assume
 suffix — completeness counting, verification, globbing — will mis-handle it. Note also that
 a size-up that sums only `.zip` parts understates the export by 13.58 GB (141.28 GB actual
 vs ~131.6 GB estimated).
+
+---
+
+## 1.23 — ZIP-only validator declares a complete mixed-format export broken
+
+**Added 2026-09-22.** Attempt cost **0**. The cost is that a finished, correct download is
+reported as a failure, and an operator re-runs it.
+
+### Symptom
+
+```
+status     : error
+parts_total: 69
+parts_done : 69
+bytes      : 126868187243 / 126868187243
+last_error : "28 part(s) failed validation"
+```
+
+Every byte is present and the byte count matches Google's own total, yet the job is an error.
+
+### Cause
+
+`takeout_dl.validate_zip(path, expected_size)` opens **every** part with
+`zipfile.ZipFile(path)`. Takeout parts are not all archives. This export is 68 parts:
+**40 `.zip` + 28 non-zip (27 `.mp4` + 1 `.mbox`)**. `zipfile` raises
+`BadZipFile: File is not a zip file` on each of the 28, so they can never validate —
+regardless of how correct they are.
+
+`manager/engine_bridge.py` then reports `f"{len(incomplete)} part(s) failed validation"`.
+
+### Verified, 2026-09-22 (read-only, on the live export)
+
+```
+non-zip parts actually opened: 28
+each one: BadZipFile: File is not a zip file
+```
+
+The arithmetic is exact, which is why this is a root cause and not a hypothesis:
+
+| | |
+|---|---|
+| ledger parts | 68 = **40 zip + 28 non-zip** |
+| v2's `parts_total` | **69** — it also counts `takeout-20260919T043421Z-001.zip`, whose timestamp (`043421Z`) is 30 s before this export's (`043451Z`) and is not a part of it |
+| v2's failing set | **28** = exactly the non-zip parts |
+| independent check | all 68 parts match Google's size for their name; all 40 export zips CRC-verified |
+
+### Recovery
+
+Nothing to recover — the export is complete. Confirm with a **name + size** check and a CRC
+pass over the zip parts (`.recon/_gap62b.py`, `.recon/_crc_dir.py`), not with the validator
+that produced the error.
+
+### Prevention
+
+- **A validator's verdict is a claim, not a fact.** Check it against the bytes; do not re-pull
+  a 118 GB export because a tool said so.
+- **Dispatch on the actual format**, not on the file's membership of the export. Size is the
+  universal check; `zipfile.testzip()` applies only to `.zip`.
+- v3 records the real filename at mint time (`ledger.set_part_filename`) and verifies size for
+  every part, so this class cannot recur there. It is keeping the v2 validator's message as
+  *evidence* that needs a second opinion, not as a verdict.

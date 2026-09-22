@@ -287,3 +287,5 @@ each one needs a fresh **mint** (**Δ1**) to resume — the bytes already on dis
 3. **Detect pressure before it bites:** alert on available memory below a threshold rather than waiting
    for the kernel.
 4. **Keep the daemon out of the browser container if possible**, or account for the shared ceiling.
+
+| 1.23 | ZIP-only validator declares a complete mixed-format export broken | **0** — but invites a needless re-pull | [failure-modes-exports.md](failure-modes-exports.md) |

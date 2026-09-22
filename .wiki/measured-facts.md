@@ -289,3 +289,24 @@ placeholder has now produced two separate wrong conclusions in this project.
 
 A mint is Δ1; the bytes are a separate, unbounded cost that only exists because
 `autoCancelDownloads` is OFF (see the 2026-09-22 ADR and failure mode 1.22).
+
+## 2026-09-22 — the composition of the 62-product export, and v2's "28 failures" explained exactly
+
+| | |
+|---|---|
+| Ledger parts | 68 |
+| `.zip` parts | **40** |
+| non-zip parts | **28** — 27 `.mp4` + 1 `.mbox` |
+| v2 `parts_total` | **69** (adds `takeout-20260919T043421Z-001.zip`, a non-part) |
+| v2 `last_error` | `"28 part(s) failed validation"` |
+| non-zip parts opened with `zipfile` | **28**, every one `BadZipFile: File is not a zip file` |
+
+`validate_zip()` in `takeout_dl.py` runs `zipfile.ZipFile()` on every part, so the 28 non-zip
+parts can never validate. The failing count is exactly the non-zip count — arithmetic, not
+correlation. Failure mode **1.23**.
+
+**Also measured:** `/opt/archives/google-takeout/braincreation/` holds **37** entries, not the
+6 previously claimed: 8 real export dirs plus **29 `*-capture` job directories** (28 of them
+empty, one holding a **~121 GB** per-file duplicate of an export). The earlier "exactly 6
+directories" reading was wrong and was never re-checked before being written down — the same
+failure of method as the "28 parts missing" claim.

@@ -55,6 +55,8 @@ from .mover import (
 )
 from .report import build_report, parse_expiry
 from .scrape import (
+    ArchivePage,
+    PartLink,
     archive_url,
     page_has_rapt,
     provoke_rapt,
@@ -167,6 +169,61 @@ def _int_size(value) -> Optional[int]:
         return n if n > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def page_from_ledger(ledger, archive_id: str) -> Optional[ArchivePage]:
+    """Rebuild the work-list from the ledger when the browser cannot supply one.
+
+    **Why this exists — measured 2026-09-22.** The transfer pass scraped the archive page
+    before moving anything, and that scrape needs a live `rapt`. So a run whose parts were
+    ALL already minted still died with `needs_reauth` before transferring a byte, which
+    invalidated the entire point of `--mint-only`. The observed failure:
+
+        error: the archive page served download links carrying no rapt, and provoking one
+        by navigating the redirector did not produce a token either. No download attempt
+        was spent.
+
+    The scrape has two jobs: discover the part list, and obtain a live token. When every
+    part already carries a cached `minted_url` and a real `filename`, the ledger supplies
+    both the part list and the URLs — so the browser is not needed for either, and the
+    transfer becomes genuinely window-independent, as documented.
+
+    Returns `None` when the ledger is NOT self-sufficient, so the caller keeps its normal
+    behaviour rather than silently proceeding on a partial view of the export. The
+    condition is deliberately strict: one part without a URL, or still holding the
+    placeholder name `download`, and this declines.
+
+    **Provenance caveat, surfaced on stderr:** completeness is then judged against the part
+    list this ledger recorded during an earlier authenticated scrape, not a fresh page read.
+    If that scrape had been partial, so is this view. The run says so when it takes this
+    path rather than letting a green verdict imply a check that did not happen.
+    """
+    rows = ledger.parts(archive_id)
+    if not rows:
+        return None
+
+    parts: list = []
+    for r in rows:
+        name = (r.filename or "").strip()
+        if not r.minted_url or not name or name == "download" or r.idx is None:
+            return None
+        parts.append(PartLink(
+            index=int(r.idx),
+            raw_uri="",
+            filename=name,
+            size=str(r.size_expected) if r.size_expected else "",
+        ))
+    if not parts:
+        return None
+
+    page = ArchivePage(url="", parts=parts)
+    job = ledger.job(archive_id)
+    if job is not None:
+        try:
+            page.expiry = job["expiry_at"]
+        except (KeyError, TypeError, IndexError):
+            page.expiry = None
+    return page
 
 
 def _get_json(url: str, timeout: float) -> dict:
@@ -389,11 +446,46 @@ async def run_once(
                     work_url = rapt_url
 
             page = await read_archive(session, work_url, settle=cfg.settle)
+
+            # ---- offline fallback: the ledger may already be sufficient --------
+            #
+            # This is what makes the transfer pass genuinely window-independent, which is
+            # the whole justification for `--mint-only`. Without it the transfer scraped
+            # the page, needed a live rapt for that scrape, and died with `needs_reauth`
+            # before moving anything — measured 2026-09-22, on an export whose URLs were
+            # ALL already cached. Minting first bought nothing.
+            #
+            # Only taken when EVERY part has a cached URL and a real name
+            # (`page_from_ledger` returns None otherwise), so this can never mask a
+            # partial view of the export. When it does fire, the run needs no browser
+            # work at all: no scrape, no mint, no token.
+            _from_ledger = False
+            if page.challenged or not page.parts:
+                # Capture WHY before `page` is reassigned, or the note below reports the
+                # ledger page's own state instead of the reason we fell back.
+                _why = "challenge" if page.challenged else "no parts"
+                _ledger_page = page_from_ledger(ledger, cfg.archive_id)
+                if _ledger_page is not None:
+                    page = _ledger_page
+                    _from_ledger = True
+                    print(f"note: the archive page was unavailable ({_why}), but all "
+                          f"{len(page.parts)} part(s) already have cached URLs — "
+                          f"working from the ledger, no token needed. Completeness will "
+                          f"be judged against the part list this ledger recorded during "
+                          f"its last authenticated scrape.", file=sys.stderr)
+
             if page.challenged:
                 ledger.set_job_status(cfg.archive_id, "needs_reauth",
                                       error=f"challenge at {page.url}")
                 return await _finish("needs_reauth",
                                      error=f"the archive page is a sign-in page: {page.url}")
+
+            # NOTE: deliberately NO special case for an empty page. Zero parts is not a
+            # ReAuth situation — it means the export has nothing downloadable yet — and
+            # reporting `needs_reauth` would send an operator to re-authenticate for no
+            # reason. `test_rule7_zero_parts_is_never_complete` pins that it must end
+            # `failed` or `incomplete` with an explanation, and an earlier draft of this
+            # very change broke that invariant by adding such a branch.
 
             # Keep the tokened page loaded. `_restore`'s docstring promises this,
             # and it is worth having: a tab left on the rapt page is what lets the

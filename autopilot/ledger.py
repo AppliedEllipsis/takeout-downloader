@@ -24,7 +24,6 @@ Attempts are recorded per *kind* so a budget can tell the two apart.
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,26 +64,41 @@ class AttemptKind:
     RESUME = "resume"      # measured Δ0
 
 
-#: A real Takeout part filename, e.g. `takeout-20260919T163231Z-1-001.zip`.
+#: Names the scrape produces instead of a real part name.
 #:
-#: Used to decide whether a name is worth keeping. The scrape cannot produce one
-#: (its source is the redirector basename `download`), so this is how a recorded
-#: real name survives a re-scrape.
-PART_FILENAME_RE = re.compile(r"^takeout-\d{8}T\d{6}Z-\d+-\d+\.zip$", re.I)
+#: The scrape's filename comes from the redirector's basename, which is the literal
+#: string `download` for EVERY part (measured 2026-09-19), so it carries no part
+#: identity and must never displace a name that is real.
+PLACEHOLDER_PART_NAMES = frozenset({"download", "download.zip"})
 
 
-def looks_like_part_filename(name: str) -> bool:
-    """Whether `name` is a real Takeout part filename rather than a placeholder.
+def carries_part_identity(name: str) -> bool:
+    """Whether a filename carries part identity rather than being a placeholder.
 
-    Pure, so the rule that decides when a recorded filename is preserved is
-    testable without a database.
+    Pure, so the rule that decides when a recorded filename is preserved is testable
+    without a database.
+
+    **This predicate replaced one that destroyed data.** The previous rule was a regex
+    matching only `takeout-<stamp>-N-NNN.zip`, and it gated the preserve-the-recorded-name
+    check as `looks_like_part_filename(current)`. A part whose real name was
+    `Louie 2018-057.mp4` therefore FAILED the test, the guard did not fire, and the
+    scrape's placeholder `download` overwrote the real name. Measured 2026-09-22: a
+    single re-scrape blanked **25 of the 62-export's 68 filenames** — every non-zip part —
+    and reset them to `pending`. A guard that is right about zips and actively wrong about
+    everything else is worse than no guard, because the comment above it promises that
+    recorded names are safe.
+
+    The rule is about the INCOMING value, not the stored one: a placeholder must never
+    displace anything. Everything else is worth keeping, including names no pattern could
+    have predicted — `.mp4`, `.mbox`, and whatever the next export type turns out to be.
     """
-    return bool(PART_FILENAME_RE.match((name or "").strip()))
-
-
-#: A real Takeout part filename, e.g. `takeout-20260919T163231Z-1-001.zip`.
-#: (Kept beside the predicate so both are found together.)
-PART_FILENAME_EXAMPLE = "takeout-20260919T163231Z-1-001.zip"
+    n = (name or "").strip()
+    if not n:
+        return False
+    if n.lower() in PLACEHOLDER_PART_NAMES:
+        return False
+    # Every real part name observed has an extension. A bare word is not one.
+    return "." in n
 
 
 class LedgerError(AutopilotError):
@@ -296,16 +310,16 @@ class Ledger:
             # so it carries no part identity and must never replace a name that is
             # real. `set_part_filename()` records the real one after minting.
             #
-            # The test is a PATTERN, not the literal `download`. A literal check
-            # was tried first and was too narrow: any other non-name from the page
-            # still clobbered a recorded real name, which is exactly how the
-            # destination-index skip silently failed to fire.
+            # The test is applied to the INCOMING value, because the stored name is the
+            # thing worth protecting. It used to be applied to the STORED value through
+            # a zip-only regex, which meant a recorded `Louie 2018-057.mp4` did not look
+            # "real", the guard did not fire, and the placeholder overwrote it — 25 of
+            # 68 filenames in one re-scrape. See `carries_part_identity`.
             incoming = filename or None
             existing = self.part(archive_id, idx)
             if existing is not None:
-                current = existing["filename"] or ""
-                if (looks_like_part_filename(current)
-                        and not looks_like_part_filename(incoming or "")):
+                current = (existing["filename"] or "").strip()
+                if current and not carries_part_identity(incoming or ""):
                     incoming = current
             self.conn.execute(
                 "INSERT INTO parts (archive_id, idx, filename, size_expected, status) "

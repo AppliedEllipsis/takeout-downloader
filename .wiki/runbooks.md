@@ -363,3 +363,86 @@ bash .recon/_resume_mint62.sh
 - **Watch the stray downloads.** With `autoCancelDownloads` OFF (the standing state) every mint
   leaves a real browser download running — failure mode 1.22. Sweep `config/Downloads/*.crdownload`
   before starting a transfer.
+
+---
+
+## 10. Prove which code is actually running (do this after every deploy)
+
+A deploy command succeeding is not evidence that the deployed code is executing. On 2026-09-22
+three extension fixes had been committed, "deployed", and were still not running: Chromium
+loaded `--load-extension=/work/helpers` (the main checkout) while the fixes lived in
+`/work/.v3/helpers`. Everything looked healthy, because the *storage* was correct and storage
+alone suppresses the symptom.
+
+**Never verify a deployment by timestamp or by `git log`. Verify by behaviour.**
+
+### Python (v3)
+
+```bash
+# the deployed commit
+ssh takeout-server 'cd /opt/local_cache_crypt/_projects/takeout-downloader/.v3 && git log --oneline -1'
+
+# import the thing you just changed, IN the container, and assert on it
+ssh takeout-server 'docker exec -w /work/.v3 takeout-webgui python3 -B -c "
+from autopilot.ledger import JOB_STATUSES
+print(\"minting in JOB_STATUSES:\", \"minting\" in JOB_STATUSES)
+"'
+```
+
+An `ImportError` here means the deploy did not land, however clean `git log` looked.
+
+### The extension
+
+```bash
+# 1. which directory does Chromium actually load?
+ssh takeout-server 'docker exec takeout-webgui sh -c "ps -eo args | grep [c]hromium | head -1" \
+  | tr " " "\n" | grep load-extension'
+
+# 2. probe the RUNNING code, not the file
+scp .recon/_which_ext_code.py takeout-server:/tmp/
+ssh takeout-server 'docker cp /tmp/_which_ext_code.py takeout-webgui:/config/'
+ssh takeout-server 'docker exec takeout-webgui python3 -B /config/_which_ext_code.py'
+```
+
+The probe reads `chrome.alarms.getAll()` and `chrome.storage.local`. With
+`autoRecapture: false`:
+
+| observation | meaning |
+|---|---|
+| `takeout-recapture-poll` present | **the OLD `background.js` is executing** — it creates the alarm unconditionally |
+| alarms empty | the new code is executing (it clears/never creates it) |
+
+This works because an alarm's presence is a direct consequence of which code ran, whereas mtime
+and `git log` describe the file, not the process.
+
+### Reload the extension after changing it
+
+```bash
+ssh takeout-server 'docker exec -w /work/.v3 takeout-webgui python3 -B -c "
+import asyncio, json, urllib.request, sys
+sys.path.insert(0, \"/work/.v3\")
+from autopilot.cdp import CdpSession
+from autopilot.ws_transport import WebSocketTransport
+async def main():
+    ts = json.load(urllib.request.urlopen(\"http://127.0.0.1:9222/json/list\"))
+    for t in [x for x in ts if (x.get(\"url\") or \"\").startswith(\"chrome-extension://\")
+              and x.get(\"webSocketDebuggerUrl\")]:
+        tr = await WebSocketTransport.connect(t[\"webSocketDebuggerUrl\"])
+        async with CdpSession(tr) as s:
+            await s.value(\"chrome.runtime.reload(); \\\"reloading\\\"\")
+asyncio.run(main())
+"'
+```
+
+Then re-run the probe and confirm the verdict actually changed.
+
+**Gotchas.**
+
+- **`chrome.alarms` entries survive a browser restart** (measured 2026-09-19). A stale alarm
+  keeps waking the service worker forever and can look like live behaviour — which is how the
+  first reload check wrongly concluded the old code was still running.
+- **`--load-extension=/work/helpers` is baked into the image** by `webgui/init_custom.sh` and
+  written to `/usr/local/bin/takeout-chromium` at container boot. Patching the source needs a
+  rebuild; patching the live script needs only a restart. Do both.
+- **A passing test is not a deploy.** `tests/v3/test_extension_defaults.py` asserts the source in
+  the worktree — it will pass green while the browser runs an August build of the same file.

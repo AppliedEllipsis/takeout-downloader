@@ -548,3 +548,49 @@ and the entire point is to remove a manual step from a 68-part run.
   character count, and it re-reads the field's **length** to confirm entry.
 - **2FA still wins.** If Google demands a second factor, no file can satisfy it and a human is
   required. `gPass.txt` is measured to be password-only in scope.
+
+---
+
+## 2026-09-22 — The extension loads from the DEPLOYED checkout, not the main one
+
+**Context.** Chromium's launcher passed `--load-extension=/work/helpers`. `/work` is the main
+checkout, which sits on `feat/internal-downloader`; the v3 code — including three extension
+fixes (`3049c80` fail-closed `autoRecapture`, `a9596f5` the two accumulation loops, and the
+2026-09-22 default flip) — ships on `feat/takeout-autopilot`. So every extension fix made in
+this project landed in `.v3/helpers/` and **the browser kept executing a months-stale
+`background.js` from `$R/helpers/`**.
+
+**How it was found.** Not by timestamp. `/config/extension_switch.py` proved the *storage* was
+correct (`autoRecapture: false`) and the behaviour looked fixed, because storage alone suppresses
+the flood. The tell was a **behavioural** probe of the running code:
+
+```
+alarms                 : ['takeout-recapture-poll']
+recaptureAlarmPresent  : True
+storage                : {'autoCancelDownloads': False, 'autoRecapture': False}
+VERDICT: the OLD background.js is loaded
+```
+
+Only the old `background.js` creates the recapture alarm unconditionally. So the code fix was
+never live, and because `chrome.alarms` entries **survive a browser restart** (measured
+2026-09-19), the stale alarm was still firing every minute forever — doing nothing, but one
+early-return bug away from resuming the tab flood that reached **314 tabs** and took the
+container to OOM.
+
+**Decision.** Point the launcher at the deployed checkout:
+`--load-extension=/work/.v3/helpers`. Changed in `webgui/init_custom.sh` (takes effect on the
+next image build) **and** in the live `/usr/local/bin/takeout-chromium` (takes effect on the next
+container restart), so both paths are covered. `$R/helpers` was also mirrored from `.v3/helpers`
+and backed up, so the two are identical today whichever path runs.
+
+**Why not "just remember to copy".** A manual mirror is a step someone forgets, and the failure
+is silent: the browser runs old code and everything looks healthy. Making the loaded path *be*
+the deployed path removes the class.
+
+**Consequences.**
+- The extension now tracks the same commit as the Python, because the deploy step updates `.v3`.
+- **Verify extension deployments by behaviour, never by mtime.** `_recon/_which_ext_code.py`
+  prints the verdict from `chrome.alarms.getAll()` plus storage, and the reload was confirmed by
+  the alarm disappearing (`recaptureAlarmPresent: false`, `alarms: []`).
+- A container **rebuild** is needed for the `init_custom.sh` change to take effect; until then
+  the patched live launcher covers restarts and the mirrored files cover the current process.

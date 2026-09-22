@@ -29,6 +29,17 @@ cat > /usr/local/bin/takeout-chromium <<EOF
 #!/bin/bash
 # Resolve the chromium binary (deb package name varies).
 CHROME=\$(command -v chromium-browser || command -v chromium || echo chromium)
+# NOTE: the extension loads from the DEPLOYED checkout (.v3), not /work/helpers.
+# `/work` is the main checkout on branch feat/internal-downloader while the v3 code
+# ships on feat/takeout-autopilot, so pointing at /work/helpers silently ran a
+# months-stale background.js: the fix commits sat in .v3/helpers the whole time and
+# were never the code the browser executed. Measured 2026-09-22 -- with storage saying
+# autoRecapture=false the recapture alarm was STILL present, and only the old
+# background.js creates it unconditionally, so a profile reset would have re-armed the
+# tab flood that once reached 314 tabs and took the container to OOM. The deploy step
+# updates .v3, so this keeps the extension on the same commit as the Python. Confirm
+# which code is live by BEHAVIOUR, not by timestamp: with autoRecapture false the new
+# code leaves no `takeout-recapture-poll` alarm.
 # Clear a stale SingletonLock left by a previous container instance. The lock
 # is a symlink "<host>-<pid>"; after a container recreate that pid is gone but
 # the link persists and blocks every launch. Remove it if no chromium is live.
@@ -39,7 +50,7 @@ exec "\$CHROME" \\
   --user-data-dir=$PROFILE_DIR \\
   --remote-debugging-address=127.0.0.1 \\
   --remote-debugging-port=9222 \\
-  --load-extension=/work/helpers \\
+  --load-extension=/work/.v3/helpers \\
   --no-first-run \\
   --no-default-browser-check \\
   --disable-features=TranslateUI --disable-gpu --disable-software-rasterizer \\

@@ -1427,3 +1427,64 @@ Result: `/config/Downloads` 15,371 MB → **1 MB**, free space on `cache_crypt`
   apart) and that the vocabulary has not drifted.
 - `helpers/background.js`: the cancel listener's default is now OFF, keyed on `=== true`
   rather than `!== false`, so a missing key leaves a human's download alone. Two tests.
+
+---
+
+## 2026-09-22 — the extension fixes were never live, and the 62-export is CRC-clean
+
+### The 62-product export passes CRC: 41/41 zips, 0 failures
+
+```
+zips checked   : 41
+bytes read     : 33065211996 (30.79 GB)
+elapsed        : 323.4 s (97.5 MB/s)
+failures       : 0
+RESULT: ALL ZIPS CRC-VERIFIED
+```
+
+Combined with the earlier 68/68 exact-name-and-size match, this export is **complete and
+verified**. 27 of its 68 parts are `.mp4` files (plus `.manager_state.json` and
+`manifest.json`); those are size-verified but **not** content-hashed, because `zipfile` cannot
+read them — recorded as a limitation rather than glossed as "all verified". Report:
+`.recon/crc62_result.txt`.
+
+Together with the 64-product export (141.28 GB, 18/18 zips CRC-clean) and the 21-product export
+(2/2 parts exact), **all three exports on this account are on disk and verified.**
+
+### The extension fixes were never running
+
+Chromium's launcher loaded `--load-extension=/work/helpers` — the MAIN checkout, which is on
+`feat/internal-downloader`. The v3 extension fixes (`3049c80`, `a9596f5`, and today's default
+flip) are on `feat/takeout-autopilot`, so they sat in `.v3/helpers/` while the browser executed a
+`background.js` from **August 6**.
+
+It looked fixed because it was *behaviourally* fixed: flipping `autoRecapture` in storage stops
+the tab flood on its own. What storage cannot fix is the default — and the old file had
+`autoRecapture: true` with an **unconditional** `chrome.alarms.create`, so a profile reset would
+have rebuilt the flood.
+
+Proved by probing the running code rather than its timestamp:
+
+```
+BEFORE:  alarms ['takeout-recapture-poll']  recaptureAlarmPresent True   -> OLD code
+AFTER:   alarms []                          recaptureAlarmPresent False  -> NEW code
+```
+
+The alarm is created unconditionally by the old file and only on explicit opt-in by the new
+one, so its presence is a direct read of which code is executing. And because `chrome.alarms`
+survive a browser restart (measured 2026-09-19), that stale alarm had been waking the service
+worker every minute for who knows how long.
+
+Fixed three ways so the class cannot recur: `webgui/init_custom.sh` now points at
+`/work/.v3/helpers`; the **live** `/usr/local/bin/takeout-chromium` was patched too (so a
+container restart is enough, no rebuild needed); and `$R/helpers` was mirrored from `.v3/helpers`
+and backed up, so both paths serve identical bytes today.
+
+### Files
+
+| Path | What |
+|---|---|
+| `.recon/_which_ext_code.py` | Behavioural probe: which `background.js` is running |
+| `.recon/_deploy_extension.sh` | Mirror + reload + prove |
+| `webgui/init_custom.sh` | `--load-extension=/work/.v3/helpers` |
+| `.recon/crc62_result.txt` | The 41/41 CRC report |

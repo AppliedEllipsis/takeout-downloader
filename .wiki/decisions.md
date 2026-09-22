@@ -594,3 +594,50 @@ the deployed path removes the class.
   the alarm disappearing (`recaptureAlarmPresent: false`, `alarms: []`).
 - A container **rebuild** is needed for the `init_custom.sh` change to take effect; until then
   the patched live launcher covers restarts and the mirrored files cover the current process.
+
+---
+
+## 2026-09-22 — Cancel a mint's stray download AFTER the capture, never before
+
+**Context.** Failure mode 1.22: a mint navigate ends at a `Content-Disposition: attachment`
+response, so Chrome starts a **real** download of the part. `autoCancelDownloads` is OFF by
+owner directive, so nothing disposes of it — a 68-part mint left **15.4 GB** in
+`/config/Downloads`. With this project now aimed at 500 GB–2 TB exports against ~198 GB free on
+the staging volume, that is not survivable.
+
+**The obvious fix is wrong.** `Browser.setDownloadBehavior {behavior: "deny"}` around the mint
+hop would be simpler. But aborting a request is **measured** to *prevent* the mint, and denying a
+download is a form of abort. A change that fixes disk hygiene by breaking the mint is not a fix.
+
+**Decision.** Cancel **after** the minted URL is captured, addressed by the `guid` from
+`Browser.downloadWillBegin`, on every exit path from `mint()`.
+
+**Why after.** Once the URL is in hand the download has no further purpose, and cancelling cannot
+affect a mint that has already succeeded — or a mint that already failed, which is equally fine.
+
+**Measured end to end, 2026-09-22.** A 9.88 GB part, driven through the deployed `mint()` with a
+cached file-host URL as the entry (the response-form success return), so the download is real:
+
+| | |
+|---|---|
+| observed in flight | `Unconfirmed 200099.crdownload` growing 27 → 59 → 86 → 116 MB |
+| `mint()` returned | the file-host URL |
+| Downloads bytes, before → after | **879,721 → 879,721 (+0)** |
+| leftovers | none |
+| prior isolated measurement | 581,397,203 bytes in flight; `cancelDownload(guid)` → state `canceled`; byte count and free space returned exactly |
+
+**Consequences.**
+- All **six** exit paths of `mint()` now route through `_leave()` instead of `_restore()`. They
+  were retargeted by enumeration with an assertion of exactly six, because hand-editing six
+  near-identical lines is how one gets missed — and a missed one leaves a download running on the
+  path nobody tested.
+- Every failure degrades safely: a refused `setDownloadBehavior`, a refused `cancelDownload`, or an
+  absent `Browser` domain still returns the minted URL. A lost cancel costs a stray file
+  (`tools/sweep_downloads.py` clears it); it must not cost the caller a URL it already earned.
+- `behavior: "default"` and **no `downloadPath`**. Setting a path would silently move the owner's
+  own downloads, which is the exact thing the owner directive protected. A test pins this.
+- The `Fetch` domain is still never used, and a test asserts it.
+- **Free space is a noisy signal here** — the rclone VFS cache moves ~100 GB independently, and
+  the free-space delta in the live proof read −137 MB while the download had provably been
+  cancelled. The exact signal is the byte count of `/config/Downloads`, and that is what the
+  verification asserts.

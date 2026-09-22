@@ -1488,3 +1488,76 @@ and backed up, so both paths serve identical bytes today.
 | `.recon/_deploy_extension.sh` | Mirror + reload + prove |
 | `webgui/init_custom.sh` | `--load-extension=/work/.v3/helpers` |
 | `.recon/crc62_result.txt` | The 41/41 CRC report |
+
+---
+
+## 2026-09-22 — mint stray downloads fixed and proven; every export on the account is already complete
+
+### The blocker is closed
+
+Implemented cancel-after-capture in `autopilot/mint.py` (commit `edd84eb`): download events are
+requested once before the first navigate, `Browser.downloadWillBegin` guids are collected per hop
+(a multi-hop mint can start more than one download), and all six exit paths now cancel before
+restoring the tab. 14 new offline tests — 285 total, was 271.
+
+Proven against the real browser on the **deployed** code, using a cached file-host URL as the
+entry so the response-form success path runs with a real download:
+
+```
+BEFORE  : Downloads=879721 bytes  in-progress=0  free=198350 MB
+  in flight: Unconfirmed 200099.crdownload = 27066368
+  in flight: Unconfirmed 200099.crdownload = 59637760
+  in flight: Unconfirmed 200099.crdownload = 86507520
+  in flight: Unconfirmed 200099.crdownload = 116195328
+mint returned : https://takeout-download.usercontent.google.com/download/Louie%202018-057.mp4?…
+AFTER         : Downloads=879721 bytes  in-progress=0  free=198213 MB
+  bytes delta vs BEFORE : +0        leftovers : none
+```
+
+Two lessons from getting this measurement right:
+
+1. **Size the experiment to the question.** The first attempt used a 357 KB part, which finished
+   inside the observation window, so `cancelDownload` was a no-op against an already-complete
+   download and proved nothing. The retry used 9.88 GB.
+2. **Pick the exact signal, not a correlated one.** The free-space delta read −137 MB even though
+   the download had been cancelled and nothing was left behind — the rclone VFS cache moves
+   ~100 GB independently of us. The `/config/Downloads` byte count returning to exactly 879,721 is
+   the signal that actually answers the question.
+
+### Every export on this account is already archived
+
+Surveyed read-only (`_recon/_survey_all.py`), cross-checked against disk by exact byte size:
+
+| archive | products | state | created | available until | parts | disk |
+|---|---|---|---|---|---|---|
+| `da982753` | 64 | Completed | Sep 19 4:27 AM | Sep 28 | 19/19 | 141.28 GB |
+| `29462f3d` | 62 | Completed | Sep 19 4:34 AM | Sep 28 | 68/68 | 126.87 GB |
+| `606ab3c0` | 21 | Completed | Sep 19 4:48 AM | Sep 28 | 2/2 | 4.68 MB |
+| `f470fe32` | 3 | Completed | Sep 19 4:58 AM | **Sep 26** | 1/1 | 261 KB |
+| `16d8663e` | 20 | Completed | Sep 19 4:30 PM | Sep 28 | 5/5 | 2.65 GB |
+| `f9a17be0` | 3 | Completed | Sep 19 4:32 PM | **Sep 26** | 1/1 | 36 KB |
+| `69f95248` | 65 | **Failed** | Sep 19 7:07 AM | — | **0** | — |
+
+**Nothing is pending.** But three things matter for an archive-before-delete:
+
+- **The 65-product export FAILED on Google's side and has zero parts.** It covers the most
+  products of any archive on the account and holds nothing. Anyone deleting data on the
+  assumption that "the big export" covers it would be deleting unarchived data.
+- **Everything expires between September 26 and 28** — four to six days. After that the download
+  links are dead and a fresh export has to be built from scratch.
+- **The exports are a September 19 snapshot.** Anything written to the account since then is not
+  in them.
+
+### Still open
+
+- **Unattended ReAuth.** The webgui run showed `NeedsReauth` against a *passive*
+  `ServiceLogin?passive=1209600` with no UI, which nothing can satisfy. A `Page.navigate` is not
+  user-initiated, so Google will not raise the interactive challenge — but a CDP-dispatched input
+  event is trusted and does (measured). Since the window is ~11 minutes and buys ~25–35 mints, a
+  multi-hundred-part export needs roughly a re-auth every 25 parts: **without automation that is
+  a manual click-chain the whole way through a multi-TB pull.**
+- The offline transfer path (`page_from_ledger`) is still unit-tested only.
+- One part of the 62-export (`idx 4`) had its cached URL cleared for the proof run and the
+  re-mint hit the expired window, so the ledger reads 67/68 minted. Harmless — the export is
+  complete and CRC-verified on disk, and the URL is only needed to transfer — but it should be
+  restored on the next sign-in.

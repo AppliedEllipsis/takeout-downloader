@@ -360,10 +360,21 @@ async def run_once(
 
         async def _finish(status: str, *, error: Optional[str] = None) -> RunOutcome:
             rows = ledger.parts(cfg.archive_id)
+            # `present` so the report can see bytes that are in the archive but were not
+            # transferred by this ledger. Without it a resumed run reports `0/68` on an
+            # export that is complete on disk, because v2 (or an earlier ledger) did the
+            # downloading — observed live on the 62-product export.
+            try:
+                _present = index_destination(cfg.archive_dir)
+            except Exception:
+                # A missing or unmounted destination must not break reporting; the report
+                # falls back to ledger-only, which is what it always used to do.
+                _present = None
             report = build_report(rows, archive_id=cfg.archive_id, account=cfg.account,
                                   status=status, expiry_at=_expiry_seen, now=now,
                                   attempts=ledger.attempts_by_kind(cfg.archive_id),
-                                  attempt_kinds=ledger.attempt_kinds_by_part(cfg.archive_id))
+                                  attempt_kinds=ledger.attempt_kinds_by_part(cfg.archive_id),
+                                  present=_present)
             summary = ledger.summary(cfg.archive_id)
             return RunOutcome(
                 archive_id=cfg.archive_id,

@@ -96,6 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
     rep = sub.add_parser("report", help="print the completeness report from the ledger")
     _add_common(rep)
     rep.add_argument("--account", default=None)
+    rep.add_argument(
+        "--archive-dir", default=None,
+        help="the destination archive directory for this export, e.g. "
+             "<STORAGE_ROOT>/<subdir>/<account>/2026-09-19-04-34-51. When given, parts "
+             "already present there are counted as held, so a resume (or an export a "
+             "previous tool pulled) is not reported as 0/N. Omit to report on the "
+             "ledger alone.")
     return ap
 
 
@@ -160,10 +167,24 @@ def cmd_run(args) -> int:
 
 
 def cmd_report(args) -> int:
-    """Ledger-only. Works with no browser and no network."""
+    """Ledger-only by default. Works with no browser and no network.
+
+    `--archive-dir` additionally indexes the destination, so parts already in the archive
+    are counted as held. Without it the report speaks only for this ledger, and on an
+    export a previous tool pulled it reads `0/N` — which is how a complete, CRC-verified
+    archive got reported as BLOCKED.
+    """
     ledger = open_ledger(args.ledger)
     try:
         job = ledger.job(args.archive_id)
+        present = None
+        if getattr(args, "archive_dir", None):
+            from .mover import index_destination
+
+            try:
+                present = index_destination(args.archive_dir)
+            except Exception as exc:  # noqa: BLE001
+                print(f"warning: could not index {args.archive_dir!r}: {exc}")
         out = build_report(
             ledger.parts(args.archive_id),
             archive_id=args.archive_id,
@@ -171,6 +192,7 @@ def cmd_report(args) -> int:
             status=(job["status"] if job else "pending"),
             expiry_at=(job["expiry_at"] if job else None),
             attempts=ledger.attempts_by_kind(args.archive_id),
+            present=present,
         )
     finally:
         ledger.close()

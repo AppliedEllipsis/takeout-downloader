@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from .ledger import AttemptKind
+from .ledger import AttemptKind, carries_part_identity
 
 __all__ = ["Report", "build_report", "parse_expiry"]
 
@@ -73,6 +73,11 @@ class Report:
     dl_counts: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     verdict: str = "UNKNOWN"
+    #: Parts whose bytes are in the archive but which THIS ledger never transferred —
+    #: pulled by v2, or by an earlier run whose ledger was reset. Counted in
+    #: `parts_done` (they are held) and reported separately so the operator can tell
+    #: "v3 downloaded this" from "this was already here".
+    parts_in_archive: int = 0
 
     @property
     def complete(self) -> bool:
@@ -93,6 +98,13 @@ class Report:
             + ("  **← EXPIRED**" if self.expired else ""),
             "",
         ]
+        if self.parts_in_archive:
+            lines += [
+                f"> {self.parts_in_archive} of these part(s) were already in the "
+                "archive and were **not** transferred by this ledger. Without this "
+                "line the count reads as work v3 did.",
+                "",
+            ]
         if self.missing_indices:
             lines += [
                 "## Missing parts",
@@ -139,7 +151,8 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
                  now: Optional[datetime] = None,
                  attempts: Optional[dict] = None,
                  dl_counts: Optional[dict] = None,
-                 attempt_kinds: Optional[dict] = None) -> Report:
+                 attempt_kinds: Optional[dict] = None,
+                 present: Optional[dict] = None) -> Report:
     """Assemble a report from ledger part rows.
 
     `parts` is any iterable of objects with `idx`, `status`, `size_expected`,
@@ -151,6 +164,20 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
     always** — a decorative instrument in a project whose whole lesson is not to
     print numbers that are not measurements. `tests/v3/test_report.py` now pins
     that the table reflects real counts.
+
+    `present` maps a part filename to its size in the DESTINATION archive (that is
+    `index_destination(archive_dir)`). It exists because the report used to judge
+    completeness purely from this ledger's own transfer bookkeeping, and that read
+    **dangerously wrong** on a real export: the 62-product archive was complete and
+    CRC-verified on disk, and the report announced
+    `BLOCKED — re-authentication required (0/68 held)` because v2 had done the
+    downloading and this ledger had transferred nothing. An archive-before-delete
+    decision made on that line would be made on a falsehood.
+
+    A part counts as held if the ledger says `done` **or** its file is in the archive
+    at the expected size. A size mismatch is NOT counted — it becomes a warning, not a
+    silent pass. "Held" and "v3 downloaded this" are different claims, so the archive
+    count is reported separately rather than folded in.
     """
     now = now or datetime.now(timezone.utc)
     parts = list(parts)
@@ -164,8 +191,37 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
     for p in parts:
         idx = getattr(p, "idx", None)
         pstatus = getattr(p, "status", "pending")
-        if pstatus == "done":
+
+        # Is this part's file in the DESTINATION, even though the ledger never
+        # transferred it? Checked only when the status does not already say `done`, so
+        # the two sources cannot double-count.
+        archived_size = None
+        if present is not None and pstatus != "done":
+            name = getattr(p, "filename", None)
+            # `present` is a `mover.DestinationIndex` in production (it exposes
+            # `size_of`) and a plain dict in tests. Accept both rather than forcing a
+            # conversion at every call site.
+            hit = None
+            if name and carries_part_identity(name):
+                size_of = getattr(present, "size_of", None)
+                if callable(size_of):
+                    hit = size_of(name)
+                elif hasattr(present, "get"):
+                    hit = present.get(name)
+            if hit is not None:
+                expected = getattr(p, "size_expected", None)
+                if expected is None or int(hit) == int(expected):
+                    archived_size = int(hit)
+                else:
+                    rep.warnings.append(
+                        f"part {idx} ({name}): a file of that name is in the archive "
+                        f"but is {hit} bytes, not the expected {expected} — NOT counted "
+                        "as held")
+
+        if pstatus == "done" or archived_size is not None:
             rep.parts_done += 1
+            if archived_size is not None:
+                rep.parts_in_archive += 1
         elif pstatus == "partial":
             rep.partial_indices.append(idx)
         elif pstatus in ("failed", "budget_exhausted"):
@@ -175,7 +231,9 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
 
         if getattr(p, "size_expected", None):
             rep.bytes_expected += int(p.size_expected)
-        if getattr(p, "size_on_disk", None):
+        if archived_size is not None:
+            rep.bytes_on_disk += archived_size
+        elif getattr(p, "size_on_disk", None):
             rep.bytes_on_disk += int(p.size_on_disk)
 
         # The v2 signature: a TRANSFER was booked but nothing was ever sent.
@@ -193,8 +251,10 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
         _kinds = ((attempt_kinds or {}).get(int(idx), set())
                   if attempt_kinds is not None else set())
         _moved = _kinds & {AttemptKind.TRANSFER, AttemptKind.RESUME}
-        if _moved and getattr(p, "attempts", 0) and not getattr(p, "size_on_disk", 0) \
-                and pstatus in ("failed", "pending"):
+        if (_moved and getattr(p, "attempts", 0)
+                and not getattr(p, "size_on_disk", 0)
+                and archived_size is None
+                and pstatus in ("failed", "pending")):
             rep.warnings.append(
                 f"part {idx}: attempt(s) spent with zero bytes on disk "
                 "— the v2 NETWORK_ERROR signature (an attempt booked with no "

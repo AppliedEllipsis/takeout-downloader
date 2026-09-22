@@ -101,6 +101,32 @@ def carries_part_identity(name: str) -> bool:
     return "." in n
 
 
+def filename_aliases(name: str) -> list:
+    """Every spelling of `name` that identifies the same part on disk.
+
+    A ledger written before the percent-decoding fix holds
+    `All%20mail%20Including%20Spam%20and%20Trash-002.mbox` while the file on disk is
+    `All mail Including Spam and Trash-002.mbox`. Both name the same part. Without this,
+    the 64-product export reports **18/19 and 13.58 GB "short" on a complete archive** —
+    measured 2026-09-22 — because the report identifies parts by name, so the exact-size
+    match never runs.
+
+    Ordered most-specific first, so the stored spelling is preferred over a decoded
+    guess. A caller must still verify by size: this says "the same name", never "the
+    same bytes".
+    """
+    from urllib.parse import unquote
+
+    n = (name or "").strip()
+    if not n:
+        return []
+    out = [n]
+    decoded = unquote(n)
+    if decoded != n:
+        out.append(decoded)
+    return out
+
+
 class LedgerError(AutopilotError):
     pass
 

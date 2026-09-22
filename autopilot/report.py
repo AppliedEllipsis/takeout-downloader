@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from .ledger import AttemptKind, carries_part_identity
+from .ledger import AttemptKind, carries_part_identity, filename_aliases
 
 __all__ = ["Report", "build_report", "parse_expiry"]
 
@@ -204,10 +204,14 @@ def build_report(parts, *, archive_id: str, account: Optional[str] = None,
             hit = None
             if name and carries_part_identity(name):
                 size_of = getattr(present, "size_of", None)
-                if callable(size_of):
-                    hit = size_of(name)
-                elif hasattr(present, "get"):
-                    hit = present.get(name)
+                lookup = size_of if callable(size_of) else (
+                    present.get if hasattr(present, "get") else (lambda _n: None))
+                # Try every spelling: a ledger written before the percent-decoding fix
+                # holds `All%20mail%20...` while the file on disk is `All mail ...`.
+                for alias in filename_aliases(name):
+                    hit = lookup(alias)
+                    if hit is not None:
+                        break
             if hit is not None:
                 expected = getattr(p, "size_expected", None)
                 if expected is None or int(hit) == int(expected):

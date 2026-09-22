@@ -182,3 +182,50 @@ def test_a_partial_archive_gives_an_incomplete_verdict_not_a_complete_one():
     assert rep.missing_indices == [1]
     assert not rep.complete
     assert not rep.verdict.startswith("COMPLETE"), rep.verdict
+
+
+# ---------------------------------------------------------------------------
+# a percent-encoded ledger name still names the same part
+# ---------------------------------------------------------------------------
+def test_a_percent_encoded_ledger_name_matches_the_decoded_file_on_disk():
+    """Measured 2026-09-22: the 64-product export read `18/19`, 13.58 GB "short", on a
+    COMPLETE archive — because its ledger holds `All%20mail%20Including%20Spam%20and%20
+    Trash-002.mbox` while the file on disk is `All mail Including Spam and Trash-002.mbox`.
+    Both name the same part; the same bytes are there."""
+    rows = parts({"idx": 18, "filename": "All%20mail%20Including%20Spam%20and%20Trash-002.mbox",
+                  "size_expected": 13582799406})
+    rep = build_report(rows, archive_id="a1", status="incomplete", now=NOW,
+                       present={"All mail Including Spam and Trash-002.mbox": 13582799406})
+    assert rep.parts_done == 1
+    assert rep.parts_in_archive == 1
+    assert rep.missing_indices == []
+    assert rep.bytes_on_disk == 13582799406
+
+
+def test_the_alias_does_not_bypass_the_size_check():
+    """The alias says "same name", never "same bytes". A decoded match at the wrong size
+    must still be refused."""
+    rows = parts({"idx": 18, "filename": "All%20mail%20Including%20Spam%20and%20Trash-002.mbox",
+                  "size_expected": 13582799406})
+    rep = build_report(rows, archive_id="a1", status="incomplete", now=NOW,
+                       present={"All mail Including Spam and Trash-002.mbox": 999})
+    assert rep.parts_done == 0
+    assert rep.missing_indices == [18]
+    assert any("not the expected" in w for w in rep.warnings)
+
+
+def test_a_literal_plus_is_not_decoded_into_a_space():
+    """Percent-decoding a filename is not form-decoding. A `+` in a name is a `+`."""
+    from autopilot.ledger import filename_aliases
+
+    assert filename_aliases("a+b.mbox") == ["a+b.mbox"]
+
+
+def test_filename_aliases_prefers_the_stored_spelling():
+    from autopilot.ledger import filename_aliases
+
+    assert filename_aliases("All%20mail-002.mbox") == [
+        "All%20mail-002.mbox", "All mail-002.mbox"]
+    assert filename_aliases("plain.zip") == ["plain.zip"]
+    assert filename_aliases("") == []
+    assert filename_aliases(None) == []

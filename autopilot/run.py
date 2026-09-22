@@ -592,7 +592,16 @@ async def run_once(
                 return await _finish("failed",
                                      error=f"refusing to write: {exc}")
 
-            ledger.set_job_status(cfg.archive_id, "transferring")
+            # The phase label has to name the phase that is actually running.
+            # A `--mint-only` run reaches this line too (the destination-ready
+            # check is shared by both paths), so an unconditional `transferring`
+            # made a mint-only run claim it was transferring while it minted and
+            # moved nothing at all — observed on the 62-product mint, which
+            # reported `transferring` with 63 of 68 URLs earned and zero bytes on
+            # the wire. Nothing keys off the value, which is exactly why nobody
+            # noticed: the only consumer is a human reading the status.
+            ledger.set_job_status(cfg.archive_id,
+                                  "minting" if cfg.mint_only else "transferring")
             dest_index = index_destination(cfg.archive_dir)
             todo = [p for p in page.parts if _needs_work(ledger, cfg.archive_id, p.index)]
             if cfg.max_parts is not None:

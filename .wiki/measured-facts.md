@@ -247,3 +247,45 @@ verdict `COMPLETE`, exit 0, `36670 of 36670` bytes, mint 1 / transfer 1 / resume
 * **`zipfile.testzip()` reads every byte** — ~10+ minutes on 127 GB of JuiceFS, and it is
   not needed to answer "is the file whole?". A truncated zip loses its EOCD, so two seeks
   per file is the right instrument. The heavy CRC check is a separate, deliberate pass.
+
+---
+
+## 2026-09-22 — the 62-product export is COMPLETE, to the byte
+
+| | |
+|---|---|
+| Destination | `/opt/archives/google-takeout/braincreation/2026-09-19-04-34-51` |
+| Ledger parts | 68 |
+| Parts exact by **name and size** | **68** |
+| Size mismatches / absent | **0 / 0** |
+| Ledger expected total | 126,867,340,402 bytes |
+| On disk total | 126,868,242,288 bytes |
+| Difference | **+901,886** = `043421Z-001.zip` (846,841) + `.manager_state.json` (35,511) + `manifest.json` (19,534) |
+
+**"28 parts failed validation" was v2's validator, not a real gap.** v2's own record says
+`parts_done 69/69` with every byte present. Do not re-pull this export.
+
+**The `69 vs 68` off-by-one is arithmetic, not a discrepancy.** Google's 126,868,187,243 for
+this export includes `takeout-20260919T043421Z-001.zip`, whose timestamp (`043421Z`) is 30
+seconds *before* this export's (`043451Z`) — it is not a part of this export. 68 parts +
+that file = 126,868,187,243 exactly.
+
+**Method note — how a 68-part export read as 40.** The scrape can only ever produce the
+placeholder name `download`; the real filename appears only **after minting**. A presence
+check run at 57-of-68 minted therefore compared real names against placeholders and reported
+28 parts absent. Any name-based part check must run after minting or key on the index. This
+placeholder has now produced two separate wrong conclusions in this project.
+
+## 2026-09-22 — measured cost of a mint with browser downloads un-cancelled
+
+| | |
+|---|---|
+| A 68-part mint left in `/config/Downloads` | **15.4 GB / 14 files** |
+| Of which completed part files | 9 files, 7.01 GB — all three-way exact duplicates |
+| Of which still running | 3 (two at ~3.7 GB, one 139.9 KB) |
+| Peak observed growth | ~10 GB/min while several mints were in flight |
+| After cancelling via `chrome.downloads` + deleting verified duplicates | **1 MB**; free 182,663 → 198,353 MB |
+| Attempt cost of a stray download | **0** — the attempt was spent by the mint |
+
+A mint is Δ1; the bytes are a separate, unbounded cost that only exists because
+`autoCancelDownloads` is OFF (see the 2026-09-22 ADR and failure mode 1.22).

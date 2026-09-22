@@ -89,3 +89,69 @@ def test_run_once_checks_mint_only_after_minting_and_before_transferring():
     transfer_at = src.index("transfer = await download(")
     assert mint_at < flag_at < transfer_at, (
         "mint_only must sit after the mint and before the transfer")
+
+
+def test_a_mint_only_run_reports_minting_and_never_transferring(tmp_path, monkeypatch):
+    """The phase label must name the phase that is actually running.
+
+    `--mint-only` shares the destination-ready check with the transfer path, and
+    that check wrote `transferring` unconditionally — so a run that minted and
+    moved nothing reported `transferring` for its entire life. Observed on the real
+    62-product mint: status `transferring`, 63 of 68 URLs earned, zero bytes on the
+    wire. Nothing keys off the value, which is exactly why no test noticed it: the
+    only consumer is a human reading the status.
+
+    Asserted DURING the mint, not after the run — the final status is `incomplete`
+    either way, so only an in-flight observation can tell the two apart.
+    """
+    import sqlite3
+
+    import autopilot.run as run_mod
+
+    s = scenario(tmp_path, n_parts=2)
+    ledger_path = s["cfg"].ledger_path
+
+    def status_now():
+        # Read-only connection: `open_ledger` runs the schema script (a write) and
+        # the orchestrator already holds the file.
+        conn = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True, timeout=15)
+        try:
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE archive_id=?", (ARCHIVE_ID,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    seen = []
+    real_mint = run_mod.mint_part
+
+    async def spy(*args, **kwargs):
+        seen.append(status_now())
+        return await real_mint(*args, **kwargs)
+
+    monkeypatch.setattr(run_mod, "mint_part", spy)
+
+    cfg = RunConfig(archive_id=ARCHIVE_ID, ledger_path=ledger_path,
+                    staging_dir=s["cfg"].staging_dir, archive_dir=s["cfg"].archive_dir,
+                    account=ACCOUNT, settle=0.01, mint_only=True)
+    outcome = asyncio.run(run_once(cfg, session_factory=s["harness"],
+                                   http_client=s["client"]))
+
+    assert seen, "the mint must actually run, or this proves nothing"
+    assert "transferring" not in seen, (
+        f"a mint-only run reported transferring: {seen}")
+    assert set(seen) == {"minting"}, f"status during a mint-only run was {set(seen)}"
+    assert s["client"].requests == [], "and it must still transfer nothing"
+    assert outcome.status == "incomplete"
+
+
+def test_minting_is_a_status_the_ledger_accepts():
+    """Vocabulary drift guard: `run.py` writes `minting`, so `JOB_STATUSES` must
+    contain it. The two lists have silently disagreed before — see the `incomplete`
+    note in `ledger.py`."""
+    from autopilot.ledger import JOB_STATUSES
+    from autopilot.run import RUN_OUTCOME_STATUSES
+
+    assert "minting" in JOB_STATUSES
+    # `minting` is a phase, not an outcome: a run never *ends* as `minting`.
+    assert "minting" not in RUN_OUTCOME_STATUSES

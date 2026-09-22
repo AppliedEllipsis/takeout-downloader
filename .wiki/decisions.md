@@ -487,3 +487,64 @@ for a small export that safety net is worth its bytes. For a 141 GB pull it is n
 ~120 GB — it fits. A failure to unlink is reported on stderr and does **not** fail the
 part, because the bytes are already safe in the archive. The unlink happens only after a
 verified move, never before.
+
+## 2026-09-22 — Browser downloads are NOT cancelled; suppression is scoped to the automation
+
+**Context.** `chrome.storage.local.autoCancelDownloads` was `true`, so the extension cancelled
+*every* native Takeout-host download — including one a human started deliberately. The owner
+stated twice that the workflow depends on real browser downloads and asked for this to stop. The
+earlier reasoning (`_recon/restore_cancel.py`, 2026-09-21) was that browser-downloaded bytes are
+waste under the hybrid architecture. That reasoning is correct about **automated** downloads and
+irrelevant to a human's.
+
+**Decision.** `autoCancelDownloads = false`, set live over CDP on 2026-09-22 and verified by
+re-reading the stored value **and** the listener's own guard (`d.autoCancelDownloads === false`).
+`false` is the standing state.
+
+**Why.** The interference was the whole problem: the listener cannot distinguish a human click
+from the daemon's mint navigate, and the owner's workflow needs the human path to work.
+
+**Consequences.**
+- A mint now leaves a **real part-sized browser download running** in `/config/Downloads`.
+  Measured during round 3 of the 62-product mint: 4 concurrent `.crdownload` files, 898 MB total,
+  largest 494 MB and still growing. Recorded as failure mode **1.22**.
+- It lands on the 300 GB `cache_crypt` volume, not the 14 GB root disk, so it is a space and
+  bandwidth problem rather than a take-the-server-down problem.
+- The right future fix is to suppress downloads **around each automated mint hop only**
+  (e.g. `Browser.setDownloadBehavior {behavior:"deny"}`, restored afterwards) rather than
+  globally. **Not implemented, and not to be assumed safe** — an aborted request is measured to
+  prevent the mint, and a denied download is a form of abort. Measure on one part first.
+- `--clean-staging` does not help: the stray download is not in staging.
+
+**Supersedes:** the 2026-09-21 note keeping the switch ON.
+
+---
+
+## 2026-09-22 — The ReAuth password is supplied out-of-band and never stored in the repo
+
+**Context.** The last 11 mints of the 62-product export were blocked on the interactive ReAuth
+("Password challenge"). v3's stated design was "no stored credential; 2FA makes human-in-the-loop
+mandatory", so the run could not proceed. The owner pointed out that a **temporary** password
+exists and asked for it to be used, supplied as a file: `gPass.txt`.
+
+**Decision.** Read the password from a file at run time. Search order:
+`$TAKEOUT_GPASS` → `/config/gPass.txt` → `/work/gPass.txt` → `~/.takeout-gpass`.
+The value is read **only** from the file — never argv, never the environment — so it cannot appear
+in `ps`, in shell history, or in this project's logs. The file lives in `<repo>/config/`, which
+`.gitignore:126` excludes, so it cannot be committed to the public repo.
+
+**Why a file rather than a prompt.** The daemon runs detached inside the container with no TTY,
+and the entire point is to remove a manual step from a 68-part run.
+
+**Consequences.**
+- `tools/satisfy_login.py` attempts **once** per invocation and **never retries**. A rejected
+  password on a repeated Google challenge can escalate to a lockout, which is not a risk to take
+  automatically. Exit 4 means rejected: it is reported, not looped on.
+- It types with CDP `Input.dispatchKeyEvent` rather than assigning `.value`, because Google raises
+  the interactive challenge only for **user-initiated** navigation — the same measured reason a CDP
+  `Input.dispatchMouseEvent` works where `location.href = …` yields only a passive
+  `accounts.google.com/ServiceLogin?passive=1209600`.
+- It never prints the password, its value, or any field value — only the source path and the
+  character count, and it re-reads the field's **length** to confirm entry.
+- **2FA still wins.** If Google demands a second factor, no file can satisfy it and a human is
+  required. `gPass.txt` is measured to be password-only in scope.

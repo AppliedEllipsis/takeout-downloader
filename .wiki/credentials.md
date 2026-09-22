@@ -46,3 +46,18 @@ chat id, manager API auth, archive paths.
 |---|---|
 | Extension id | `dgbbpdjpfeeaiheekoclkkkbipkikejl` |
 | Key file | `webgui/extension-key` (in repo — check whether it is a private key before publishing) |
+
+## Temporary credential (ReAuth)
+
+| What | Where |
+|---|---|
+| Temp password for the Google ReAuth "Password challenge" | `<repo>/config/gPass.txt` — **gitignored** (`.gitignore:126`), so it never reaches the public repo. Read at run time; never in argv, never in env, never echoed |
+| Override path | env `TAKEOUT_GPASS` |
+| Handler | `tools/satisfy_login.py` — `--dry-run` reports form geometry and types nothing |
+| Extension switches | `autoCancelDownloads=false`, `autoRecapture=false`; flip with `tools/extension_switch.py` |
+
+> **The file is the secret. Never echo it.** The handler prints only the source path and the
+> character count. Use `--dry-run` to confirm the form is findable before typing anything.
+> If Google demands a second factor, `gPass.txt` cannot satisfy it — a human is required.
+> Set the file mode to `0600` (`chmod 600 config/gPass.txt`; the host dir is owned by the
+> container's uid 1000, so chmod it **inside** the container).

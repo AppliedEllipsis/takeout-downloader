@@ -52,7 +52,7 @@ JOB_STATUSES = (
     # orchestrator wrote its own status straight into the ledger and the two lists
     # had silently disagreed. No unit test could see it, because `run.py` was
     # written after them.
-    "pending", "scraping", "needs_reauth", "transferring",
+    "pending", "scraping", "minting", "needs_reauth", "transferring",
     "verifying", "moving", "incomplete", "complete",
     "expired_unrecoverable", "quota_exceeded", "failed",
 )

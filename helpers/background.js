@@ -885,22 +885,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ---------------------------------------------------------------------------
-// Auto-cancel Chrome's native Takeout download.
+// Optionally cancel Chrome's native Takeout download. DEFAULT: DO NOT CANCEL.
 // ---------------------------------------------------------------------------
-// When the user clicks "Download" on a part to make the cookie-bearing request
-// fire (so we can capture it), Chrome ALSO starts its own download of that
-// 50GB+ part into the container's disk. The manager downloads server-side, so
-// the browser copy is pure waste and was a contributor to the disk-full crash.
-// We cancel + erase it the instant it appears. Gated by a setting (default on);
-// matches the same final-host patterns we capture from.
+// History matters here, because the default was the opposite and it hurt.
+//
+// v2 had to stop Chrome from downloading a 50GB+ part into the container while
+// the manager pulled it server-side, and the cancel-by-default did that job. But
+// the listener cannot tell a human's click from the automation's mint navigate,
+// so it also cancelled every download a *person* asked for. The owner's workflow
+// depends on real browser downloads; asked twice, and on 2026-09-22 the default
+// was flipped to OFF.
+//
+// The cost of the new default is measured, not hand-waved: a mint ends at a
+// `Content-Disposition: attachment` response, so Chrome keeps downloading, and a
+// 68-part mint left **15.4 GB** in /config/Downloads (failure mode 1.22). Sweep it
+// with tools/sweep_downloads.py, which cancels through chrome.downloads so the
+// blocks are actually released — unlinking the file from a shell does NOT free
+// them while Chrome still holds the descriptor.
+//
+// `=== true` rather than `!== false`, deliberately: a missing or merge-omitted key
+// must mean "leave the human's download alone", not "cancel it".
 chrome.downloads.onCreated.addListener((item) => {
     try {
         const url = (item.finalUrl || item.url || '').toLowerCase();
         if (!url) return;
         if (!FINAL_HOST_PATTERNS.some(p => url.includes(p))) return;
         chrome.storage.local.get(['autoCancelDownloads'], (d) => {
-            // Default ON: only skip if explicitly disabled.
-            if (d.autoCancelDownloads === false) return;
+            // Default OFF: only cancel when explicitly enabled.
+            if (d.autoCancelDownloads !== true) return;
             chrome.downloads.cancel(item.id, () => {
                 // Remove the cancelled entry from the downloads shelf/list.
                 chrome.downloads.erase({ id: item.id }, () => {});

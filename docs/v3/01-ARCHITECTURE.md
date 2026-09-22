@@ -49,7 +49,7 @@ That is exactly what the one hand-finished 3.08 TB export did by hand. v3 automa
 │       daemon navigates the redirector│                                             │
 │                                         ▼                                          │
 │                             EXTENSION (helpers/, MV3)                              │
-│          • cancels the browser's stray native downloads (auto-cancel ON)           │
+│          • auto-cancel of native downloads is OFF (owner directive 2026-09-22)     │
 │       • autoRecapture OFF by default — the tab-flood spawner stays disabled        │
 │                                                                                    │
 │                              AUTOPILOT DAEMON (python)                             │
@@ -168,10 +168,10 @@ completion.
    in this project.
 2. **Capture the minted URL from CDP `Network` events** (`Network.requestWillBeSent`'s `redirectResponse`,
    plus the file-host `Network.responseReceived`). **Observe-only — nothing is aborted**, so nothing breaks.
-3. **Prevent the bytes, not the request.** Keep `autoCancelDownloads` **ON**. The extension cancels *and
-   erases* the stray download; measured, no entry remained in `chrome.downloads` at all. On a 50 GB part
-   the cancel lands long before completion, so the disk waste is bounded. (It still loses the race on a
-   261 KB file — irrelevant at real part sizes.)
+3. **Observe-only — nothing is aborted**, so nothing breaks. (Historically the extension's
+   `autoCancelDownloads` also cleaned up the stray native download the browser starts; **that switch is
+   now OFF by owner directive** and the stray download is left alone. It is not bounded by a cancel any
+   more — watch `/config/Downloads` on a large pull. See failure mode 1.22.)
 4. **Never abort a request to dodge the attempt.** That attempt is the price of the URL.
 
 **Why this is affordable:** a mint is **Δ1** and a `Range` resume is **Δ0**. A 5-attempt allowance buys

@@ -24,8 +24,11 @@ Three things were measured that shape the code:
    `302 -> /manage/archive/<id>?user=…&rapt=<fresh>&j=<id>` — no password
    demanded. Rebuilding the redirector with that fresh `rapt` is the second hop.
 
-The stray download the browser also starts is *not* this module's problem: the
-extension's auto-cancel handles it (failure mode 1.9 keeps that switch ON).
+The stray download the browser also starts is *not* this module's problem, but it
+is no longer disposed of for us: **`autoCancelDownloads` is OFF** (owner
+directive 2026-09-22 — the workflow depends on real browser downloads), so a mint
+leaves a real part-sized download running in `/config/Downloads`. It lands on the
+300 GB `cache_crypt` volume, not the 14 GB root disk. See failure mode 1.22.
 """
 from __future__ import annotations
 

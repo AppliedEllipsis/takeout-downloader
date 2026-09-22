@@ -20,7 +20,7 @@ Read directly from the running container and the live extension on 2026-09-19.
 | Page targets | **2** | was **314** at the flood peak |
 | Memory | 3.1 GiB / 7.6 GiB | was **0 → 4.7 GiB** while the flood ran |
 | `local.autoRecapture` | **`false`** | the tab-flood fix; now also the code default |
-| `local.autoCancelDownloads` | **`true`** | v3 needs the browser to cancel its own download |
+| `local.autoCancelDownloads` | **`false`** | flipped 2026-09-22 by owner directive — the workflow depends on real browser downloads. A mint therefore leaves a real part-sized download in `/config/Downloads` (on `cache_crypt`, 300 GB; not the 14 GB root disk). Reverse with `.recon/_cancel_off.py` + one edit. |
 | `chrome.storage.managed` | **empty `[]`** | proves the managed-policy `autoRecapture` was inert — nothing ever wrote it |
 | v2 manager `:8080` | HTTP 200 | alive; **all jobs `complete`**, none parked in `needs_cookie` |
 | webgui `:3000` | HTTP 200 | |

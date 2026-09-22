@@ -1237,3 +1237,193 @@ separate pass, detached, writing its report to `/config/v3-selftest/crc64.txt`
 The earlier structural check remains worth running separately: it answers "has the
 download finished and is the file whole" in seconds, whereas CRC answers "is the content
 correct" in ~22 minutes. Different questions, different instruments.
+
+---
+
+## 2026-09-22 — a temp credential supplied as a file; browser downloads un-cancelled; the 62-export mint unblocked
+
+**What changed.** Two owner directives, both acted on rather than argued with, then measured.
+
+### 1. `autoCancelDownloads` → **`false`**
+
+The extension cancelled *every* native download from the Takeout file host, so a human's own
+click was cancelled too. The owner said twice that the workflow depends on real browser
+downloads. Flipped live over CDP on the extension service worker and verified by re-reading the
+stored value **and** the listener's guard:
+
+```
+BEFORE: {"autoCancelDownloads":true,"autoRecapture":false}
+AFTER : {"autoCancelDownloads":false,"autoRecapture":false}
+GUARD  (listener will SKIP cancelling): True
+```
+
+The prior reasoning (`_recon/restore_cancel.py`) was not wrong, it was **scoped wrong**: browser
+bytes are waste for the *automated* path, and the listener cannot tell that path from a human's.
+
+**The measured consequence** (this is the part that had to be checked, not assumed): a mint
+navigate ends at a `Content-Disposition: attachment` response, so Chrome starts a real download
+that nobody cancels now. `/config/Downloads` during round 3:
+
+| t | files | size | free on `cache_crypt` |
+|---|---|---|---|
+| 20 s | 3 | 1 MB | 193,714 MB |
+| 100 s | 7 | 1,186 MB | 187,521 MB |
+| 140 s | 8 | 2,945 MB | 192,393 MB |
+
+Five `.crdownload` files alive at once, the largest at 823 MB and climbing — roughly **10 GB/min**
+while several mints are in flight. It lands on the 300 GB volume, not the 14 GB root disk.
+Recorded as failure mode **1.22**; the free-space readings fluctuate because rclone's VFS cache
+trims concurrently, so `df` alone is not a reliable budget signal here.
+
+### 2. The temp password, passed in as `gPass.txt`
+
+v3's stated design was "no stored credential". The owner pointed out a **temporary** password
+exists and asked for it to be used, delivered as a file. The file appeared at
+`<repo>/config/gPass.txt` (13 bytes, 12 chars). `config/` is at `.gitignore:126`, so it never
+reaches the public repo; chmod 600 had to be done **inside** the container because the host
+directory is owned by uid 1000.
+
+Wrote `tools/satisfy_login.py`:
+
+- reads the password **only** from a file (`$TAKEOUT_GPASS` → `/config/gPass.txt` →
+  `/work/gPass.txt` → `~/.takeout-gpass`) — never argv, never env, so it cannot surface in
+  `ps`, shell history, or this log;
+- **`--dry-run`** first, which located the form and typed nothing:
+  `hasPassword: true, hasButton: true, inputBox {x:817,y:299,w:356,h:52}, buttonBox {x:958,y:439}`;
+- types with CDP `Input.dispatchKeyEvent` per character (a `.value` assignment does not fire the
+  events Google's handler listens to), then re-reads the field **length** to confirm entry;
+- clicks submit with `Input.dispatchMouseEvent` — a *trusted* event, which is exactly why Google
+  accepts it as user-initiated. The same measurement explains why `location.href = …` only ever
+  produced a passive `ServiceLogin?passive=1209600`;
+- **one attempt, no retry** — a rejected password on a repeated challenge risks a lockout, and
+  that is not a risk to take automatically.
+
+Result — the challenge cleared and the archive page came back carrying `rapt`:
+
+```
+credential source: /config/gPass.txt (12 chars, value not shown)
+typed length now: 12 expected: 12
+submitted; waiting for the redirect chain ...
+RESULT: password step cleared:
+  {"url": "https://takeout.google.com/manage/archive/29462f3d-…", "stillPassword": false, "error": null}
+```
+
+And the page target then carried the token:
+`https://takeout.google.com/manage/archive/29462f3d-…?user=116943325794238708860&rapt…`
+
+### 3. The 62-product mint resumed
+
+Round 3 (`_recon/_mint62_round3.sh`), detached, skips the parts already earned at zero cost.
+Progress measured: **57 → 58 → 59 → 60 → 61 → 62 of 68** at 20 s intervals, attempts
+`kinds: [('mint', 62)]`.
+
+### Correction shipped in the same commit
+
+Four files asserted the old behaviour and would have been wrong from here on:
+`autopilot/mint.py` (its docstring said "the extension's auto-cancel handles it — failure mode
+1.9 keeps that switch ON"), `docs/v3/01-ARCHITECTURE.md` (twice), and `docs/v3/03-OPERATIONS.md`
+(recorded `autoCancelDownloads` as `true`). All four corrected.
+
+### New / changed files
+
+| Path | What |
+|---|---|
+| `tools/satisfy_login.py` | ReAuth handler; dry-run capable; file-sourced secret |
+| `tools/extension_switch.py` | Flips `autoCancelDownloads` / `autoRecapture` over CDP, prints the guards |
+| `.wiki/failure-modes-storage.md` | failure mode **1.22** |
+| `.recon/_cancel_off.py`, `_satisfy_login.py` | the scratch originals |
+| `.recon/_mint62_round3.sh`, `_status3.sh`, `_login_precheck.sh`, `_do_login.sh` | the drive scripts |
+
+---
+
+## 2026-09-22 — the 62-product export was never missing 28 parts (my measurement was wrong, and so was v2's)
+
+**The claim being tested.** Two sources agreed that this export was incomplete:
+v2's own job record (`job_id 20260922T050147-braincreation`, `status: error`,
+`last_error: "28 part(s) failed validation"`) and my own earlier survey, which reported
+**"40 of 68 parts on disk (33.06 GB), 28 missing"**.
+
+**Both are wrong.** Measured on disk, read-only:
+
+```
+ledger parts            : 68
+destination files       : 71
+EXACT (name + size)     : 68
+SIZE MISMATCH           : 0
+ABSENT                  : 0
+
+ledger expected total   : 126867340402 bytes (118.154 GB)
+destination total       : 126868242288 bytes (118.155 GB)
+difference              : +901886 bytes
+```
+
+The +901,886 is **exactly** the three non-part files in the directory:
+`takeout-20260919T043421Z-001.zip` (846,841) + `.manager_state.json` (35,511) +
+`manifest.json` (19,534) = **901,886**. The reconciliation is exact to the byte, which is
+the whole reason this number is trustworthy rather than merely plausible.
+
+**Why my measurement was wrong** — and this is the lesson, not the number: the scrape can
+only ever produce the placeholder filename `download` (it is the redirector's basename), and
+the real name is recorded **only after a part is minted**. My survey ran when 57 of 68 had
+been minted, so it compared 57 real names and 11 placeholders against a directory of real
+names and concluded 28 parts were absent. The placeholder name is a trap that has now caught
+me **twice** — the first time was reading `PartLink.filename` at scrape time and finding it
+empty. Any check written against part identity must run *after* minting, or key on the index.
+
+**This also resolves the `69 vs 68` off-by-one** flagged earlier and left open: Google's
+total of 126,868,187,243 includes `takeout-20260919T043421Z-001.zip`, which is not a part of
+this export (its timestamp is `043421Z`, thirty seconds before this export's `043451Z`). The
+ledger's 68 parts sum to 126,867,340,402; adding that stray file gives 126,868,187,243
+**exactly**. It is arithmetic, not a discrepancy.
+
+**What v2 was actually reporting.** Its validator rejected 28 parts while its own counters
+said `parts_done 69/69` and every byte was on disk. So the failure was in v2's *validation*,
+not in its downloading — consistent with everything measured about v2 in this rebuild, and a
+good argument for v3's rule that a validator's verdict is a claim to be checked against the
+bytes rather than a fact. v2's counter mismatch is recorded as unexplained rather than
+explained away; the disk contents are not in doubt.
+
+**Consequence: this export needs no transfer.** Todo #21 is void — not "deferred", void. The
+same holds for the 21-product export, measured exact at 4,326,106 + 357,203 = 4,683,309.
+
+### The stray downloads turned out to be verifiable duplicates
+
+The mint left **9 completed part files** (7.01 GB) in `/config/Downloads`. Each was checked
+three ways before anything was unlinked — stray size vs ledger `size_expected` vs the
+destination copy — and all nine matched on all three:
+
+```
+takeout-20260919T043451Z-1-001.zip   1062859210  1062859210  1062859210  exact duplicate -> safe
+takeout-20260919T043451Z-1-002.zip    975382069   975382069   975382069  exact duplicate -> safe
+... 7 more, all three columns identical
+safe to delete : 9 files, 7526581359 bytes (7.01 GB)
+left in place  : 2 files   (261 KB each, not ledger part names)
+```
+
+The three still-running downloads were cancelled first — **through `chrome.downloads`, not
+with `rm`**: Chrome holds those files open, and on Linux an unlinked-but-open file keeps its
+blocks until the last descriptor closes, so a shell delete would have freed nothing.
+
+Result: `/config/Downloads` 15,371 MB → **1 MB**, free space on `cache_crypt`
+182,663 MB → **198,353 MB**.
+
+### New tools
+
+| Path | What |
+|---|---|
+| `tools/sweep_downloads.py` | Reports / cancels in-progress browser downloads over CDP; report-only by default, `--apply` to act |
+| `tools/extension_switch.py` | Flips `autoCancelDownloads` / `autoRecapture`; prints the guards the code branches on |
+| `tools/satisfy_login.py` | The ReAuth handler (runbook 9) |
+| `.recon/_gap62b.py` | The strict name+size presence check that settled this |
+| `.recon/_crc_dir.py` | Generic detached CRC pass over a directory |
+
+### Also fixed in this commit
+
+- `run.py` wrote `transferring` unconditionally before the mint loop, so a `--mint-only` run
+  claimed to be transferring while it minted and moved nothing — measured on the real
+  62-product run: status `transferring`, 68 of 68 URLs earned, **zero bytes on the wire**.
+  Now `minting`. `"minting"` added to `JOB_STATUSES`; two tests assert the status *during* the
+  mint (the final status is `incomplete` either way, so only an in-flight read can tell them
+  apart) and that the vocabulary has not drifted.
+- `helpers/background.js`: the cancel listener's default is now OFF, keyed on `=== true`
+  rather than `!== false`, so a missing key leaves a human's download alone. Two tests.

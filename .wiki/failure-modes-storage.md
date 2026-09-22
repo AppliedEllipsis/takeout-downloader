@@ -308,3 +308,96 @@ allowance is 5 attempts per part. For a small export that safety net is worth it
 a 141 GB one it is not. The unlink happens only after a verified move, never before, and a
 failed unlink is reported on stderr without failing the part — the bytes are already safe in
 the archive.
+
+---
+
+## 1.22 — Stray browser download left running by a mint
+
+**Added 2026-09-22.** Attempt cost: **0** (the attempt was already spent by the mint).
+The cost is volume space and bandwidth, and it is invisible unless you look at
+`/config/Downloads`.
+
+### Symptom
+
+Free space on the archive volume falls while a `--mint-only` run is in progress, even
+though a mint-only run transfers nothing. `df` shows GBs disappearing; nothing in the
+ledger or staging directory accounts for it.
+
+### Cause
+
+A mint works by **navigating the browser** at the redirector, and the redirect chain ends
+at `takeout-download.usercontent.google.com/...zip` — a response Chrome classifies as a
+**download**, not a page. The navigation is abandoned but **the download is not**: Chrome
+keeps writing the part to its download directory for as long as the connection allows.
+
+That download used to be disposed of by the extension's `autoCancelDownloads` listener.
+On 2026-09-22 the owner directed that browser downloads must **not** be cancelled (the
+workflow depends on real downloads), so the listener is now off and nothing cleans up.
+
+### Measured
+
+During round 3 of the 62-product mint (`_mint62_round3.sh`, 2026-09-22 ~17:04 UTC):
+
+| t | files in `/config/Downloads` | size |
+|---|---|---|
+| 20 s | 3 | 1 MB |
+| 40 s | 4 | 65 MB |
+| ~2 min | 5 | 161 MB, with **two** live `.crdownload` files (115.5 MB and 31.6 MB) growing concurrently |
+
+Two mints in flight ⇒ two concurrent part-sized downloads. A mint **costs no extra
+attempt**, but it does cost the bytes.
+
+### Final measured total for that run
+
+A full 68-part mint left **15.4 GB across 14 files**: **9 that had completed** (7.01 GB —
+and all nine turned out to be exact duplicates of parts already in the archive) and 3 still
+running (two at ~3.7 GB, one at 139.9 KB). Peak growth was ~10 GB/min while several mints
+were in flight.
+
+### Blast radius
+
+`/config` is on the 300 GB `cache_crypt` (LUKS+xfs) volume, **not** the 14 GB root disk,
+so this is a space/bandwidth problem rather than a take-the-server-down problem — until
+a pull is large enough for the arithmetic in 1.21 to matter. Staging + VFS cache +
+stray downloads share that one 300 GB volume.
+
+### Recovery — measured, not assumed
+
+After clearing this run: `/config/Downloads` 15,371 MB → **1 MB**, free space on the volume
+182,663 MB → **198,353 MB**.
+
+1. **Cancel through `chrome.downloads`, not with `rm`:**
+
+   ```
+   python3 -B tools/sweep_downloads.py           # report; cancels nothing
+   python3 -B tools/sweep_downloads.py --apply   # cancel the in-progress ones
+   ```
+
+   A shell `rm` frees **nothing** while Chrome still holds the descriptor: Linux keeps the
+   blocks of an unlinked-but-open file until the last fd closes. The space only comes back
+   once Chrome itself cancels the download. The tool goes through the extension service
+   worker over CDP for exactly this reason, and it only ever touches `state ==
+   "in_progress"` entries — a *finished* download is left alone, because a finished download
+   might be something a human wanted.
+2. **Check completed strays before deleting them.** They are frequently real part files that
+   happen to duplicate the archive. Compare three ways — stray size vs the ledger's
+   `size_expected` vs the destination copy — and delete only exact matches. No match on all
+   three, no delete. (`.recon/_sweep_strays.py --delete` did this for the 62-export: 9 files
+   deleted, 2 left in place, with the reason printed for every one.)
+3. Deleting a stray costs **no attempt** — the allowance is spent by the mint, not the file.
+
+### Prevention (not yet implemented — flagged as a follow-up)
+
+The right fix is to scope the suppression to the **automation**, not the browser: either
+- `Browser.setDownloadBehavior {behavior: "deny"}` around each mint hop, restoring
+  `{behavior: "allow", downloadPath: "/config/Downloads"}` afterwards, or
+- cancel the stray download by GUID after the minted URL is captured.
+
+**Neither is measured yet.** Do not assume `deny` leaves the mint intact — an aborted
+request is known to prevent the mint (measured 2026-09-19), and a denied download is a
+form of abort. Measure on **one** part before baking it in. Until then, watch
+`/config/Downloads` on any large pull and sweep before transferring.
+
+**Cheaper mitigation already in place:** `--mint-only` runs are the only ones that produce
+strays (a transfer with a cached URL mints nothing), so sweep after a mint pass and before
+the transfer pass.

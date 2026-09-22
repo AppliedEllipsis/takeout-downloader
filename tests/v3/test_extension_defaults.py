@@ -81,3 +81,31 @@ def test_the_spawner_still_exists_rather_than_being_silently_deleted():
     src = _src()
     assert "triggerRecapture" in src
     assert "RECAPTURE_ALARM" in src
+
+
+def test_the_download_cancel_default_is_off():
+    """The cancel listener must not fire unless someone explicitly turned it on.
+
+    Owner directive 2026-09-22: the workflow depends on real browser downloads, and
+    the listener cannot distinguish a human's click from the automation's mint
+    navigate — so it cancelled the human's too. A `=== false` early-return (the old
+    form) means a missing key CANCELS, which is exactly backwards now.
+    """
+    src = _src()
+    m = re.search(r"if \(d\.autoCancelDownloads ([^)]*)\) return;", src)
+    assert m, "could not find the autoCancelDownloads guard"
+    assert m.group(1).strip() == "!== true", (
+        "the cancel listener must require an explicit `true`; got "
+        f"`{m.group(1).strip()}`, which lets a missing value cancel a human's download")
+
+
+def test_the_cancel_listener_no_longer_claims_a_default_on():
+    """The comment above the listener is what the next reader trusts. It used to
+    say 'Gated by a setting (default on)'. A stale rationale is how a reversed
+    default gets re-reversed."""
+    src = _src()
+    idx = src.index("chrome.downloads.onCreated.addListener")
+    preamble = src[max(0, idx - 2200):idx]
+    assert "default on" not in preamble.lower(), (
+        "the cancel listener's preamble still claims a default-on setting")
+    assert "default: do not cancel" in preamble.lower()

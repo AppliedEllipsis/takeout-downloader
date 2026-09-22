@@ -279,3 +279,87 @@ ssh takeout-server 'docker exec takeout-webgui sh -c "DISPLAY=:1 xdotool getacti
 **Design consequence for ReAuth:** `xdotool` can type the password step, so the human burden drops from
 *"open the webgui and type a password"* to *"approve a prompt"* — with SMS/prompt 2FA the second factor
 still needs the owner's phone. Worth weighing before implementing the re-auth path.
+
+---
+
+## 9. Unblock a `needs_reauth` run (the "Password challenge")
+
+**Symptom.** `autopilot run --mint-only` exits with
+`error: ReAuth required (hit https://accounts.google.com/ServiceLogin?passive=1209600&continue=…)`
+and the job status is `needs_reauth`. Nothing is wrong with the code: Google is refusing to mint
+without a fresh interactive proof.
+
+**Why it cannot be automated away entirely.** `passive=1209600` is a *passive* check with no UI.
+Google raises the **interactive** challenge only for *user-initiated* navigation. A CDP
+`Input.dispatchMouseEvent` / `dispatchKeyEvent` is trusted, so it counts as user-initiated;
+`location.href = …` from page JS does not. That is the whole trick.
+
+### Put the password where the handler can read it (once)
+
+```bash
+# on the workstation: the file already exists on the server at <repo>/config/gPass.txt
+ssh takeout-server 'ls -la /opt/local_cache_crypt/_projects/takeout-downloader/config/gPass.txt'
+```
+
+`config/` is gitignored (`.gitignore:126`) so the secret cannot be committed. The host directory
+is owned by the container's uid 1000, so **chmod it inside the container**, not on the host:
+
+```bash
+ssh takeout-server 'docker exec takeout-webgui chmod 600 /config/gPass.txt'
+```
+
+### Get the handler into the container
+
+The host `config/` is not writable by `scp` (uid mismatch), so stage and `docker cp`:
+
+```bash
+R=/opt/local_cache_crypt/_projects/takeout-downloader
+scp tools/satisfy_login.py takeout-server:/tmp/satisfy_login.py
+ssh takeout-server "docker cp /tmp/satisfy_login.py takeout-webgui:/config/satisfy_login.py"
+```
+
+### Always dry-run first — it types nothing
+
+```bash
+ssh takeout-server 'docker exec takeout-webgui python3 -B /config/satisfy_login.py --dry-run'
+```
+
+Expect `hasPassword: true`, `hasButton: true`, and a non-zero box for each. If
+`hasPassword` is false there is nothing to satisfy and the script exits 0.
+
+### Submit
+
+```bash
+ssh takeout-server 'docker exec takeout-webgui python3 -B /config/satisfy_login.py'
+```
+
+Exit codes: `0` satisfied or nothing to do · `2` form not found / button missing · `3`
+`gPass.txt` missing or empty · `4` **password rejected** (also: no error text but the step did
+not clear). There is **no retry** on purpose — a rejected password on a repeated challenge can
+escalate to a lockout.
+
+### Confirm, then resume
+
+```bash
+# the archive page must now carry rapt
+ssh takeout-server 'docker exec takeout-webgui python3 -c "
+import json, re, urllib.request
+for x in json.load(urllib.request.urlopen(\"http://127.0.0.1:9222/json/list\")):
+    if x.get(\"type\") == \"page\":
+        print(re.sub(r\"(rapt=)[^&]+\", r\"\1<R>\", x.get(\"url\", \"\"))[:110])
+"'
+
+# then re-run the SAME mint command — already-earned URLs are skipped at zero cost
+bash .recon/_resume_mint62.sh
+```
+
+**Gotchas.**
+
+- **2FA wins.** If Google demands a second factor, no file can satisfy it. A human is required.
+- **The password is only part of it.** `rapt` gates **minting**, not transferring. A run whose
+  every part is already minted does not need it — `page_from_ledger()` rebuilds the page from the
+  ledger so the transfer can proceed offline.
+- **Never echo the file.** The handler prints the source path and character count only.
+- **Watch the stray downloads.** With `autoCancelDownloads` OFF (the standing state) every mint
+  leaves a real browser download running — failure mode 1.22. Sweep `config/Downloads/*.crdownload`
+  before starting a transfer.

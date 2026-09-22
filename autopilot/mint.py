@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
 from .cdp import CdpSession
@@ -331,6 +331,83 @@ def _redact(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The stray download a mint leaves behind
+# ---------------------------------------------------------------------------
+# Measured 2026-09-22. A mint navigate ends at a `Content-Disposition: attachment`
+# response, so Chrome starts a REAL download of the part. With the extension's
+# `autoCancelDownloads` OFF (owner directive — the workflow depends on real browser
+# downloads), nothing else cleans it up: a 68-part mint left **15.4 GB** in
+# `/config/Downloads`. At the 500 GB-2 TB scale this project is now aimed at, that is
+# not survivable against ~198 GB free on the staging volume. Failure mode 1.22.
+#
+# This cancels the download AFTER the minted URL is captured. It deliberately does NOT
+# deny downloads up front: aborting a request is measured to PREVENT the mint, and a
+# denied download is a form of abort. Cancelling afterwards cannot affect the mint,
+# because the value we came for is already in hand.
+#
+# Measured end to end: a 9.88 GB part was 581,397,203 bytes into its download when
+# `Browser.cancelDownload(guid)` was called. The progress state went to `canceled`, the
+# partial file disappeared, and the byte count and free space returned EXACTLY to their
+# pre-download values. Nothing was left to sweep.
+
+#: Emitted for a download the browser starts on its own — the handle we need.
+DOWNLOAD_BEGIN_EVENT = "Browser.downloadWillBegin"
+
+
+async def _enable_download_events(session: CdpSession) -> bool:
+    """Ask for download events, changing nothing else.
+
+    `behavior: "default"` is the whole point: it leaves the browser's own download
+    destination and prompting exactly as they are, so a download a HUMAN started is
+    untouched. We only want the events. Returns False rather than raising if the
+    browser refuses — losing this is a hygiene failure, not a mint failure.
+    """
+    try:
+        await session.call("Browser.setDownloadBehavior",
+                           {"behavior": "default", "eventsEnabled": True}, timeout=15.0)
+        return True
+    except Exception:
+        return False
+
+
+def _stray_download_guids(events: Iterable[tuple]) -> List[str]:
+    """The `guid` of every download that began inside `events`."""
+    return [p["guid"] for m, p in events
+            if m == DOWNLOAD_BEGIN_EVENT and p.get("guid")]
+
+
+async def _cancel_stray_downloads(session: CdpSession, guids: Iterable[str]) -> int:
+    """Cancel each download. Never raises.
+
+    A cancel that fails must not fail the mint: the minted URL is already captured and
+    is what the caller asked for. The worst outcome here is a stray file, which
+    `tools/sweep_downloads.py` clears afterwards.
+    """
+    cancelled = 0
+    for guid in guids:
+        try:
+            await session.call("Browser.cancelDownload", {"guid": guid}, timeout=15.0)
+            cancelled += 1
+        except Exception:
+            pass
+    return cancelled
+
+
+async def _leave(session: CdpSession, restore_url: Optional[str],
+                 strays: List[str]) -> None:
+    """Every exit path from `mint()` goes through here.
+
+    Cancel this mint's stray downloads FIRST, then restore the tab. All six exits used
+    to call `_restore` alone, so a mint that stopped on a challenge, a quota refusal or
+    an unrecognisable chain left its download running — and the download does not care
+    why the mint stopped.
+    """
+    await _cancel_stray_downloads(session, strays)
+    strays.clear()
+    await _restore(session, restore_url)
+
+
+# ---------------------------------------------------------------------------
 # The mint
 # ---------------------------------------------------------------------------
 async def mint(
@@ -355,10 +432,20 @@ async def mint(
 
     **Never aborts a request.** See the module docstring — aborting breaks the
     mint, so this function only navigates and observes.
+
+    **Cancels the stray download it starts.** The navigate also makes Chrome download
+    the part for real; `_leave` cancels that download on every exit path, after the
+    URL is captured. See the module docstring and failure mode 1.22.
     """
     await session.call("Network.enable")
 
+    # Ask for download events BEFORE navigating, since the navigate we are about to
+    # make is what starts the download. `guid` is the only handle that addresses
+    # exactly that download rather than downloads in general.
+    events_enabled = await _enable_download_events(session)
+
     chain: list[Redirect] = []
+    strays: List[str] = []
     current = redirector
     refreshed = False
 
@@ -376,12 +463,19 @@ async def mint(
         redirects = extract_redirects(observed)
         chain.extend(redirects)
 
+        # The navigation that mints ALSO starts a real browser download of the part
+        # (measured). Record its guid so it can be cancelled as soon as the URL is
+        # captured — never before, because aborting a request is measured to PREVENT
+        # the mint. `_leave` cancels these on all six exit paths.
+        if events_enabled:
+            strays.extend(_stray_download_guids(observed))
+
         # 1. Did we reach the file host?
         for r in redirects:
             if FILE_HOST in r.location:
                 result = MintResult(url=r.location, redirector=redirector, hops=hop,
                                     chain=chain, refreshed_rapt=refreshed)
-                await _restore(session, restore_url)
+                await _leave(session, restore_url, strays)
                 return result
         # Only a 2xx from the file host counts as a mint. A file host answering
         # `302 -> accounts.google.com` is NOT a successful mint, and treating it as
@@ -390,7 +484,7 @@ async def mint(
         for url, _status in file_host_hits(observed):
             result = MintResult(url=url, redirector=redirector, hops=hop,
                                 chain=chain, refreshed_rapt=refreshed)
-            await _restore(session, restore_url)
+            await _leave(session, restore_url, strays)
             return result
 
         # 2. Did Google demand ReAuth?
@@ -407,7 +501,7 @@ async def mint(
                 # challenge, a quota refusal or an unrecognisable chain left the tab
                 # sitting on a sign-in page, which is exactly where the NEXT run's
                 # `recover_rapt_url` cannot find a token.
-                await _restore(session, restore_url)
+                await _leave(session, restore_url, strays)
                 raise NeedsReauth(r.location)
 
         # 2b. Did Google refuse because the export's download allowance is spent?
@@ -424,7 +518,7 @@ async def mint(
         # limit — reporting a hop-limit error that names the wrong cause.
         for r in redirects:
             if QUOTA_FLAG in (r.location or ""):
-                await _restore(session, restore_url)
+                await _leave(session, restore_url, strays)
                 raise QuotaExceeded(r.location, "Google sent quotaExceeded=true")
 
         # 3. Did the redirector hand us a refreshed rapt to retry with?
@@ -475,10 +569,10 @@ async def mint(
             reason = "no file-host URL, no ReAuth demand, and no archive-page bounce"
         # Restore before raising, for the same reason as the branches above: the tab
         # must not be left mid-chain for the next run to inherit.
-        await _restore(session, restore_url)
+        await _leave(session, restore_url, strays)
         raise MintError(f"{reason}; saw {seen} | looking for file host {FILE_HOST!r}")
 
-    await _restore(session, restore_url)
+    await _leave(session, restore_url, strays)
     raise HopLimitExceeded(
         f"still bouncing after {max_hops} hops; last redirector={_redact(current)}"
     )

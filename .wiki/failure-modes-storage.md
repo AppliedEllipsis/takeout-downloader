@@ -401,3 +401,61 @@ form of abort. Measure on **one** part before baking it in. Until then, watch
 **Cheaper mitigation already in place:** `--mint-only` runs are the only ones that produce
 strays (a transfer with a cached URL mints nothing), so sweep after a mint pass and before
 the transfer pass.
+
+---
+
+## 1.24 — A truncated part that every size check passes
+
+**Found 2026-09-22**, in `2026-06-23-03-59-47` (the June archive). Three parts totalling
+**119.4 GB** are unreadable and **cannot be re-downloaded** — that export's links expired
+about June 30.
+
+### Symptom
+
+`zipfile.ZipFile()` raises `BadZipFile: File is not a zip file` on a file that plainly
+starts with a zip local file header. Nothing else complains: the file exists, its size is
+plausible, and the mtime looks like every other part in the directory.
+
+### Cause — a download that stopped mid-member
+
+| | |
+|---|---|
+| `takeout-20260623T035947Z-13-003.zip` | 53,500,444,672 (49.83 GB) |
+| `takeout-20260623T035947Z-13-005.zip` | 41,701,867,520 (38.84 GB) |
+| `takeout-20260623T035947Z-13-006.zip` | 32,986,103,808 (30.72 GB) |
+
+All three: first four bytes `PK\x03\x04`, local file header intact, flags `0x0808`
+(streamed — bit 3 set, so member sizes live in a trailing data descriptor), and **no
+`PK\x07\x08` data descriptor, no central directory, no EOCD anywhere in the last 64 KB**.
+A streamed zip must end with all three. They end mid-member.
+
+Their mtimes — `00:16:18`, `00:23:20`, `00:27:45` — interleave with parts that completed
+(`00:23:13`, `00:27:27`). That is a parallel download run being interrupted repeatedly,
+consistent with the known disk-full and restart history of 2026-06-27/28.
+
+### The trap: the check that would have caught it is not the check anyone runs
+
+A **size** check passes (nothing to compare against — the export's page is gone).
+A **name/content sniff** passes, because the local header is intact. Only asking the
+archive to *list itself* fails, and only `zipfile` — or a tool that opens the central
+directory — does that.
+
+**My own first sweep fell into exactly this.** `_sniff_all.py` reads the first 512 bytes
+and reported *"NAME/CONTENT MISMATCHES: none — every part is the type its name claims"*,
+which was true and useless. The three broken parts were already known from an earlier
+scrape, and the fresh check did not reproduce them. A check that reports all-clear on a
+known-bad input is worse than no check, because it retires the question.
+
+### Recovery
+
+None. The export expired. The lesson is the only asset.
+
+### Prevention
+
+- **Every zip gets an EOCD/central-directory check**, not just the ones being CRC'd. One
+  `tail_scan` per file is enough and costs nothing next to the CRC pass.
+- **A completeness verdict must open the container**, not stat it. `.recon/_forensics_june.py`
+  is the reference implementation.
+- **Verify while the export is still downloadable.** The June set was pulled on the 27th and
+  "completed" on the 28th; by the time anything checked it properly, the only remedy was
+  gone. This is the whole argument for verifying a pull before its own expiry window closes.

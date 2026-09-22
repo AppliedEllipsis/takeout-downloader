@@ -1561,3 +1561,95 @@ Surveyed read-only (`_recon/_survey_all.py`), cross-checked against disk by exac
   re-mint hit the expired window, so the ledger reads 67/68 minted. Harmless — the export is
   complete and CRC-verified on disk, and the URL is only needed to transfer — but it should be
   restored on the next sign-in.
+
+---
+
+## 2026-09-22 — verifying the Sep 19 set for a delete decision: three real defects, one unrecoverable loss
+
+The owner's decision was "no new export — the Sep 19 set is enough", sequenced as "nothing is
+deleted until it is verified". That makes **verification the deliverable**, so the standard was
+raised from "sizes match" to "every file is the thing it claims to be". Raising it found four
+things.
+
+### 1. Three parts of the June archive are truncated, and they are unrecoverable
+
+`2026-06-23-03-59-47` holds 119.4 GB in three parts that `zipfile` refuses:
+`-13-003` (49.83 GB), `-13-005` (38.84 GB), `-13-006` (30.72 GB). Each has an intact local file
+header (`PK\x03\x04`, flags `0x0808` = streamed) and **no data descriptor, no central
+directory, no EOCD**. A streamed zip must end with all three; these end mid-member.
+
+Mtimes `00:16:18 / 00:23:20 / 00:27:45` interleave with parts that completed
+(`00:23:13 / 00:27:27`) — a parallel run interrupted repeatedly, matching the known
+disk-full period of 2026-06-27/28. **That export expired around June 30, so this is not
+re-downloadable.** All three begin in `Takeout/Google Photos/`, and this is the only archive on
+disk holding Google Photos as proper folders. Failure mode **1.24**.
+
+**My own first check missed it.** `_sniff_all.py` reads the first 512 bytes and printed
+*"NAME/CONTENT MISMATCHES: none — every part is the type its name claims"* — true, and useless,
+because a truncated zip has an intact header. It reported all-clear on input that was already
+known bad, which is worse than reporting nothing: it retires the question.
+
+### 2. A re-scrape destroyed 25 real filenames
+
+One `--mint-only` run whose mint failed blanked **25 of the 62-export's 68 filenames** to the
+placeholder `download`. Cause: `looks_like_part_filename` was a regex matching only
+`takeout-<stamp>-N-NNN.zip`, and it gated the preserve-the-name check against the *stored*
+value — so a real `Louie 2018-057.mp4` did not look "real", the guard did not fire, and the
+placeholder overwrote it. Correct for zips, destructive for everything else, under a comment
+claiming the opposite. Failure mode **1.25**.
+
+Repaired 25/25 with `tools/repair_part_filenames.py`, which derives each name from the part's
+`minted_url` and writes it only when it matches a real file at the exact expected size. Backup
+taken. The fix is `carries_part_identity` applied to the **incoming** value, plus 26 tests
+including a source-level one, because a bug that *reads* like a guard keeps passing tests that
+only exercise zips.
+
+### 3. The report called a complete archive BLOCKED
+
+```
+**Verdict: BLOCKED — re-authentication required (0/68 held)**
+- parts: **0/68** (0%)   - bytes on disk: 0 of 126867340402 expected
+```
+
+on an archive that was complete and CRC-verified. The report only ever looked at this ledger's
+`status`/`size_on_disk`; v2 did the downloading, so this ledger had nothing. Failure mode
+**1.26**. `build_report(present=...)` fixes it, `parts_in_archive` keeps "already here"
+distinct from "we fetched it", a size mismatch stays a warning, and a placeholder name can never
+verify against the archive.
+
+A second instance of the same fault: the 64-export read **18/19, 13.58 GB "short"** because its
+ledger holds `All%20mail%20Including%20Spam%20and%20Trash-002.mbox` from before the decoding fix
+while the file on disk is decoded. `ledger.filename_aliases` makes both spellings name the same
+part, and both the report and the repair tool now use that one function.
+
+### Verified state, both exports at exact byte parity
+
+| export | products | parts | bytes | zips CRC |
+|---|---|---|---|---|
+| `da982753` (`2026-09-19-04-27-12`) | 64 | **19/19** | 141,278,352,495 of 141,278,352,495 | 18/18 clean |
+| `29462f3d` (`2026-09-19-04-34-51`) | 62 | **68/68** | 126,867,340,402 of 126,867,340,402 | 41/41 clean |
+
+### Coverage — what is where, for the delete decision
+
+51 distinct Google products across the archives. Two are worth naming:
+
+- **Google Drive appears in ONE archive** — `2026-09-19-04-27-12` (the 64-product export).
+- **Google Photos** appears as folders in the June archive (three parts of which are truncated)
+  and as **28 standalone `.mp4` parts** in the 62-product export, which are complete and
+  size-verified. The folder listing does not show Photos for that export because Google served
+  it as loose video files rather than inside an archive.
+
+The seventh export, named for 65 products, **FAILED on Google's side with zero parts** — the
+one covering the most products holds nothing.
+
+### Tools added
+
+| Path | What |
+|---|---|
+| `tools/repair_part_filenames.py` | Derives real names from minted URLs; writes only on an exact size match; `--apply` to act |
+| `.recon/_sniff_all.py` | Name-vs-content sniff (with the 512-byte blind spot documented) |
+| `.recon/_forensics_june.py` | The EOCD/central-directory check that actually finds a truncated part |
+| `.recon/_coverage.py` | Reads the central directory of every zip to list the products each archive covers |
+| `.recon/_why_18of19.py` | Names the unreachable part instead of guessing |
+
+325 tests pass, was 271 at the start of this stretch.

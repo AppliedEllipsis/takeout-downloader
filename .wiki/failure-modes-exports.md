@@ -492,3 +492,84 @@ that produced the error.
 - v3 records the real filename at mint time (`ledger.set_part_filename`) and verifies size for
   every part, so this class cannot recur there. It is keeping the v2 validator's message as
   *evidence* that needs a second opinion, not as a verdict.
+
+---
+
+## 1.25 — A re-scrape destroyed real part filenames
+
+**Found 2026-09-22 on the live 62-product export.** One `--mint-only` run whose mint failed
+re-scraped the archive page and blanked **25 of 68 filenames**, replacing each with the
+placeholder `download`. The disk was untouched; the ledger was damaged. Since the ledger is
+what identifies parts, completeness reporting went blind — and an earlier all-clear
+("68/68 exact by name and size") had been true minutes before.
+
+### Cause — a guard that did the opposite of its comment
+
+```python
+PART_FILENAME_RE = re.compile(r"^takeout-\d{8}T\d{6}Z-\d+-\d+\.zip$", re.I)
+if looks_like_part_filename(current) and not looks_like_part_filename(incoming):
+    incoming = current          # keep the recorded name
+```
+
+The predicate only ever matches **`.zip`** names. A part whose real name was
+`Louie 2018-057.mp4` failed the test, so the guard did not fire and the placeholder
+overwrote it. **Correct for zips, actively destructive for everything else**, under a
+comment promising that recorded names were safe.
+
+### Recovery
+
+The names are recoverable, because the ledger still holds each part's `minted_url` and that
+URL ends in the real name. `tools/repair_part_filenames.py` derives the name and writes it
+**only** when it matches a real file in the destination at the exact expected size — 25/25
+recovered, 0 written on trust. Backup taken first.
+
+### Prevention
+
+- The rule is about the **incoming** value, not the stored one: a placeholder must never
+  displace a stored name, whatever shape it has. `carries_part_identity` replaces the regex.
+  Google serves `.zip`, `.mp4` and `.mbox` today; the next export type will be something
+  else, so the rule cannot be a list of observed shapes.
+- Pinned by 26 tests, including a **source-level** one, because the bug *read* like a guard
+  and a behavioural test on zips alone kept passing.
+
+---
+
+## 1.26 — A complete archive reported as BLOCKED 0/N
+
+**Found 2026-09-22.** The 62-product archive was complete and CRC-verified on disk —
+68/68 parts, 126,868,242,288 bytes, all 41 zips CRC-clean — and the report said:
+
+```
+**Verdict: BLOCKED — re-authentication required (0/68 held)**
+- parts: **0/68** (0%)
+- bytes on disk: 0 of 126867340402 expected
+```
+
+### Cause
+
+The report judged completeness from **this ledger's own bookkeeping** (`status`,
+`size_on_disk`). v2 had done the downloading, so this ledger had transferred nothing, and
+its rows legitimately said `pending` with zero bytes. Every line of the output is wrong for
+the question being asked, and the decision it feeds is *delete or not*.
+
+A second, smaller version of the same fault: the 64-product export reported **18/19,
+13.58 GB "short"** because the ledger held the still-percent-encoded `.mbox` name from
+before the decoding fix, so the name match failed. Nothing was missing; the file is on disk
+at exactly 13,582,799,406 bytes.
+
+### Recovery
+
+`build_report(present=index_destination(archive_dir))`; the `report` CLI gained
+`--archive-dir`. Both live exports then read `COMPLETE` at exact byte parity.
+
+### Prevention
+
+- **A completeness verdict must consult the destination**, not only the tool's own records.
+- Two claims must stay separate: `parts_in_archive` is reported separately from
+  `parts_done`, because "it was already here" is not "we downloaded it".
+- **A size mismatch is never a pass.** "A file of that name exists" is not "the file is
+  correct" — this is the check that catches 1.24's truncated parts instead of counting them.
+- A **placeholder name can never verify against the archive**; the lookup is gated on
+  `carries_part_identity`.
+- Percent-encoded and decoded spellings of a name are **the same part**
+  (`ledger.filename_aliases`). The alias says "same name", never "same bytes".

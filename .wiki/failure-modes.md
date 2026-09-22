@@ -289,3 +289,7 @@ each one needs a fresh **mint** (**Δ1**) to resume — the bytes already on dis
 4. **Keep the daemon out of the browser container if possible**, or account for the shared ceiling.
 
 | 1.23 | ZIP-only validator declares a complete mixed-format export broken | **0** — but invites a needless re-pull | [failure-modes-exports.md](failure-modes-exports.md) |
+
+| 1.24 | A truncated part that every size check passes | **0** — but the bytes are unrecoverable | [failure-modes-storage.md](failure-modes-storage.md) |
+| 1.25 | A re-scrape destroyed real part filenames | **0** — but completeness reporting went blind | [failure-modes-exports.md](failure-modes-exports.md) |
+| 1.26 | A complete archive reported as BLOCKED 0/N | **0** — but it feeds a delete decision | [failure-modes-exports.md](failure-modes-exports.md) |

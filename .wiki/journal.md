@@ -1202,3 +1202,38 @@ docker exec takeout-webgui python3 /tmp/_v64f.py
 
 **261 tests pass, 6 skipped.** Defects 1 and 2 are fixed, tested and deployed.
 `20b5d61` on `feat/takeout-autopilot`, pushed to `origin` and `server-final`.
+
+
+### CRC verification of the 64-product backup — PASSED, all 18 zips
+
+The byte-count and EOCD checks established that every part was present and structurally
+whole, but explicitly did **not** verify content. That gap is now closed:
+
+```
+[1/18]  takeout-20260919T042712Z-1-001.zip   OK  (27.1s,  98 MB/s)  ok, 756 members
+[2/18]  takeout-20260919T042712Z-2-001.zip   OK  ( 7.8s, 104 MB/s)  ok, 459 members
+...
+total 22.6 minutes for 18 zips
+RESULT: ALL ZIPS CRC-VERIFIED
+```
+
+**18 zips OK, 0 failures, 0 corrupt members.** 127 GB read from JuiceFS at ~94 MB/s.
+
+`zipfile.testzip()` decodes every compressed member and checks its CRC — the strongest
+check available short of extracting everything and diffing it. Run as a deliberate
+separate pass, detached, writing its report to `/config/v3-selftest/crc64.txt`
+(copied to `.recon/crc64_result.txt`).
+
+**Two mistakes made and corrected while getting this check right**, both worth keeping:
+
+1. The first attempt used `testzip()` inline and timed out at 600 s. It reads **every
+   byte** — ~22 minutes for 127 GB here — so it belongs in a detached pass with a report
+   file, never in a foreground command expecting a quick answer.
+2. The first *screenshot* attempt piped `xwd` into `tools/xwd_to_png.py` via stdin. The
+   tool takes `src` and `dst` **paths**, so it wrote nothing and the "screenshot" was a
+   126-byte file containing its own printed output. `xwd -out FILE` then two path
+   arguments is the correct invocation.
+
+The earlier structural check remains worth running separately: it answers "has the
+download finished and is the file whole" in seconds, whereas CRC answers "is the content
+correct" in ~22 minutes. Different questions, different instruments.

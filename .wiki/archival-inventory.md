@@ -140,3 +140,22 @@ everything visible through the mount is already in the remote.
   produced truncated archives before.
 
 The 3 previously-identified truncated parts elsewhere in this account remain unopenable.
+
+
+## CRC verification — PASSED 2026-09-21
+
+The completeness claim above was upgraded from structural to **content-verified**:
+
+| check | result |
+|---|---|
+| exact byte count, all 19 parts | 19/19 — 141,278,352,495 of 141,278,352,495 |
+| nothing still being written | yes (20 s no-growth window) |
+| zip end-of-archive record, all 18 zips | 18/18 present |
+| **CRC of every compressed member, all 18 zips** | **18/18 OK, 0 corrupt, 0 failures** |
+| mbox head/tail | valid (`From … X-GM-THRID`, clean MIME terminator) |
+
+22.6 minutes, ~94 MB/s. Evidence: `.recon/crc64_result.txt`.
+
+**The 64-product full backup is complete and independently verified.** Note that v2's own
+manager UI displayed this job with an **Error** badge — that is v2's bookkeeping, not a data
+problem, and the badges should not be trusted as the completeness oracle.

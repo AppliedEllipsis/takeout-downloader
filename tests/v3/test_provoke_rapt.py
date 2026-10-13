@@ -89,15 +89,56 @@ def test_a_rapt_on_the_accounts_host_is_not_accepted():
     assert asyncio.run(provoke_rapt(s, REDIRECTOR)) is None
 
 
-def test_run_once_actually_provokes_before_giving_up():
-    """Source-level, because the whole point is that the orchestrator TRIES. A guard
-    that is present but never called has bitten this project repeatedly."""
-    import inspect
+def test_run_once_refuses_an_untokened_page_without_probe_or_mint(tmp_path, monkeypatch):
+    """An absent page token is a hard safety boundary, not an invitation to probe.
+
+    The redirector probe can start an unmanaged browser download.  The orchestrator
+    must report ``needs_reauth`` without navigating that redirector or minting a URL.
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
 
     import autopilot.run as run_mod
+    import autopilot.scrape as scrape_mod
+    from autopilot.scrape import ArchivePage, PartLink
+    from autopilot.run import RunConfig
 
-    src = inspect.getsource(run_mod.run_once)
-    assert "provoke_rapt(" in src, "run_once must try to earn a token"
-    provoke_at = src.index("provoke_rapt(")
-    giveup_at = src.index('"needs_reauth",\n                    error="archive page served')
-    assert provoke_at < giveup_at, "it must provoke BEFORE reporting needs_reauth"
+    archive = "f9a17be0-65e2-4b1f-a9c6-04c840204419"
+    work_url = f"https://takeout.google.com/manage/archive/{archive}"
+    redirector = f"https://takeout.google.com/takeout/download?j={archive}&i=0&user=116943325794238708860"
+    page = ArchivePage(
+        url=work_url,
+        parts=[PartLink(index=0, raw_uri=redirector, redirector=redirector,
+                        archive_id=archive, user="116943325794238708860",
+                        has_rapt=False, size="1",
+                        filename="takeout-20260919T000000Z-1-001.zip")],
+        part_of_N=[1],
+    )
+    session = FakeSession(work_url)
+
+    @asynccontextmanager
+    async def factory():
+        yield session
+
+    async def fake_read(*_args, **_kwargs):
+        return page
+
+    async def unsafe_probe(*_args, **_kwargs):
+        raise AssertionError("unsafe redirector probe was attempted")
+
+    async def unsafe_mint(*_args, **_kwargs):
+        raise AssertionError("mint was attempted without a page token")
+
+    monkeypatch.setattr(run_mod, "read_archive", fake_read)
+    monkeypatch.setattr(scrape_mod, "provoke_rapt", unsafe_probe)
+    monkeypatch.setattr(run_mod, "mint_part", unsafe_mint)
+    cfg = RunConfig(archive_id=archive, ledger_path=str(tmp_path / "ledger.db"),
+                    staging_dir=str(tmp_path / "staging"),
+                    archive_dir=str(tmp_path / "archive"), require_mount=False,
+                    work_url=work_url, settle=0)
+
+    outcome = asyncio.run(run_mod.run_once(cfg, session_factory=factory,
+                                           http_client=object()))
+
+    assert outcome.status == "needs_reauth"
+    assert session.navigated() == [], "no browser navigation is safe for this guard"

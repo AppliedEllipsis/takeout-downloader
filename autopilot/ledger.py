@@ -72,6 +72,25 @@ class AttemptKind:
 PLACEHOLDER_PART_NAMES = frozenset({"download", "download.zip"})
 
 
+def safe_filename(name: str) -> bool:
+    """A portable single component, including after repeated percent decoding."""
+    from urllib.parse import unquote
+    import re
+    if not isinstance(name, str) or not name or name != name.strip():
+        return False
+    for _ in range(8):
+        if (name in (".", "..") or name.endswith((".", " "))
+                or any(ord(c) < 32 or ord(c) == 127 for c in name)
+                or any(c in name for c in '/\\:<>"|?*')
+                or re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", name, re.I)):
+            return False
+        decoded = unquote(name)
+        if decoded == name:
+            return True
+        name = decoded
+    return False
+
+
 def carries_part_identity(name: str) -> bool:
     """Whether a filename carries part identity rather than being a placeholder.
 
@@ -262,6 +281,9 @@ class PartRow:
     status: str
     minted_url: Optional[str]
     attempts: int
+    sha256: Optional[str] = None
+    remote_path: Optional[str] = None
+    remote_verified_at: Optional[str] = None
 
 
 def _now() -> str:
@@ -277,6 +299,15 @@ def open_ledger(path: str, mounts: Optional[Iterable[tuple[str, str]]] = None) -
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    # Additive migrations: older databases retain all URLs and progress.
+    for table, columns in {
+        "parts": {"sha256": "TEXT", "remote_path": "TEXT", "remote_verified_at": "TEXT"},
+        "jobs": {"expected_count": "INTEGER", "user_id": "TEXT"},
+    }.items():
+        present = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for column, typ in columns.items():
+            if column not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typ}")
     conn.commit()
     return Ledger(conn)
 
@@ -294,6 +325,9 @@ class Ledger:
     def upsert_job(self, archive_id: str, *, account: Optional[str] = None,
                    output_dir: Optional[str] = None,
                    expiry_at: Optional[str] = None) -> None:
+        prior = self.job(archive_id)
+        if prior and account and prior["account"] and prior["account"] != account:
+            raise LedgerError("account mismatch for recorded archive")
         now = _now()
         self.conn.execute(
             "INSERT INTO jobs (archive_id, account, status, output_dir, expiry_at,"
@@ -341,6 +375,8 @@ class Ledger:
             # a zip-only regex, which meant a recorded `Louie 2018-057.mp4` did not look
             # "real", the guard did not fire, and the placeholder overwrote it — 25 of
             # 68 filenames in one re-scrape. See `carries_part_identity`.
+            if filename and not safe_filename(filename):
+                raise LedgerError("unsafe recorded filename")
             incoming = filename or None
             existing = self.part(archive_id, idx)
             if existing is not None:
@@ -367,7 +403,7 @@ class Ledger:
     def parts(self, archive_id: str) -> list[PartRow]:
         cur = self.conn.execute(
             "SELECT idx, filename, size_expected, size_on_disk, status, minted_url, attempts"
-            " FROM parts WHERE archive_id=? ORDER BY idx", (archive_id,))
+            ", sha256, remote_path, remote_verified_at FROM parts WHERE archive_id=? ORDER BY idx", (archive_id,))
         return [PartRow(**dict(r)) for r in cur.fetchall()]
 
     def set_part_status(self, archive_id: str, idx: int, status: str,
@@ -390,12 +426,46 @@ class Ledger:
         time. Without this the ledger would describe every part of a multi-part
         export by the same name.
         """
-        if not filename:
-            return
+        if not safe_filename(filename) or not carries_part_identity(filename):
+            raise LedgerError("unsafe or placeholder filename")
+        duplicate = self.conn.execute(
+            "SELECT idx FROM parts WHERE archive_id=? AND filename=? AND idx<>?",
+            (archive_id, filename, idx)).fetchone()
+        if duplicate:
+            raise LedgerError("duplicate filename across parts")
         self.conn.execute(
             "UPDATE parts SET filename=? WHERE archive_id=? AND idx=?",
             (filename, archive_id, idx),
         )
+        self.conn.commit()
+
+    def record_part_list(self, archive_id: str, *, expected_count: int,
+                         user_id: Optional[str] = None) -> None:
+        job = self.job(archive_id)
+        if job and user_id and job["user_id"] and job["user_id"] != user_id:
+            raise LedgerError("discovered account mismatch")
+        self.conn.execute(
+            "UPDATE jobs SET expected_count=MAX(COALESCE(expected_count,0),?), "
+            "user_id=COALESCE(?,user_id) WHERE archive_id=?",
+            (expected_count, user_id, archive_id))
+        self.conn.commit()
+
+    def record_verified(self, archive_id: str, idx: int, *, sha256: str,
+                        size: int, remote_path: Optional[str] = None) -> None:
+        import re
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+            raise LedgerError("invalid verified SHA256")
+        self.conn.execute(
+            "UPDATE parts SET sha256=?, size_on_disk=?, verify_state=?, "
+            "remote_path=?, remote_verified_at=? WHERE archive_id=? AND idx=?",
+            (sha256, size, "sha256", remote_path, _now() if remote_path else None,
+             archive_id, idx))
+        self.conn.commit()
+
+    def invalidate_receipt(self, archive_id: str, idx: int) -> None:
+        self.conn.execute(
+            "UPDATE parts SET remote_path=NULL, remote_verified_at=NULL, status='pending' "
+            "WHERE archive_id=? AND idx=?", (archive_id, idx))
         self.conn.commit()
 
     # -- the minted-URL cache (rule 2) --------------------------------------
@@ -464,7 +534,8 @@ class Ledger:
         request that failed tells us nothing about whether it was a resume, and
         claiming the cheap kind would understate the cost.
         """
-        message = f"{type(exc).__name__}: {exc}"
+        import re
+        message = re.sub(r"https?://[^\s]+", "<url>", f"{type(exc).__name__}: {exc}")
         self.conn.execute(
             "UPDATE parts SET attempts=attempts+1 WHERE archive_id=? AND idx=?",
             (archive_id, idx),
@@ -475,10 +546,8 @@ class Ledger:
     def failed_transfer_count(self, archive_id: str, idx: int) -> int:
         """How many transfer attempts for this part have failed.
 
-        Used to bound how long a cached minted URL is retried before it is
-        discarded: re-minting costs Δ1 and an export allows only 5 attempts in
-        total, so one transient blip must not trigger a fresh mint — but neither
-        may a genuinely dead URL be retried forever.
+        Historical telemetry only: transient failures must never invalidate a cached
+        URL merely because a lifetime counter crossed a threshold.
         """
         cur = self.conn.execute(
             "SELECT COUNT(*) FROM attempts WHERE archive_id=? AND idx=? "

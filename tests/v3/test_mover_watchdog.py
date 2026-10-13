@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from autopilot.mover import (
+    _COPY_CHILD,
+    _HASH_CHILD,
     MOVE_STALL_SECONDS,
     MOVE_WATCHDOG_SECONDS,
     MoveRefused,
@@ -92,7 +94,7 @@ def test_the_watchdog_kills_a_hung_copy_and_reports_it(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kw):
         # the copy child is python -c <_COPY_CHILD> src dst chunk stall
-        if len(cmd) > 2 and cmd[0] == sys.executable and cmd[1] == "-c":
+        if cmd[:3] == [sys.executable, "-c", _COPY_CHILD]:
             sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
             return real_run(sleeper, timeout=2.0, capture_output=True, text=True)
         return real_run(cmd, **kw)
@@ -105,7 +107,7 @@ def test_the_watchdog_kills_a_hung_copy_and_reports_it(tmp_path, monkeypatch):
     assert "WATCHDOG" in r.detail
     assert "1.7/1.16" in r.detail or "FUSE" in r.detail
     assert not os.path.exists(dest / "part.bin"), "no truncated file under the final name"
-    assert not os.path.exists(dest / ("part.bin" + ".partial")), "partial left behind"
+    assert not list(dest.glob("*.moving")), "copy temporary left behind"
 
 
 def test_a_child_that_reports_no_progress_fails_the_move(tmp_path):
@@ -120,12 +122,12 @@ def test_a_child_that_reports_no_progress_fails_the_move(tmp_path):
     # report success, and must not leave anything behind.
     if r.action != "moved":
         assert not os.path.exists(dest / "part.bin")
-        assert not os.path.exists(dest / ("part.bin" + ".partial"))
+        assert not list(dest.glob("*.moving"))
 
 
 def test_a_short_write_is_caught_after_the_copy(tmp_path, monkeypatch):
-    """The parent re-checks the landed size, so a child that stops early cannot be
-    renamed into place."""
+    """Re-check landed size even after a valid child receipt: backend tail loss
+    must never be renamed into place."""
     src = _stage(tmp_path, size=8192)
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -133,12 +135,15 @@ def test_a_short_write_is_caught_after_the_copy(tmp_path, monkeypatch):
     real_run = subprocess.run
 
     def fake_run(cmd, **kw):
-        if len(cmd) > 2 and cmd[0] == sys.executable and cmd[1] == "-c":
-            # write only half, then succeed
-            half = [sys.executable, "-c",
-                    "import sys;open(sys.argv[2],'wb').write(b'x'*4096);print(4096)",
-                    cmd[3], cmd[4]]
-            return real_run(half, capture_output=True, text=True)
+        if cmd[:3] == [sys.executable, "-c", _COPY_CHILD]:
+            # Obtain the real child's full count/digest receipt, then simulate a
+            # backend losing the tail after the child's flush/read succeeded.
+            receipt = real_run(cmd, **kw)
+            assert receipt.returncode == 0
+            assert receipt.stdout.split()[0] == "8192"
+            with open(cmd[4], "r+b") as landed:
+                landed.truncate(4096)
+            return receipt
         return real_run(cmd, **kw)
 
     monkeypatch.setattr("autopilot.mover.subprocess.run", fake_run)
@@ -146,7 +151,9 @@ def test_a_short_write_is_caught_after_the_copy(tmp_path, monkeypatch):
                   expected_size=src.stat().st_size)
     assert r.action == "failed"
     assert "short write" in r.detail
+    assert src.stat().st_size == 8192
     assert not os.path.exists(dest / "part.bin")
+    assert not list(dest.glob("*.moving"))
 
 
 def test_a_child_that_cannot_start_is_reported(tmp_path, monkeypatch):
@@ -154,14 +161,35 @@ def test_a_child_that_cannot_start_is_reported(tmp_path, monkeypatch):
     dest = tmp_path / "dest"
     dest.mkdir()
 
-    def boom(*a, **kw):
-        raise FileNotFoundError("no interpreter")
+    real_run = subprocess.run
+    def boom(cmd, **kw):
+        if cmd[:3] == [sys.executable, "-c", _COPY_CHILD]:
+            raise FileNotFoundError("no interpreter")
+        return real_run(cmd, **kw)
 
     monkeypatch.setattr("autopilot.mover.subprocess.run", boom)
     r = move_part(str(src), str(dest), filename="part.bin",
                   expected_size=src.stat().st_size)
     assert r.action == "failed"
     assert "cannot start the copy child" in r.detail
+
+
+def test_source_hash_failure_never_starts_copy(tmp_path, monkeypatch):
+    src = _stage(tmp_path)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    calls = []
+    real_run = subprocess.run
+    def fail_hash(cmd, **kw):
+        calls.append(cmd[2])
+        if cmd[:3] == [sys.executable, "-c", _HASH_CHILD]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="read failure")
+        return real_run(cmd, **kw)
+    monkeypatch.setattr("autopilot.mover.subprocess.run", fail_hash)
+    r = move_part(str(src), str(dest), filename="part.bin", expected_size=src.stat().st_size)
+    assert r.action == "failed" and "digest read failed" in r.detail
+    assert calls == [_HASH_CHILD], "copy must not run without staged digest evidence"
+    assert src.exists() and not list(dest.iterdir())
 
 
 # ==========================================================================
@@ -176,11 +204,11 @@ def test_run_once_calls_the_staging_guard():
 
     src = inspect.getsource(run_mod.run_once)
     assert "assert_staging_ready(" in src
-    # and it must come AFTER `_finish` exists, or it references a closure that is not
+    # and it must come AFTER `finish` exists, or it references a closure that is not
     # yet defined and fails only on the path it protects (which happened twice today)
     guard_at = src.index("assert_staging_ready(")
-    finish_at = src.index("async def _finish(")
-    assert finish_at < guard_at, "the guard must be placed after `_finish` is defined"
+    finish_at = src.index("async def finish(")
+    assert finish_at < guard_at, "the guard must be placed after `finish` is defined"
 
 
 def test_the_cli_supplies_a_real_headroom():

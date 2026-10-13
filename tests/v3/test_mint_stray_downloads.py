@@ -36,7 +36,7 @@ import json
 import pytest
 
 from autopilot.cdp import CdpSession
-from autopilot.errors import NeedsReauth
+from autopilot.errors import NeedsReauth, MintError
 from autopilot.mint import (
     DOWNLOAD_BEGIN_EVENT,
     FILE_HOST,
@@ -45,7 +45,8 @@ from autopilot.mint import (
     build_redirector,
     mint,
 )
-from fake_cdp import FakeTransport, redirect_event, response_event
+from orchestration_fixtures import FakeTransport
+from fake_cdp import redirect_event, response_event
 
 ARCHIVE_ID = "29462f3d-4d75-4196-b35c-8a1dbecf617b"
 USER = "116943325794238708860"
@@ -148,7 +149,7 @@ def test_a_file_host_response_without_a_location_also_cancels():
 def test_a_failed_mint_still_cancels_its_download():
     """The download does not care why the mint stopped."""
     t = FakeTransport(plan={REDIRECTOR: [redirect_event(REDIRECTOR, CHALLENGE_URL),
-                                         download_began()]})
+                                         dict(download_began(), params={**download_began()["params"], "url": REDIRECTOR})]})
     with pytest.raises(NeedsReauth):
         run(_mint_once(t))
     assert cancelled_guids(t) == [GUID]
@@ -170,7 +171,7 @@ def test_a_hop_limited_mint_still_cancels_its_download():
     # loops back to the same place and the hop limit is genuinely reached.
     assert build_redirector(ARCHIVE_ID, 0, USER, RAPT) == REDIRECTOR
     t = FakeTransport(plan={
-        REDIRECTOR: [redirect_event(REDIRECTOR, archive_bounce), download_began()],
+        REDIRECTOR: [redirect_event(REDIRECTOR, archive_bounce), dict(download_began(), params={**download_began()["params"], "url": REDIRECTOR})],
     })
     with pytest.raises(HopLimitExceeded):
         run(_mint_once(t, max_hops=2))
@@ -190,7 +191,7 @@ def test_every_hop_that_starts_a_download_gets_its_own_cancel():
         f"{ORIGIN}/manage/archive/{ARCHIVE_ID}?user={USER}&rapt={fresh}&j={ARCHIVE_ID}")
     rebuilt = build_redirector(ARCHIVE_ID, 0, USER, fresh)
     t = FakeTransport(plan={
-        REDIRECTOR: [redirect_event(REDIRECTOR, archive_bounce), download_began(GUID)],
+        REDIRECTOR: [redirect_event(REDIRECTOR, archive_bounce), dict(download_began(), params={**download_began()["params"], "url": REDIRECTOR})],
         rebuilt: [redirect_event(rebuilt, FILE_URL), download_began(guid2)],
     })
     assert run(_mint_once(t)).url == FILE_URL
@@ -235,14 +236,15 @@ def test_the_cleanup_is_not_implemented_by_aborting_the_request():
 # ---------------------------------------------------------------------------
 # Degrading safely
 # ---------------------------------------------------------------------------
-def test_a_browser_that_refuses_download_events_still_mints():
+def test_a_browser_that_refuses_download_events_refuses_before_mint():
     """Losing the events is a hygiene failure, not a mint failure. The minted URL is
     what the caller asked for and must still come back."""
     t = RefusingBrowser(refuse_prefix="Browser.setDownloadBehavior",
                         plan=plan_with_download())
-    result = run(_mint_once(t))
-    assert result.url == FILE_URL
-    assert cancelled_guids(t) == [], "nothing was addressable, so nothing to cancel"
+    with pytest.raises(MintError):
+        run(_mint_once(t))
+    assert not t.navigated(), "fail before mint when tracking is unavailable"
+    assert cancelled_guids(t) == []
 
 
 def test_a_cancel_that_fails_does_not_fail_the_mint():
@@ -255,10 +257,12 @@ def test_a_cancel_that_fails_does_not_fail_the_mint():
     assert cancelled_guids(t) == [GUID], "the attempt is still made"
 
 
-def test_the_whole_browser_domain_being_absent_still_mints():
+def test_the_whole_browser_domain_being_absent_refuses_before_mint():
     """Worst case: an older build with no `Browser.setDownloadBehavior` at all."""
     t = RefusingBrowser(refuse_prefix="Browser.", plan=plan_with_download())
-    assert run(_mint_once(t)).url == FILE_URL
+    with pytest.raises(MintError):
+        run(_mint_once(t))
+    assert not t.navigated()
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +284,33 @@ def test_a_redirect_only_mint_collects_no_guids():
     t = FakeTransport(plan={REDIRECTOR: [redirect_event(REDIRECTOR, FILE_URL)]})
     assert run(_mint_once(t)).url == FILE_URL
     assert cancelled_guids(t) == []
+
+
+def test_human_downloads_on_other_frames_or_other_urls_are_never_cancelled():
+    human_frame = download_began("human-frame")
+    human_frame["params"]["frameId"] = "human-tab"
+    human_url = download_began("human-url")
+    human_url["params"]["url"] = "https://example.test/human.zip"
+    t = FakeTransport(plan=plan_with_download([human_frame, human_url]))
+    run(_mint_once(t))
+    assert cancelled_guids(t) == [GUID]
+
+
+def test_challenge_is_not_hidden_by_restore_navigation():
+    t = FakeTransport(plan={REDIRECTOR: [redirect_event(REDIRECTOR, CHALLENGE_URL)]})
+    with pytest.raises(NeedsReauth):
+        run(_mint_once(t, restore_url=ORIGIN + "/manage/archive/" + ARCHIVE_ID))
+    assert t.navigated() == [REDIRECTOR], "the browser challenge must stay visible"
+
+
+def test_missing_frame_ownership_fails_before_navigate():
+    t = FakeTransport(plan=plan_with_download(), command_results={"Page.getFrameTree": {}})
+    with pytest.raises(MintError):
+        run(_mint_once(t))
+    assert not t.navigated()
+
+
+def test_refused_cancel_surfaces_cleanup_failure_without_losing_earned_url():
+    t = RefusingBrowser(refuse_prefix="Browser.cancelDownload", plan=plan_with_download())
+    result = run(_mint_once(t))
+    assert result.url == FILE_URL and result.download_cleanup_confirmed is False

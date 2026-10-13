@@ -20,7 +20,6 @@ from test_integration import (  # noqa: E402  (conftest puts tests/v3 on the pat
 
 from autopilot.ledger import AttemptKind, open_ledger
 from autopilot.run import (
-    MAX_CACHED_URL_FAILURES,
     RUN_OUTCOME_STATUSES,
     TERMINAL_BLOCKED_STATUSES,
 )
@@ -111,10 +110,10 @@ def test_failed_transfer_records_its_reason(tmp_path):
     assert "boom" in (row["note"] or "")
 
 
-def test_the_cached_url_failure_bound_is_small_and_explicit():
-    """It exists to bound mint spend against a 5-attempt allowance, so it must not
-    be effectively infinite."""
-    assert 2 <= MAX_CACHED_URL_FAILURES <= 10
+def test_transient_failures_do_not_have_a_lifetime_remint_bound():
+    import inspect
+    import autopilot.run as run_mod
+    assert "failed_transfer_count" not in inspect.getsource(run_mod.run_once)
 
 
 # ==========================================================================

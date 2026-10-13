@@ -100,7 +100,7 @@ def test_quota_check_precedes_the_refresh_retry_in_source():
 
     import autopilot.mint as mint_mod
 
-    src = inspect.getsource(mint_mod.mint)
+    src = inspect.getsource(mint_mod._mint_tracked)
     quota_at = src.index("QUOTA_FLAG in")
     refresh_at = src.index('"/manage/archive/" in r.location')
     assert quota_at < refresh_at, (

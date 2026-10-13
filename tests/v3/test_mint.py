@@ -25,7 +25,8 @@ from autopilot.mint import (
     mint,
     parse_query,
 )
-from fake_cdp import FakeTransport, redirect_event, response_event
+from orchestration_fixtures import FakeTransport
+from fake_cdp import redirect_event, response_event
 
 ARCHIVE_ID = "f470fe32-76d6-43a6-9321-dbc76834919e"
 USER = "116943325794238708860"

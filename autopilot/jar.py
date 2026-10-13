@@ -17,7 +17,7 @@ Cookie **values are secrets** and are never logged by this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .cdp import CdpSession
 from .errors import AutopilotError
@@ -36,6 +36,7 @@ class CookieJar:
     n_cookies: int = 0
     n_google: int = 0
     domains: list[str] = field(default_factory=list)
+    user_agent: Optional[str] = None
 
     @property
     def usable(self) -> bool:
@@ -56,7 +57,10 @@ def build_header(cookies: Iterable[dict], suffix: str = GOOGLE_SUFFIX) -> Cookie
     Pure and therefore unit-testable: `pull_jar` is just CDP plus this.
     """
     cookies = list(cookies or [])
-    google = [c for c in cookies if suffix in (c.get("domain") or "")]
+    suffix = suffix.lower().lstrip(".")
+    google = [c for c in cookies
+              if ((c.get("domain") or "").lower().lstrip(".") == suffix
+                  or (c.get("domain") or "").lower().lstrip(".").endswith("." + suffix))]
     header = "; ".join(f"{c['name']}={c['value']}" for c in google if c.get("name"))
     return CookieJar(
         header=header,
@@ -78,4 +82,15 @@ async def pull_jar(session: CdpSession, *, suffix: str = GOOGLE_SUFFIX) -> Cooki
             "browser holds no matching cookies — is it signed in? "
             f"(saw {jar.n_cookies} cookies, none matching {suffix!r})"
         )
+    # Older injected/session adapters expose cookies only. UA is optional, never
+    # a new requirement for using an otherwise valid jar.
+    value = getattr(session, "value", None)
+    if callable(value):
+        try:
+            ua = await value("navigator.userAgent")
+            if (isinstance(ua, str) and ua.startswith("Mozilla/")
+                    and len(ua) <= 1024 and not any(ord(c) < 32 for c in ua)):
+                jar.user_agent = ua
+        except Exception:
+            pass
     return jar

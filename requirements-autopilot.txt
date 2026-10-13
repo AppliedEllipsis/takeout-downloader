@@ -1,0 +1,2 @@
+# Standalone autopilot uses stdlib except for its CDP websocket adapter.
+websockets>=13,<17

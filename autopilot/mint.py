@@ -24,11 +24,10 @@ Three things were measured that shape the code:
    `302 -> /manage/archive/<id>?user=…&rapt=<fresh>&j=<id>` — no password
    demanded. Rebuilding the redirector with that fresh `rapt` is the second hop.
 
-The stray download the browser also starts is *not* this module's problem, but it
-is no longer disposed of for us: **`autoCancelDownloads` is OFF** (owner
-directive 2026-09-22 — the workflow depends on real browser downloads), so a mint
-leaves a real part-sized download running in `/config/Downloads`. It lands on the
-300 GB `cache_crypt` volume, not the 14 GB root disk. See failure mode 1.22.
+A mint also starts a real browser download. Event tracking and frame ownership
+must be available BEFORE navigation. Only this mint's exact frame/chain downloads
+are cancelled afterwards; human downloads are never swept. Authentication challenges
+remain visible. A refused cancellation is surfaced without discarding the earned URL.
 """
 from __future__ import annotations
 
@@ -40,6 +39,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
 from .cdp import CdpSession
 from .errors import HopLimitExceeded, MintError, NeedsReauth, QuotaExceeded
+from .ledger import safe_filename
 
 __all__ = [
     "ORIGIN",
@@ -105,7 +105,7 @@ def is_signin_location(url: str) -> bool:
     `BENIGN_ACCOUNTS_PATH_MARKERS`.
     """
     low = (url or "").lower()
-    if ACCOUNTS_HOST not in low:
+    if urlsplit(url or "").hostname != ACCOUNTS_HOST:
         return False
     if any(marker in low for marker in BENIGN_ACCOUNTS_PATH_MARKERS):
         return False
@@ -170,10 +170,16 @@ def part_filename_from_url(url: str) -> str:
     must not assume an extension.
     """
     path = urlsplit(url or "").path or ""
+    decoded_path = unquote(path).replace("\\", "/")
+    if any(p in (".", "..") for p in decoded_path.split("/")):
+        raise MintError("unsafe decoded URL path")
     name = path.rstrip("/").split("/")[-1] if path else ""
     if not name or name.lower() in ("download", "takeout"):
         return ""
-    return unquote(name)
+    name = unquote(name)
+    if not safe_filename(name):
+        raise MintError("unsafe decoded part filename")
+    return name
 
 
 def parse_query(url: str) -> dict:
@@ -295,7 +301,7 @@ def file_host_hits(events) -> list[tuple[str, int]]:
         if not isinstance(resp, dict):
             continue
         url = resp.get("url") or ""
-        if FILE_HOST not in url:
+        if urlsplit(url).hostname != FILE_HOST:
             continue
         status = resp.get("status")
         if isinstance(status, int) and 200 <= status < 300:
@@ -318,16 +324,16 @@ class MintResult:
     #: Measured cost of a successful mint. Recorded so callers can put the real
     #: number in the ledger rather than an assumption.
     attempts_spent: int = 1
+    download_cleanup_confirmed: bool = True
 
     def __str__(self) -> str:  # keep tokens out of logs
         return f"<MintResult hops={self.hops} url={_redact(self.url)}>"
 
 
 def _redact(url: str) -> str:
-    """Never log a `rapt` token."""
-    import re
-
-    return re.sub(r"((?:rapt|TL)=)[^&\s]{8,}", r"\1<redacted>", url or "")
+    """URLs carry more secrets than rapt (signed query, TL, account identities)."""
+    parsed = urlsplit(url or "")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "<redacted>" if parsed.query else "", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +385,8 @@ def _stray_download_guids(events: Iterable[tuple]) -> List[str]:
 async def _cancel_stray_downloads(session: CdpSession, guids: Iterable[str]) -> int:
     """Cancel each download. Never raises.
 
-    A cancel that fails must not fail the mint: the minted URL is already captured and
-    is what the caller asked for. The worst outcome here is a stray file, which
-    `tools/sweep_downloads.py` clears afterwards.
+    Preserve an earned URL if cancellation fails, but expose the failed cleanup so
+    orchestration stops for human action. Never sweep unowned browser downloads.
     """
     cancelled = 0
     for guid in guids:
@@ -394,7 +399,7 @@ async def _cancel_stray_downloads(session: CdpSession, guids: Iterable[str]) -> 
 
 
 async def _leave(session: CdpSession, restore_url: Optional[str],
-                 strays: List[str]) -> None:
+                 strays: List[str]) -> bool:
     """Every exit path from `mint()` goes through here.
 
     Cancel this mint's stray downloads FIRST, then restore the tab. All six exits used
@@ -402,15 +407,71 @@ async def _leave(session: CdpSession, restore_url: Optional[str],
     an unrecognisable chain left its download running — and the download does not care
     why the mint stopped.
     """
-    await _cancel_stray_downloads(session, strays)
+    unique = list(dict.fromkeys(strays))
+    cancelled = await _cancel_stray_downloads(session, unique)
     strays.clear()
     await _restore(session, restore_url)
+    return cancelled == len(unique)
 
 
 # ---------------------------------------------------------------------------
 # The mint
 # ---------------------------------------------------------------------------
-async def mint(
+async def mint(session: CdpSession, redirector: str, *, max_hops: int = 3,
+               settle: float = 20.0, navigate_timeout: float = 25.0,
+               restore_url: Optional[str] = None) -> MintResult:
+    """Fail before navigating if exact download ownership cannot be tracked.
+
+    A browser-wide time window is NOT ownership. Frame plus observed chain URL
+    scopes cancellation to this automation; unrelated human downloads are untouched.
+    No Fetch, passwords, browser restarts or unrelated tabs.
+    """
+    parsed = urlsplit(redirector)
+    if parsed.scheme != "https" or parsed.hostname != "takeout.google.com" or parsed.username or parsed.password:
+        raise MintError("unsafe mint redirector")
+    if not all(callable(getattr(session, n, None)) for n in ("event_count", "events_since", "drain")):
+        raise MintError("download event tracking unavailable; refusing to mint")
+    try:
+        tree = await session.call("Page.getFrameTree")
+        owner = tree["frameTree"]["frame"]
+        frame = owner["id"]
+        if owner.get("url") and urlsplit(owner["url"]).hostname != "takeout.google.com":
+            raise MintError("refusing to drive unrelated tab")
+    except Exception as exc:
+        raise MintError("download ownership unavailable; refusing to mint") from exc
+    if not frame or not await _enable_download_events(session):
+        raise MintError("download event tracking unavailable; refusing to mint")
+    await session.call("Network.enable")
+    strays: List[str] = []
+    owned_urls = {redirector}
+    mark = session.event_count()
+    challenged = False
+    result = None
+    try:
+        result = await _mint_tracked(session, redirector, max_hops=max_hops, settle=settle,
+                                   navigate_timeout=navigate_timeout, restore_url=restore_url,
+                                   owner_frame=frame, strays=strays, owned_urls=owned_urls)
+        return result
+    except NeedsReauth:
+        challenged = True
+        raise
+    finally:
+        # A drain/navigation error can happen before the loop consumes queued events.
+        # Recover only exact frame/chain-owned downloads, never sweep browser downloads.
+        observed = [(m, p) for m, p in session.events_since(mark)
+                    if not m.startswith("Network.") or p.get("frameId", frame) == frame]
+        for r in extract_redirects(observed):
+            if r.from_url in owned_urls:
+                owned_urls.add(r.location)
+        strays.extend(p["guid"] for m, p in observed
+                      if m == DOWNLOAD_BEGIN_EVENT and p.get("guid")
+                      and p.get("frameId") == frame and p.get("url") in owned_urls)
+        cleaned = await _leave(session, None if challenged else restore_url, strays)
+        if result is not None:
+            result.download_cleanup_confirmed = cleaned
+
+
+async def _mint_tracked(
     session: CdpSession,
     redirector: str,
     *,
@@ -418,6 +479,9 @@ async def mint(
     settle: float = 20.0,
     navigate_timeout: float = 25.0,
     restore_url: Optional[str] = None,
+    owner_frame: str,
+    strays: List[str],
+    owned_urls: set,
 ) -> MintResult:
     """Drive the browser so it mints a file-host URL, and return it.
 
@@ -437,20 +501,13 @@ async def mint(
     the part for real; `_leave` cancels that download on every exit path, after the
     URL is captured. See the module docstring and failure mode 1.22.
     """
-    await session.call("Network.enable")
-
-    # Ask for download events BEFORE navigating, since the navigate we are about to
-    # make is what starts the download. `guid` is the only handle that addresses
-    # exactly that download rather than downloads in general.
-    events_enabled = await _enable_download_events(session)
-
     chain: list[Redirect] = []
-    strays: List[str] = []
     current = redirector
     refreshed = False
 
     for hop in range(1, max_hops + 1):
         mark = session.event_count()
+        owned_urls.add(current)
         try:
             await session.call("Page.navigate", {"url": current}, timeout=navigate_timeout)
         except asyncio.TimeoutError:
@@ -459,7 +516,8 @@ async def mint(
             pass
         await session.drain(settle)
 
-        observed = session.events_since(mark)
+        observed = [(m, p) for m, p in session.events_since(mark)
+                    if not m.startswith("Network.") or p.get("frameId", owner_frame) == owner_frame]
         redirects = extract_redirects(observed)
         chain.extend(redirects)
 
@@ -467,15 +525,26 @@ async def mint(
         # (measured). Record its guid so it can be cancelled as soon as the URL is
         # captured — never before, because aborting a request is measured to PREVENT
         # the mint. `_leave` cancels these on all six exit paths.
-        if events_enabled:
-            strays.extend(_stray_download_guids(observed))
+        for r in redirects:
+            if r.from_url in owned_urls:
+                owned_urls.add(r.location)
+        # A direct file-host response in our frame is also automation evidence.
+        owned_urls.update(url for url, _ in file_host_hits(observed))
+        strays.extend(p["guid"] for m, p in observed
+                      if m == DOWNLOAD_BEGIN_EVENT and p.get("guid")
+                      and p.get("frameId") == owner_frame and p.get("url") in owned_urls)
+
+        # Auth refusal wins over an earlier file-host redirect in the same batch.
+        challenge = next((url for url in [r.location for r in redirects] + response_urls(observed)
+                          if is_signin_location(url)), None)
+        if challenge:
+            raise NeedsReauth(challenge)
 
         # 1. Did we reach the file host?
         for r in redirects:
-            if FILE_HOST in r.location:
+            if urlsplit(r.location).hostname == FILE_HOST and r.from_url in owned_urls:
                 result = MintResult(url=r.location, redirector=redirector, hops=hop,
                                     chain=chain, refreshed_rapt=refreshed)
-                await _leave(session, restore_url, strays)
                 return result
         # Only a 2xx from the file host counts as a mint. A file host answering
         # `302 -> accounts.google.com` is NOT a successful mint, and treating it as
@@ -484,7 +553,6 @@ async def mint(
         for url, _status in file_host_hits(observed):
             result = MintResult(url=url, redirector=redirector, hops=hop,
                                 chain=chain, refreshed_rapt=refreshed)
-            await _leave(session, restore_url, strays)
             return result
 
         # 2. Did Google demand ReAuth?
@@ -501,7 +569,6 @@ async def mint(
                 # challenge, a quota refusal or an unrecognisable chain left the tab
                 # sitting on a sign-in page, which is exactly where the NEXT run's
                 # `recover_rapt_url` cannot find a token.
-                await _leave(session, restore_url, strays)
                 raise NeedsReauth(r.location)
 
         # 2b. Did Google refuse because the export's download allowance is spent?
@@ -518,7 +585,6 @@ async def mint(
         # limit — reporting a hop-limit error that names the wrong cause.
         for r in redirects:
             if QUOTA_FLAG in (r.location or ""):
-                await _leave(session, restore_url, strays)
                 raise QuotaExceeded(r.location, "Google sent quotaExceeded=true")
 
         # 3. Did the redirector hand us a refreshed rapt to retry with?
@@ -569,10 +635,8 @@ async def mint(
             reason = "no file-host URL, no ReAuth demand, and no archive-page bounce"
         # Restore before raising, for the same reason as the branches above: the tab
         # must not be left mid-chain for the next run to inherit.
-        await _leave(session, restore_url, strays)
         raise MintError(f"{reason}; saw {seen} | looking for file host {FILE_HOST!r}")
 
-    await _leave(session, restore_url, strays)
     raise HopLimitExceeded(
         f"still bouncing after {max_hops} hops; last redirector={_redact(current)}"
     )

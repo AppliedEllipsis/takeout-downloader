@@ -1,25 +1,8 @@
 """Move verified parts from local staging onto the archive.
 
-The destination is `/opt/archives` — an **rclone FUSE** mount over a remote. Three
-consequences drive this module, each from a measured or documented incident:
-
-1. **Never stat per part in a loop.** A per-part `stat()` pre-pass over 58 parts
-   on this mount took about six minutes (documented, and the cause of a
-   production livelock). So the destination is indexed with **one `scandir`** and
-   all planning is done against that snapshot, in pure code.
-
-2. **Assert the destination really is the mount.** When the FUSE daemon dies the
-   kernel does not fail the path — it turns `/opt/archives` into an ordinary,
-   empty directory **on the root filesystem**, which has ~13 GB free. A mover that
-   does not check will happily write terabytes into it. That is failure mode 1.7,
-   and it has taken this server down once.
-
-3. **Copy under a temporary name, then rename.** A rename on rclone is a
-   server-side move, so it is cheap, and an interrupted copy never leaves a
-   plausible-looking truncated file under the final name.
-
-Idempotent by design: a part already present at the expected size is skipped, so
-a re-run after a crash costs nothing.
+Native-local copies are digest checked before no-clobber publication. FUSE
+flush/fsync is NOT evidence of remote durability; use autopilot.remote for that.
+Destination indexing remains a planning hint, not proof of byte integrity.
 """
 from __future__ import annotations
 
@@ -27,6 +10,9 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
+
+from .remote import _safe_filename
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -170,6 +156,7 @@ def plan_moves(sources: Iterable[tuple[str, str, int]],
     """
     plan: list[MovePlanItem] = []
     for filename, source, size in sources:
+        _safe_filename(filename)
         present = dest_index.size_of(filename)
         if present is None:
             action = "move"
@@ -203,7 +190,32 @@ def move_part(source: str, dest_dir: str, *,
     `expected_size` is the staged file's size; it is re-checked after the copy so
     a short write on a flaky remote cannot be renamed into place.
     """
-    filename = filename or os.path.basename(source)
+    filename = filename if filename is not None else os.path.basename(source)
+    try:
+        _safe_filename(filename)
+        for path in (source, dest_dir):
+            value = os.fspath(path)
+            if (any(ord(c) < 32 for c in value)
+                    or '..' in value.replace('\\', '/').split('/')
+                    or os.path.normcase(os.path.realpath(value)) != os.path.normcase(os.path.abspath(value))):
+                raise ValueError("unsafe source or destination path")
+        if not os.path.isdir(dest_dir) or os.path.islink(dest_dir):
+            raise ValueError("unsafe or missing destination directory")
+        if os.path.islink(source) or not os.path.isfile(source):
+            raise ValueError("cannot stat source: not a regular file")
+        initial_mount = fuse_mount_for(dest_dir, _read_mounts())
+        def check_mount():
+            if initial_mount is not None and fuse_mount_for(dest_dir, _read_mounts()) != initial_mount:
+                raise ValueError("destination mount lost during copy")
+        def digest(path):
+            r = subprocess.run([sys.executable, "-c", _HASH_CHILD, path],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode or len(r.stdout.strip()) != 64:
+                raise ValueError("local digest read failed")
+            return r.stdout.strip()
+        source_digest = digest(source)
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        return MoveResult(filename, "failed", detail=str(exc)[:256])
     try:
         size = os.path.getsize(source)
     except OSError as exc:
@@ -214,8 +226,19 @@ def move_part(source: str, dest_dir: str, *,
             detail=f"staged size {size} != expected {expected_size}",
         )
 
-    tmp_path = os.path.join(dest_dir, filename + PARTIAL_SUFFIX)
+    tmp_path = os.path.join(dest_dir, filename + "." + uuid.uuid4().hex + PARTIAL_SUFFIX)
     final_path = os.path.join(dest_dir, filename)
+    try:
+        check_mount()
+        if os.path.lexists(final_path):
+            if os.path.islink(final_path) or not os.path.isfile(final_path):
+                raise ValueError("unsafe existing destination")
+            if os.path.getsize(final_path) != size or digest(final_path) != source_digest:
+                return MoveResult(filename, "skipped-size-mismatch", detail="existing destination size or digest mismatch; preserved")
+            check_mount()
+            return MoveResult(filename, "skipped-present", detail="local bytes verified; not remote durability")
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        return MoveResult(filename, "failed", detail=str(exc)[:256])
 
     # The copy runs in a CHILD PROCESS, with a hard timeout.
     #
@@ -243,7 +266,10 @@ def move_part(source: str, dest_dir: str, *,
             return MoveResult(filename, "failed",
                               detail=(detail[-1] if detail else
                                       f"copy child exited {proc.returncode}"))
-        moved = int((proc.stdout or "0").strip() or 0)
+        fields = proc.stdout.strip().split()
+        moved = int(fields[0])
+        if len(fields) != 2 or fields[1] != source_digest:
+            raise ValueError("copied digest differs from staged digest")
     except subprocess.TimeoutExpired:
         _unlink_quietly(tmp_path)
         return MoveResult(
@@ -254,7 +280,7 @@ def move_part(source: str, dest_dir: str, *,
                     f"than left to wedge the run. Check the rclone mount "
                     f"(failure mode 1.7/1.16)."),
         )
-    except FileNotFoundError as exc:
+    except (OSError, ValueError, IndexError) as exc:
         _unlink_quietly(tmp_path)
         return MoveResult(filename, "failed",
                           detail=f"cannot start the copy child: {exc}")
@@ -267,9 +293,16 @@ def move_part(source: str, dest_dir: str, *,
                               detail=f"short write: {written} != {size}")
         # rename last: a server-side move on rclone, and no truncated file ever
         # appears under the final name.
-        os.replace(tmp_path, final_path)
-        return MoveResult(filename, "moved", bytes_moved=moved)
-    except OSError as exc:
+        check_mount()
+        # Atomic no-clobber publication: unlike replace/rename on POSIX this
+        # cannot destroy an object created concurrently. Unsupported filesystems
+        # fail closed (direct backend archival is the production path).
+        os.link(tmp_path, final_path)
+        os.unlink(tmp_path)
+        check_mount()
+        return MoveResult(filename, "moved", bytes_moved=moved,
+                          detail="local bytes verified; not remote durability")
+    except (OSError, ValueError) as exc:
         _unlink_quietly(tmp_path)
         return MoveResult(filename, "failed", detail=str(exc))
 
@@ -281,11 +314,11 @@ def move_part(source: str, dest_dir: str, *,
 #: argv: source, tmp_path, chunk, stall_seconds
 #: stdout: total bytes written
 _COPY_CHILD = r"""
-import os, sys, time
+import os, sys, time, hashlib
 src, dst_path, chunk, stall = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 n = 0
 last = time.time()
-with open(src, 'rb') as s, open(dst_path, 'wb') as d:
+with open(src, 'rb') as s, open(dst_path, 'xb') as d:
     while True:
         b = s.read(chunk)
         if not b:
@@ -302,7 +335,20 @@ with open(src, 'rb') as s, open(dst_path, 'wb') as d:
         last = now
     d.flush()
     os.fsync(d.fileno())
-print(n)
+h = hashlib.sha256()
+with open(dst_path, 'rb') as f:
+    for b in iter(lambda: f.read(chunk), b''):
+        h.update(b)
+print(n, h.hexdigest())
+"""
+
+_HASH_CHILD = r"""
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as f:
+    for b in iter(lambda: f.read(4 << 20), b''):
+        h.update(b)
+print(h.hexdigest())
 """
 
 

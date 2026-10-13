@@ -38,10 +38,11 @@ import asyncio
 import errno
 import os
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Protocol
 
-from .errors import AutopilotError, NeedsReauth
+from .errors import AutopilotError, NeedsReauth, redact_error
 
 __all__ = [
     "CHUNK",
@@ -50,6 +51,7 @@ __all__ = [
     "TransferResult",
     "TransferError",
     "RemoteChanged",
+    "RateLimited",
     "HttpStream",
     "HttpClient",
     "UrllibHttpClient",
@@ -170,6 +172,13 @@ class TransferError(AutopilotError):
     """A transfer failed for a reason that is not an authentication demand."""
 
 
+class RateLimited(TransferError):
+    """The server asked us to wait; this is not a reason to mint a new URL."""
+    def __init__(self, message: str, retry_after: Optional[str] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class RemoteChanged(TransferError):
     """The remote object no longer matches the local expectations.
 
@@ -188,6 +197,7 @@ class TransferResult:
     http_status: Optional[int] = None
     etag: Optional[str] = None
     restarted: bool = False      # server ignored Range / validator changed
+    error: Optional[str] = None
 
     @property
     def complete(self) -> bool:
@@ -216,6 +226,9 @@ async def download(
     rewind: int = REWIND,
     chunk: int = CHUNK,
     on_progress: Optional[ProgressFn] = None,
+    expected_filename: Optional[str] = None,
+    user_agent: str = "Mozilla/5.0",
+    host_validator: Optional[Callable[[str], bool]] = None,
 ) -> TransferResult:
     """Download `url` to `dest`, resuming if `dest` already holds bytes.
 
@@ -226,6 +239,15 @@ async def download(
     `TransferError` when the jar was simply missing (a programming error, not a
     session problem), `RemoteChanged` when the remote object differs.
     """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.username or parsed.password or not host:
+        raise TransferError("unsafe download URL")
+    allowed = bool(host_validator(host)) if host_validator else (
+        host in {"localhost", "127.0.0.1"} or host.endswith(".googleusercontent.com") or host.endswith(".google.com"))
+    if not allowed:
+        raise TransferError(f"refusing foreign download host {host!r}")
+
     if not jar_header:
         # Measured: without the jar the file host answers 302 -> ServiceLogin.
         # Sending nothing and blaming the session would be a misdiagnosis.
@@ -243,10 +265,6 @@ async def download(
                               bytes_written=0, resumed_from=have, etag=etag)
 
     start = aligned_resume_offset(have, rewind) if have else 0
-    if start < have:
-        # Re-fetch the overlap rather than append after a possibly torn tail.
-        with open(dest, "r+b") as fh:
-            fh.truncate(start)
 
     # **No validator, no resume.** Fixed 2026-09-19: `If-Range` used to be sent only
     # when an etag was supplied, so a resume with no recorded etag sent a bare
@@ -258,13 +276,13 @@ async def download(
     # A resume costs Δ0 attempts and a fresh acquisition costs Δ1, so this is a real
     # trade — but bandwidth is recoverable and a corrupt archive is not. Decided
     # BEFORE the headers are built, so no `Range` is sent at all in this case.
-    resumed = start > 0 and bool(etag)
+    resumed = start > 0 and bool(etag) and not etag.startswith("W/")
     if start > 0 and not resumed:
         start = 0
 
     headers = {
         "Cookie": jar_header,
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": user_agent,
         "Accept": "*/*",
         # a byte-range download must not be transparently content-encoded
         "Accept-Encoding": "identity",
@@ -276,7 +294,12 @@ async def download(
         # instead of a 206, which is the correct signal to start over.
         headers["If-Range"] = etag
 
-    stream = await client.get(url, headers)
+    try:
+        stream = await client.get(url, headers)
+    except Exception as exc:
+        return TransferResult("partial", total_bytes=have, resumed_from=have,
+                              etag=etag, error=redact_error(f"client operation failed: {type(exc).__name__}: {exc}"))
+    stream_error = None
     try:
         status = stream.status
         hdrs = {k.lower(): v for k, v in stream.headers.items()}
@@ -285,44 +308,65 @@ async def download(
             location = hdrs.get("location", "")
             if ACCOUNTS_HOST in location:
                 raise NeedsReauth(location, "file host redirected to sign-in")
-            raise TransferError(f"unexpected redirect -> {location[:120]}")
+            raise TransferError(f"unexpected redirect -> {redact_error(location)}")
 
         if status in (401, 403):
             raise NeedsReauth(url, f"file host returned HTTP {status}")
 
+        if expected_filename:
+            cd = hdrs.get("content-disposition", "")
+            m = re.search(r"filename\s*=\s*\"?([^\";]+)", cd, re.I)
+            if m and os.path.basename(m.group(1).strip()) != os.path.basename(expected_filename):
+                raise TransferError("Content-Disposition filename does not match expected filename")
+        ctype = hdrs.get("content-type", "").lower()
+        if "text/html" in ctype or "application/xhtml" in ctype:
+            raise NeedsReauth(url, "HTML authentication/error response")
+        if status == 429:
+            raise RateLimited("HTTP 429 rate limited", hdrs.get("retry-after"))
+        if 500 <= status < 600:
+            raise TransferError(f"transient HTTP {status}; retry without reminting")
+
+        # Check declared lengths BEFORE opening/truncating the destination.
+        clen = hdrs.get("content-length")
+        if clen is not None and not re.fullmatch(r"[0-9]+", clen):
+            raise RemoteChanged("invalid Content-Length")
+        try:
+            response_length = int(clen) if clen is not None else None
+        except ValueError:
+            raise RemoteChanged("invalid Content-Length") from None
+        effective_size = expected_size
         restarted = False
         if status == 206:
             cr = hdrs.get("content-range", "")
-            total = _total_from_content_range(cr)
-            if expected_size is not None and total is not None and total != expected_size:
-                raise RemoteChanged(
-                    f"remote total {total} != expected {expected_size} "
-                    f"(Content-Range: {cr!r})"
-                )
-            # The Content-Range START must also be honoured: a body that does not
-            # begin where we asked would be appended at the wrong offset. Checked
-            # because only the total used to be parsed, so a mis-ranged 206 was
-            # written into the file at whatever offset the server chose.
-            rng_start = _start_from_content_range(cr)
-            if rng_start is not None and rng_start != start:
-                raise RemoteChanged(
-                    f"Content-Range starts at {rng_start}, not the requested {start} "
-                    f"(Content-Range: {cr!r})"
-                )
-            # And when we did send a validator, the response must still agree with
-            # it. Storing the new etag without comparing let a replaced object pass
-            # as a continuation of the old one.
+            match = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", cr)
+            if not match:
+                raise RemoteChanged("invalid Content-Range")
+            try:
+                rng_start, rng_end, total = map(int, match.groups())
+            except ValueError:
+                raise RemoteChanged("invalid Content-Range") from None
+            if rng_end < rng_start or rng_start != start or rng_end >= total:
+                raise RemoteChanged("invalid Content-Range for requested offset")
+            if expected_size is not None and total != expected_size:
+                raise RemoteChanged(f"remote total {total} != expected {expected_size}")
+            clen = hdrs.get("content-length")
+            if clen is not None and (not clen.isdigit() or int(clen) != rng_end - rng_start + 1):
+                raise RemoteChanged("Content-Length disagrees with Content-Range")
             resp_etag = hdrs.get("etag")
-            if etag and resp_etag and resp_etag != etag:
-                raise RemoteChanged(
-                    f"etag changed mid-download: {etag!r} -> {resp_etag!r}"
-                )
-            mode, write_from = "ab", start
+            if not etag or not resp_etag or etag.startswith("W/") or resp_etag.startswith("W/") or resp_etag != etag:
+                raise RemoteChanged("206 resume requires a matching strong ETag")
+            effective_size = total
+            response_length = rng_end - rng_start + 1
+            mode, write_from = "r+b" if os.path.exists(dest) else "wb", start
         elif status == 200:
             # Server ignored Range, or If-Range said the object changed. Either
             # way the body starts at byte 0: appending it would corrupt the file.
             mode, write_from = "wb", 0
             restarted = start > 0
+            if response_length is not None:
+                if expected_size is not None and response_length != expected_size:
+                    raise RemoteChanged("Content-Length disagrees with expected size")
+                effective_size = response_length
         elif status == 416:
             raise RemoteChanged(
                 f"range unsatisfiable for local size {have} (expected {expected_size})"
@@ -331,6 +375,7 @@ async def download(
             raise TransferError(f"unexpected HTTP {status} from the file host")
 
         written = 0
+        stream_error = None
         # Disk errors must be CLASSIFIED, not allowed to escape.
         #
         # Fixed 2026-09-19: there was no handler here, and `AutopilotError`
@@ -344,40 +389,98 @@ async def download(
         # silent wedge instead of a diagnosis.
         try:
             with open(dest, mode) as fh:
+                fh.seek(write_from)
+                fh.truncate(write_from)
                 while True:
-                    block = await stream.read(chunk)
+                    try:
+                        block = await stream.read(chunk)
+                    except Exception as exc:
+                        stream_error = redact_error(f"stream read failed: {type(exc).__name__}: {exc}")
+                        break
                     if not block:
                         break
-                    fh.write(block)
-                    written += len(block)
+                    if ((effective_size is not None and write_from + written + len(block) > effective_size)
+                            or (response_length is not None and written + len(block) > response_length)):
+                        stream_error = "response exceeded declared/expected size"
+                        break
+                    count = fh.write(block)
+                    written += count
+                    if count != len(block):
+                        stream_error = "short disk write"
+                        break
                     if on_progress:
-                        on_progress(write_from + written, expected_size or 0)
+                        try:
+                            on_progress(write_from + written, effective_size or 0)
+                        except Exception as exc:
+                            stream_error = redact_error(
+                                f"progress callback failed: {type(exc).__name__}: {exc}")
+                            break
                 fh.flush()
                 os.fsync(fh.fileno())
+        except asyncio.CancelledError:
+            _rewind_error_tail(dest, write_from + written, effective_size, rewind)
+            raise
         except OSError as exc:
+            _rewind_error_tail(dest, write_from + written, effective_size, rewind)
             if exc.errno == errno.ENOSPC:
                 raise TransferError(
                     f"out of disk space after {written} bytes written to {dest!r} "
                     f"(failure mode 1.16): {exc}"
-                ) from exc
+                ) from None
             raise TransferError(
                 f"disk write failed after {written} bytes to {dest!r}: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
+            ) from None
     finally:
-        await stream.aclose()
+        try:
+            await stream.aclose()
+        except Exception as exc:
+            # Closing must neither leak signed URLs nor turn a full-length
+            # response with a stream failure into success. Pending classified
+            # auth/header exceptions remain the primary error.
+            stream_error = stream_error or redact_error(
+                f"stream close failed: {type(exc).__name__}: {exc}")
 
     total_bytes = write_from + written
-    complete = expected_size is None or total_bytes == expected_size
+    if stream_error:
+        total_bytes = _rewind_error_tail(dest, total_bytes, effective_size, rewind)
+    complete = not stream_error and effective_size is not None and total_bytes == effective_size
+    if not complete and not stream_error:
+        stream_error = ("response length unknown; integrity not established" if effective_size is None
+                        else f"incomplete response: {total_bytes}/{effective_size} bytes")
     return TransferResult(
         status="complete" if complete else "partial",
         bytes_written=written,
         total_bytes=total_bytes,
         resumed_from=write_from,
         http_status=status,
-        etag=hdrs.get("etag"),
+        etag=_strong_etag(hdrs.get("etag")),
         restarted=restarted,
+        error=stream_error,
     )
+
+
+def _strong_etag(value):
+    return value if value and not value.startswith("W/") else None
+
+
+def _rewind_error_tail(dest, total, expected, rewind):
+    """Do not let a failed full-length write become already-complete next time.
+
+    Preserve safe partial prefixes. Re-fetch at least one byte when rewind is
+    disabled; normal callers retain the usual aligned overlap protection.
+    """
+    if total and (expected is None or total >= expected):
+        safe = aligned_resume_offset(total, max(1, rewind))
+        try:
+            with open(dest, "r+b") as fh:
+                fh.truncate(safe)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            raise TransferError(f"cannot rewind failed transfer tail: {type(exc).__name__}: {exc}") from None
+        return safe
+    return total
 
 
 def _total_from_content_range(value: str) -> Optional[int]:

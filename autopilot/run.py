@@ -18,9 +18,8 @@ DESIGN RULES, each traceable to a measurement or a documented incident
   cleanly with the ledger intact.
 * **An expired export is terminal and is never minted against.** The source objects
   are gone; a fresh mint cannot succeed "however the request is made".
-* **The destination is indexed ONCE per run**, then updated in memory. The
-  historical livelock was a per-part `stat()` pre-pass taking ~6 minutes on the
-  FUSE mount.
+* **Backend confirmation is the archive receipt.** Remote mode never indexes FUSE
+  or adopts its size-only files. Native-local copies require hash comparison.
 * **Everything is injectable** (`session_factory`, `http_client`, `now`) so the
   whole pipeline is testable with no browser, no network and no clock.
 """
@@ -28,8 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
-from contextlib import asynccontextmanager
+import uuid
+import zipfile
+from urllib.parse import urlsplit
+from contextlib import asynccontextmanager, AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -42,16 +43,13 @@ from .errors import (
     QuotaExceeded,
 )
 from .jar import CookieError, pull_jar
-from .ledger import AttemptKind, Ledger, open_ledger
+from .ledger import AttemptKind, Ledger, open_ledger, safe_filename, carries_part_identity, fuse_mount_for, _read_mounts
 from .mint import mint as mint_part, part_filename_from_url
 from .mover import (
-    DestinationIndex,
-    MoveRefused,
     assert_destination_ready,
     assert_staging_ready,
     index_destination,
     move_part,
-    plan_moves,
 )
 from .report import build_report, parse_expiry
 from .scrape import (
@@ -59,12 +57,13 @@ from .scrape import (
     PartLink,
     archive_url,
     page_has_rapt,
-    provoke_rapt,
     read_archive,
     recover_rapt_url,
 )
 from .transport import TransferError, RemoteChanged, download
-from .verify import verify_local
+from .verify import verify_local, VerifyOutcome
+from .remote import RemoteConfig, archive_remote_part, verify_remote_part
+from .mint import parse_query
 
 __all__ = [
     "RUN_OUTCOME_STATUSES",
@@ -97,14 +96,6 @@ RUN_OUTCOME_STATUSES = (
 #: page no longer renders the evidence (e.g. `Available until` disappears).
 TERMINAL_BLOCKED_STATUSES = ("expired_unrecoverable", "quota_exceeded")
 
-#: How many failed transfers against a CACHED minted URL before it is discarded.
-#: One failure may be a transient blip, and re-minting costs Δ1 against an export
-#: that allows only 5 attempts in total — so a single blip must not trigger a fresh
-#: mint. But a URL that has failed this many times is dead, and without a bound the
-#: part stays wedged on it forever (`RemoteChanged` used to be the only invalidation).
-MAX_CACHED_URL_FAILURES = 3
-
-
 @dataclass
 class RunConfig:
     archive_id: str
@@ -123,8 +114,8 @@ class RunConfig:
     #: what the window gates — so a long pull should mint everything first, then
     #: transfer on a later pass against the cached URLs.
     mint_only: bool = False
-    #: Refuse to stage when free space is below this many bytes. `None` = do not check,
-    #: which is the default for tests and development; the CLI supplies a real value.
+    #: Safety floor added to remaining bytes and staging_reserve per transfer.
+    #: None means no additional floor; remaining-byte capacity is always checked.
     #: v2's equivalent had NO escape and made its own suite unrunnable on a full disk,
     #: so the guard meant to protect production broke every test.
     min_headroom: Optional[int] = None
@@ -140,6 +131,13 @@ class RunConfig:
     #: is the only way to re-verify without re-downloading. Never fires before a move
     #: has been verified.
     clean_staging: bool = False
+
+    archive_remote: Optional[str] = None
+    rclone_binary: str = "rclone"
+    rclone_config: Optional[str] = None
+    remote_timeout: float = 21600
+    staging_reserve: int = 0
+    cached_transfer_only: bool = False
 
     def resolved_work_url(self) -> str:
         return self.work_url or archive_url(self.archive_id)
@@ -171,59 +169,23 @@ def _int_size(value) -> Optional[int]:
         return None
 
 
-def page_from_ledger(ledger, archive_id: str) -> Optional[ArchivePage]:
-    """Rebuild the work-list from the ledger when the browser cannot supply one.
-
-    **Why this exists — measured 2026-09-22.** The transfer pass scraped the archive page
-    before moving anything, and that scrape needs a live `rapt`. So a run whose parts were
-    ALL already minted still died with `needs_reauth` before transferring a byte, which
-    invalidated the entire point of `--mint-only`. The observed failure:
-
-        error: the archive page served download links carrying no rapt, and provoking one
-        by navigating the redirector did not produce a token either. No download attempt
-        was spent.
-
-    The scrape has two jobs: discover the part list, and obtain a live token. When every
-    part already carries a cached `minted_url` and a real `filename`, the ledger supplies
-    both the part list and the URLs — so the browser is not needed for either, and the
-    transfer becomes genuinely window-independent, as documented.
-
-    Returns `None` when the ledger is NOT self-sufficient, so the caller keeps its normal
-    behaviour rather than silently proceeding on a partial view of the export. The
-    condition is deliberately strict: one part without a URL, or still holding the
-    placeholder name `download`, and this declines.
-
-    **Provenance caveat, surfaced on stderr:** completeness is then judged against the part
-    list this ledger recorded during an earlier authenticated scrape, not a fresh page read.
-    If that scrape had been partial, so is this view. The run says so when it takes this
-    path rather than letting a green verdict imply a check that did not happen.
-    """
+def page_from_ledger(ledger, archive_id: str, *, cached_transfer_only: bool = False) -> Optional[ArchivePage]:
+    """Reconstruct ALL rows, never a minted subset; retain expected-count evidence."""
     rows = ledger.parts(archive_id)
     if not rows:
         return None
-
-    parts: list = []
-    for r in rows:
-        name = (r.filename or "").strip()
-        if not r.minted_url or not name or name == "download" or r.idx is None:
-            return None
-        parts.append(PartLink(
-            index=int(r.idx),
-            raw_uri="",
-            filename=name,
-            size=str(r.size_expected) if r.size_expected else "",
-        ))
-    if not parts:
-        return None
-
-    page = ArchivePage(url="", parts=parts)
+    if not cached_transfer_only:
+        for r in rows:
+            if not safe_filename(r.filename or "") or not carries_part_identity(r.filename or ""):
+                return None
+            if r.status != "done" and not r.minted_url:
+                return None
     job = ledger.job(archive_id)
-    if job is not None:
-        try:
-            page.expiry = job["expiry_at"]
-        except (KeyError, TypeError, IndexError):
-            page.expiry = None
-    return page
+    count = max(len(rows), (job["expected_count"] or 0) if job else 0)
+    return ArchivePage(parts=[PartLink(index=r.idx, raw_uri="", filename=r.filename or "",
+                                     size=str(r.size_expected) if r.size_expected else "")
+                              for r in rows],
+                       expiry=job["expiry_at"] if job else None, part_of_N=[count])
 
 
 def _get_json(url: str, timeout: float) -> dict:
@@ -238,7 +200,7 @@ def pick_page_target(targets, *, prefer_host: str = "takeout.google.com"):
     """Choose which page target to drive. Pure, so it is testable offline.
 
     Prefer a tab already on the Takeout host (the session cookie is right there
-    and the page is warm); otherwise any page target will do.
+    and the page is warm); unrelated tabs are never driven.
 
     Raises if there is no page target at all: a browser with no tab cannot be
     navigated, and the browser-level endpoint cannot substitute (see below).
@@ -252,11 +214,13 @@ def pick_page_target(targets, *, prefer_host: str = "takeout.google.com"):
             "2026-09-19, it rejects Page.navigate, Network.enable and "
             "Runtime.evaluate with \"wasn't found\" (only Storage.getCookies works)."
         )
-    preferred = [t for t in pages if prefer_host in (t.get("url") or "")]
-    return (preferred or pages)[0]
+    preferred = [t for t in pages if urlsplit(t.get("url") or "").hostname == prefer_host]
+    if not preferred:
+        raise BrowserUnavailable("no Takeout tab available; refusing to drive unrelated tabs")
+    return preferred[0]
 
 
-def _default_session_factory(cdp_http: str, timeout: float = 20.0):
+def _default_session_factory(cdp_http: str, timeout: float = 20.0, *, read_only: bool = False):
     """Attach to a **page target**, not the browser endpoint.
 
     Measured 2026-09-19, and this was a live failure rather than a theory:
@@ -288,7 +252,13 @@ def _default_session_factory(cdp_http: str, timeout: float = 20.0):
         try:
             targets = await asyncio.to_thread(
                 _get_json, cdp_http.rstrip("/") + "/json/list", timeout)
-            target = pick_page_target(targets)
+            if read_only:
+                pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+                if not pages:
+                    raise BrowserUnavailable("no page session available for cookie read")
+                target = pages[0]  # cookie/UA read ONLY; never navigate this human tab
+            else:
+                target = pick_page_target(targets)
             transport = await WebSocketTransport.connect(target["webSocketDebuggerUrl"])
         except AutopilotError:
             raise
@@ -307,565 +277,371 @@ def _default_http_client():
     return UrllibHttpClient()
 
 
-async def run_once(
-    cfg: RunConfig,
-    *,
-    session_factory: Optional[Callable] = None,
-    http_client=None,
-    now: Optional[datetime] = None,
-) -> RunOutcome:
-    """One pass over an export. See the frozen contract for the exact rules."""
+def _safe_path(directory: str, filename: str) -> str:
+    if not safe_filename(filename) or not carries_part_identity(filename):
+        raise AutopilotError("unsafe or missing real part filename")
+    path = os.path.join(directory, filename)
+    if os.path.normcase(os.path.realpath(directory)) != os.path.normcase(os.path.abspath(directory)):
+        raise AutopilotError("unsafe directory path")
+    if os.path.islink(path):
+        raise AutopilotError("unsafe part path")
+    return path
+
+
+def _verify_part(path, **kwargs):
+    if path.lower().endswith(".zip") and os.path.isfile(path) and not zipfile.is_zipfile(path):
+        size = os.path.getsize(path)
+        if size >= (kwargs.get("size_expected") or 0):
+            return VerifyOutcome(False, "CORRUPT", "declared ZIP lacks a valid central directory", size, False)
+    result = verify_local(path, **kwargs)
+    if result.ok and not result.sha256:
+        return VerifyOutcome(False, "UNVERIFIED", "SHA256 evidence unavailable", result.size, True)
+    return result
+
+
+def _sanitized(exc) -> str:
+    import re
+    return re.sub(r"https?://[^\s]+", "<url>", str(exc))[:300]
+
+
+def _remote_path(cfg, name):
+    root = cfg.destination.split(":", 1)[-1].strip("/")
+    return cfg.destination.rstrip("/") + ("/" if root else "") + name
+
+
+def _remote_confirmed(result, cfg, name, size, digest) -> bool:
+    return (result.confirmed and result.action in ("uploaded", "already-present")
+            and result.remote_path == _remote_path(cfg, name)
+            and result.size == size and result.sha256 == digest)
+
+
+def _staged_complete(cfg, row) -> bool:
+    name = row["filename"] or ""
+    if not safe_filename(name) or not carries_part_identity(name) or not row["size_expected"]:
+        return False
+    path = _safe_path(cfg.staging_dir, name)
+    return os.path.isfile(path) and os.path.getsize(path) == row["size_expected"]
+
+
+async def run_once(cfg: RunConfig, *, session_factory: Optional[Callable] = None,
+                   http_client=None, now: Optional[datetime] = None) -> RunOutcome:
+    """One bounded pass. Completion requires backend/native hash confirmation."""
     now = now or datetime.now(timezone.utc)
+    injected_session_factory = session_factory is not None
     session_factory = session_factory or _default_session_factory(cfg.cdp_http)
     http_client = http_client or _default_http_client()
-
     os.makedirs(cfg.staging_dir, exist_ok=True)
+    ledger = open_ledger(cfg.ledger_path)
+    expiry = None
+    expected_count = 0
+    list_evidence = False
+    remote = (RemoteConfig(cfg.archive_remote, cfg.rclone_binary, cfg.rclone_config,
+                           cfg.remote_timeout) if cfg.archive_remote else None)
 
-    # `open_ledger` refuses a FUSE path (measured: v1 keeps WAL-mode SQLite on the
-    # rclone mount). It raises rather than returning an outcome: a bad ledger path
-    # is a caller bug, not a run result.
-    ledger: Ledger = open_ledger(cfg.ledger_path)
-
-    # ---- 0a. capture any TERMINAL status NOW, before anything overwrites it ----
-    #
-    # The frozen contract's rule 4 requires `run_once` to stop when the job is
-    # already `expired_unrecoverable`, or has spent its download allowance, and to
-    # never mint against it. Two earlier attempts at this guard were silently inert,
-    # so both are recorded here:
-    #
-    #   1. It was first written before `_finish` existed (it is a closure created
-    #      further down), so it would have raised `NameError` on exactly the path it
-    #      protected. No test exercised that path, so nothing noticed.
-    #   2. It was then placed after the closure — but the line
-    #      `ledger.set_job_status(cfg.archive_id, "scraping")` runs between them and
-    #      overwrites the status, so the guard compared "scraping" against the
-    #      terminal set and never fired.
-    #
-    # Hence: read the row FIRST, and act on the snapshot after `_finish` exists. The
-    # `set_job_status("scraping")` call is what defeated the naive version, so the
-    # snapshot has to be taken on this side of it.
-    _prior = ledger.job(cfg.archive_id)
-    _terminal_status: Optional[str] = None
-    _terminal_error: Optional[str] = None
-    _terminal_expiry: Optional[str] = None
-    if _prior is not None and _prior["status"] in TERMINAL_BLOCKED_STATUSES:
-        _terminal_status = _prior["status"]
-        _terminal_error = _prior["error"]
-        _terminal_expiry = _prior["expiry_at"]
+    async def finish(status, error=None):
+        ledger.set_job_status(cfg.archive_id, status, error=error)
+        rows = ledger.parts(cfg.archive_id)
+        job = ledger.job(cfg.archive_id)
+        count = max(expected_count, len(rows), job["expected_count"] or 0)
+        report = build_report(rows, archive_id=cfg.archive_id, account=cfg.account,
+                              status=status, expiry_at=expiry, now=now,
+                              attempts=ledger.attempts_by_kind(cfg.archive_id),
+                              attempt_kinds=ledger.attempt_kinds_by_part(cfg.archive_id))
+        report.parts_expected = count
+        report.parts_done = sum(r.status == "done" for r in rows)
+        if not report.complete or not list_evidence:
+            report.verdict = "INCOMPLETE"
+        if not list_evidence:
+            report.warnings.append("Expected-count evidence is absent; recorded rows are not proof of the complete export list.")
+        return RunOutcome(cfg.archive_id, status, count, report.parts_done,
+                          sum(r.size_on_disk for r in rows if r.status == "done"),
+                          report.as_markdown(), error, list(report.warnings))
 
     try:
-        ledger.upsert_job(cfg.archive_id, account=cfg.account,
-                          output_dir=cfg.archive_dir)
-        ledger.set_job_status(cfg.archive_id, "scraping")
+        prior = ledger.job(cfg.archive_id)
+        if prior and cfg.account and prior["account"] and cfg.account != prior["account"]:
+            return RunOutcome(cfg.archive_id, "failed", error="account mismatch for recorded archive")
+        ledger.upsert_job(cfg.archive_id, account=cfg.account, output_dir=cfg.archive_dir)
+        list_evidence = bool(prior and prior["expected_count"])
+        if cfg.work_url:
+            work = urlsplit(cfg.work_url)
+            if (work.scheme != "https" or work.hostname != "takeout.google.com"
+                    or work.username or work.password
+                    or work.path != "/manage/archive/" + cfg.archive_id):
+                return await finish("failed", "unsafe archive work URL or archive mismatch")
+        if prior and prior["status"] in TERMINAL_BLOCKED_STATUSES:
+            expiry = prior["expiry_at"]
+            return await finish(prior["status"], prior["error"] or "terminal export")
+        if cfg.mint_only and cfg.cached_transfer_only:
+            return await finish("failed", "mint_only and cached_transfer_only are incompatible")
+        if cfg.staging_reserve < 0 or (cfg.min_headroom is not None and cfg.min_headroom < 0):
+            return await finish("failed", "headroom and reserve must be nonnegative")
+        assert_staging_ready(cfg.staging_dir, min_headroom=cfg.min_headroom)
+        async with AsyncExitStack() as stack:
+            session = None
+            jar = None
 
-        async def _finish(status: str, *, error: Optional[str] = None) -> RunOutcome:
-            rows = ledger.parts(cfg.archive_id)
-            # `present` so the report can see bytes that are in the archive but were not
-            # transferred by this ledger. Without it a resumed run reports `0/68` on an
-            # export that is complete on disk, because v2 (or an earlier ledger) did the
-            # downloading — observed live on the 62-product export.
-            try:
-                _present = index_destination(cfg.archive_dir)
-            except Exception:
-                # A missing or unmounted destination must not break reporting; the report
-                # falls back to ledger-only, which is what it always used to do.
-                _present = None
-            report = build_report(rows, archive_id=cfg.archive_id, account=cfg.account,
-                                  status=status, expiry_at=_expiry_seen, now=now,
-                                  attempts=ledger.attempts_by_kind(cfg.archive_id),
-                                  attempt_kinds=ledger.attempt_kinds_by_part(cfg.archive_id),
-                                  present=_present)
-            summary = ledger.summary(cfg.archive_id)
-            return RunOutcome(
-                archive_id=cfg.archive_id,
-                status=status,
-                parts_expected=report.parts_expected,
-                parts_done=report.parts_done,
-                bytes_moved=sum(r.size_on_disk for r in rows),
-                report_markdown=report.as_markdown(),
-                error=error,
-                notes=list(report.warnings),
-            )
+            async def browser(*, read_only=False):
+                nonlocal session
+                if session is None:
+                    factory = session_factory
+                    if read_only and not injected_session_factory:
+                        factory = _default_session_factory(cfg.cdp_http, read_only=True)
+                    session = await stack.enter_async_context(factory())
+                return session
 
-        _expiry_seen: Optional[str] = None
-
-        # ---- 0b. act on the terminal snapshot captured above ---------------
-        # Placed here because `_finish` is a closure created just above; the
-        # snapshot itself was taken before `set_job_status("scraping")` could
-        # overwrite it. See the comment at the top of `run_once`.
-        if _terminal_status is not None:
-            _expiry_seen = _terminal_expiry
-            return await _finish(
-                _terminal_status,
-                error=(_terminal_error or "").strip()
-                      or (f"job is already {_terminal_status}; refusing to re-attempt "
-                          "a terminal export — see runbooks 1.14 / 1.19"),
-            )
-
-        # ---- 0c. staging must have room --------------------------------
-        # The architecture requires an approved-root and headroom check; the only thing
-        # that existed was `os.makedirs`. Staging shares a volume with rclone's VFS
-        # cache (`--vfs-cache-max-size 100G`) on the box this was written for, so one
-        # full transfer transiently occupies staging PLUS cache, and running out
-        # mid-write wedges a partial (failure mode 1.16).
-        #
-        # `cfg.min_headroom` defaults to None = do not check, deliberately: v2's
-        # hard-coded 20 GiB floor had no escape and made its own suite unrunnable on a
-        # nearly-full development disk, so the guard meant to protect production broke
-        # every test. The escape here is explicit, and the CLI supplies a real value.
-        #
-        # Placed AFTER `_finish` exists — this guard was nearly written next to
-        # `makedirs` above, which would have referenced the closure before it was
-        # created and failed only on the path it was meant to protect.
-        try:
-            assert_staging_ready(cfg.staging_dir, min_headroom=cfg.min_headroom)
-        except MoveRefused as exc:
-            ledger.set_job_status(cfg.archive_id, "failed", error=str(exc))
-            return await _finish("failed", error=f"refusing to stage: {exc}")
-
-        # Opening the browser session is the first thing that can fail, and it used
-        # to fail UNCAUGHT: `_default_session_factory` fetches `/json/list`, so a
-        # Chromium that is down, or that has no page target, raised straight out of
-        # `run_once` past the CLI as a traceback — leaving the job parked on
-        # `scraping` with no error recorded.
-        #
-        # It is classified in `_default_session_factory` (as `BrowserUnavailable`)
-        # and caught at the outer `except` below, NOT by probing `/json/list` here.
-        # A local pre-flight was tried first and was wrong: probing the CDP endpoint
-        # directly bypassed every test's injected `session_factory`, so the suite
-        # made real sockets and 13 tests failed. The factory is the injectable seam —
-        # whatever IT raises is the browser's availability, by definition.
-        async with session_factory() as session:
-            # ---- 1. scrape -------------------------------------------------
-            # Navigate to a *rapt-bearing* archive URL when one is recoverable.
-            #
-            # This was the bug that killed the first real run. The bare URL
-            # `.../manage/archive/<id>` serves `data-download-uri` links with no
-            # `rapt`, even on an authenticated session with the export marked
-            # Completed — because the rapt is embedded into the page's links
-            # only when the page request itself carried one. The redirector
-            # minted from such a link bounces to ServiceLogin, which is
-            # indistinguishable from "ReAuth required" unless you know this.
-            #
-            # The browser's own tab keeps those URLs in its navigation history,
-            # and reusing one costs nothing (navigation is a measured Δ0).
-            work_url = cfg.resolved_work_url()
-            rapt_url = None
-            if not cfg.work_url:
-                rapt_url = await recover_rapt_url(session, cfg.archive_id)
-                if rapt_url:
-                    work_url = rapt_url
-
-            page = await read_archive(session, work_url, settle=cfg.settle)
-
-            # ---- offline fallback: the ledger may already be sufficient --------
-            #
-            # This is what makes the transfer pass genuinely window-independent, which is
-            # the whole justification for `--mint-only`. Without it the transfer scraped
-            # the page, needed a live rapt for that scrape, and died with `needs_reauth`
-            # before moving anything — measured 2026-09-22, on an export whose URLs were
-            # ALL already cached. Minting first bought nothing.
-            #
-            # Only taken when EVERY part has a cached URL and a real name
-            # (`page_from_ledger` returns None otherwise), so this can never mask a
-            # partial view of the export. When it does fire, the run needs no browser
-            # work at all: no scrape, no mint, no token.
-            _from_ledger = False
-            if page.challenged or not page.parts:
-                # Capture WHY before `page` is reassigned, or the note below reports the
-                # ledger page's own state instead of the reason we fell back.
-                _why = "challenge" if page.challenged else "no parts"
-                _ledger_page = page_from_ledger(ledger, cfg.archive_id)
-                if _ledger_page is not None:
-                    page = _ledger_page
-                    _from_ledger = True
-                    print(f"note: the archive page was unavailable ({_why}), but all "
-                          f"{len(page.parts)} part(s) already have cached URLs — "
-                          f"working from the ledger, no token needed. Completeness will "
-                          f"be judged against the part list this ledger recorded during "
-                          f"its last authenticated scrape.", file=sys.stderr)
-
-            if page.challenged:
-                ledger.set_job_status(cfg.archive_id, "needs_reauth",
-                                      error=f"challenge at {page.url}")
-                return await _finish("needs_reauth",
-                                     error=f"the archive page is a sign-in page: {page.url}")
-
-            # NOTE: deliberately NO special case for an empty page. Zero parts is not a
-            # ReAuth situation — it means the export has nothing downloadable yet — and
-            # reporting `needs_reauth` would send an operator to re-authenticate for no
-            # reason. `test_rule7_zero_parts_is_never_complete` pins that it must end
-            # `failed` or `incomplete` with an explanation, and an earlier draft of this
-            # very change broke that invariant by adding such a branch.
-
-            # Keep the tokened page loaded. `_restore`'s docstring promises this,
-            # and it is worth having: a tab left on the rapt page is what lets the
-            # *next* run recover the token for free instead of needing ReAuth.
-            restore_url = page.url if "rapt=" in (page.url or "") else work_url
-
-            _expiry_seen = page.expiry
-            exp = parse_expiry(page.expiry)
-
-            # ---- 2. expiry guard, BEFORE any mint --------------------------
-            if exp is not None and now > exp:
-                ledger.set_job_status(cfg.archive_id, "expired_unrecoverable",
-                                      error=f"export expired at {page.expiry}")
-                return await _finish(
-                    "expired_unrecoverable",
-                    error=(f"export expired at {page.expiry} — the source objects are gone; "
-                           "a NEW export is the only remedy"))
-
-            # ---- 3. index the parts ----------------------------------------
-            try:
-                page.assert_indexed()
-            except AutopilotError as exc:
-                ledger.set_job_status(cfg.archive_id, "failed", error=str(exc))
-                return await _finish("failed", error=f"scrape is unusable: {exc}")
-
+            page = page_from_ledger(ledger, cfg.archive_id,
+                                    cached_transfer_only=cfg.cached_transfer_only)
+            if page is None and not cfg.mint_only:
+                recorded = ledger.parts(cfg.archive_id)
+                if recorded and all(r.status == "done" or r.minted_url or
+                                    _staged_complete(cfg, ledger.part(cfg.archive_id, r.idx)) for r in recorded):
+                    page = page_from_ledger(ledger, cfg.archive_id, cached_transfer_only=True)
+            if page is None and cfg.cached_transfer_only:
+                return await finish("incomplete", "no recorded part list; cached-only never scrapes or mints")
+            if page is None:
+                session = await browser()
+                work_url = cfg.resolved_work_url()
+                if not cfg.work_url:
+                    work_url = await recover_rapt_url(session, cfg.archive_id) or work_url
+                page = await read_archive(session, work_url, settle=cfg.settle)
+                list_evidence = not page.challenged and bool(page.parts)
+                if page.challenged:
+                    return await finish("needs_reauth", "archive authentication challenge; left visible")
+            page.assert_indexed()
             if not page.parts:
-                # Zero parts is emphatically NOT success.
-                ledger.set_job_status(cfg.archive_id, "failed",
-                                      error="no parts were scraped")
-                return await _finish("failed",
-                                     error="no parts were scraped — nothing to do, "
-                                           "and this must not read as success")
+                return await finish("failed", "no parts were recorded")
 
-            ledger.upsert_parts(cfg.archive_id,
-                                [(p.index, p.filename, _int_size(p.size)) for p in page.parts])
+            def validate_page(p):
+                users = {x.user for x in p.parts if x.user}
+                if len(users) > 1 or any(x.archive_id and x.archive_id != cfg.archive_id for x in p.parts):
+                    raise AutopilotError("archive/account mismatch in discovered parts")
+                user = next(iter(users), None)
+                job = ledger.job(cfg.archive_id)
+                requested = parse_query(cfg.work_url or "").get("user")
+                if requested and job["user_id"] and requested != job["user_id"]:
+                    raise AutopilotError("requested account mismatch")
+                known = job["user_id"] or requested or (cfg.account if (cfg.account or "").isdigit() else None)
+                if user and known and known != user:
+                    raise AutopilotError("discovered account mismatch")
+                for x in p.parts:
+                    if x.redirector:
+                        parsed = urlsplit(x.redirector)
+                        if parsed.scheme != "https" or parsed.hostname != "takeout.google.com" or parsed.username or parsed.password:
+                            raise AutopilotError("unsafe redirector")
+                return user
 
-            # ---- 3b. a tokened link is REQUIRED to mint --------------------
-            # Measured: a rapt-less redirector bounces to ServiceLogin. That is not a
-            # ReAuth requirement — it means the page was loaded without a rapt (see the
-            # block comment in `scrape.py`). Detecting it here saves a mint attempt and
-            # stops the run reporting "ReAuth required" when the session was never at
-            # fault.
-            #
-            # But detecting it is not enough: a token can be EARNED. Measured
-            # 2026-09-19 — a fully signed-in session still serves untokened links, and
-            # navigating the redirector once bounces back with a fresh token. So the
-            # first response is to go get one, not to demand a human. Previously the
-            # run could only work when someone had just clicked through a download,
-            # and reported `needs_reauth` otherwise — including right after a sign-in.
-            if not page_has_rapt(page):
-                _redirector = next((p.redirector for p in page.parts if p.redirector), "")
-                if _redirector:
-                    _provoked = await provoke_rapt(session, _redirector,
-                                                   settle=cfg.settle)
-                    if _provoked:
-                        page = await read_archive(session, _provoked, settle=cfg.settle)
-                        restore_url = (page.url if "rapt=" in (page.url or "")
-                                       else _provoked)
-                        if page.challenged:
-                            ledger.set_job_status(cfg.archive_id, "needs_reauth",
-                                                  error=f"challenge at {page.url}")
-                            return await _finish(
-                                "needs_reauth",
-                                error=f"the archive page is a sign-in page: {page.url}")
+            user = validate_page(page)
+            expiry = page.expiry
+            expected_count = max([len(page.parts), ledger.job(cfg.archive_id)["expected_count"] or 0]
+                                 + [int(n) for n in page.part_of_N])
+            if list_evidence:
+                ledger.record_part_list(cfg.archive_id, expected_count=expected_count, user_id=user)
+            ledger.upsert_job(cfg.archive_id, expiry_at=expiry)
+            ledger.upsert_parts(cfg.archive_id, [(p.index, p.filename, _int_size(p.size)) for p in page.parts])
+            exp = parse_expiry(expiry)
+            if exp is not None and now > exp:
+                return await finish("expired_unrecoverable", "export expired; new export required")
+            restore_url = page.url or cfg.resolved_work_url()
+            needs_mint = not cfg.cached_transfer_only and any(
+                ledger.part(cfg.archive_id, p.index)["status"] != "done"
+                and not ledger.minted_url(cfg.archive_id, p.index)
+                and not _staged_complete(cfg, ledger.part(cfg.archive_id, p.index))
+                for p in page.parts)
+            if needs_mint and not page_has_rapt(page):
+                # The historical provoke helper navigates a download redirector without
+                # ownership tracking. Do not let a token probe leak browser downloads.
+                return await finish("needs_reauth", "archive links lack rapt; human authentication required")
 
-            if not page_has_rapt(page):
-                ledger.set_job_status(
-                    cfg.archive_id, "needs_reauth",
-                    error="archive page served un-tokened download links")
-                return await _finish(
-                    "needs_reauth",
-                    error=("the archive page served download links carrying no "
-                           f"rapt, and provoking one by navigating the redirector "
-                           "did not produce a token either (loaded {0}). A human "
-                           "must satisfy the interactive ReAuth challenge. No "
-                           "download attempt was spent.").format(work_url))
+            for p in page.parts:
+                row = ledger.part(cfg.archive_id, p.index)
+                if row["status"] != "done":
+                    continue
+                name = row["filename"] or ""
+                valid = False
+                if remote and safe_filename(name) and row["sha256"]:
+                    # Stable backend receipts are the durable evidence. Re-reading
+                    # all prior multi-GB parts on every max_parts=1 pass is quadratic.
+                    # Changed paths, legacy/unconfirmed rows still need backend proof.
+                    valid = (row["remote_path"] == _remote_path(remote, name)
+                             and bool(row["remote_verified_at"])
+                             and row["size_expected"] is not None
+                             and row["size_on_disk"] == row["size_expected"]
+                             and len(row["sha256"]) == 64
+                             and all(c in "0123456789abcdef" for c in row["sha256"]))
+                    if not valid:
+                        result = await asyncio.to_thread(verify_remote_part, remote, filename=name,
+                                                        expected_size=row["size_expected"], sha256=row["sha256"])
+                        valid = _remote_confirmed(result, remote, name, row["size_expected"], row["sha256"])
+                        if valid:
+                            ledger.record_verified(cfg.archive_id, p.index, sha256=result.sha256,
+                                                   size=result.size, remote_path=result.remote_path)
+                elif not remote and row["sha256"]:
+                    assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
+                    if not fuse_mount_for(cfg.archive_dir, _read_mounts()):
+                        verified = _verify_part(_safe_path(cfg.archive_dir, name),
+                                                size_expected=row["size_expected"], hash_check=True,
+                                                sha256_expected=row["sha256"])
+                        valid = verified.ok
+                if not valid:
+                    ledger.invalidate_receipt(cfg.archive_id, p.index)
 
-            # ---- 4. the jar (only the transporter needs it) ----------------
-            try:
-                jar = await pull_jar(session)
-            except CookieError as exc:
-                ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
-                return await _finish("needs_reauth", error=str(exc))
-
-            # ---- 5. work the parts -----------------------------------------
-            # Assert the destination really is the mount BEFORE indexing it.
-            #
-            # This call was missing at first: `assert_destination_ready` was
-            # implemented and tested, the CLI passed `require_mount` in, and
-            # `cfg.require_mount` was never read — so failure mode 1.7 was
-            # unguarded on the only path that matters. When the rclone daemon dies
-            # the kernel turns /opt/archives into an ordinary empty directory on a
-            # 13 GB root filesystem, and an unguarded mover writes terabytes into
-            # it. A well-tested guard that nothing calls is not a guard.
-            #
-            # Unlike a FUSE *ledger* path (a caller bug, which raises), a detached
-            # destination mount is an environment fault that comes and goes, so it
-            # becomes a `failed` outcome rather than an exception — the operator
-            # gets a clear message and exit 1 instead of a traceback.
-            try:
-                assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
-            except MoveRefused as exc:
-                ledger.set_job_status(cfg.archive_id, "failed", error=str(exc))
-                return await _finish("failed",
-                                     error=f"refusing to write: {exc}")
-
-            # The phase label has to name the phase that is actually running.
-            # A `--mint-only` run reaches this line too (the destination-ready
-            # check is shared by both paths), so an unconditional `transferring`
-            # made a mint-only run claim it was transferring while it minted and
-            # moved nothing at all — observed on the 62-product mint, which
-            # reported `transferring` with 63 of 68 URLs earned and zero bytes on
-            # the wire. Nothing keys off the value, which is exactly why nobody
-            # noticed: the only consumer is a human reading the status.
-            ledger.set_job_status(cfg.archive_id,
-                                  "minting" if cfg.mint_only else "transferring")
-            dest_index = index_destination(cfg.archive_dir)
-            todo = [p for p in page.parts if _needs_work(ledger, cfg.archive_id, p.index)]
+            todo = [p for p in page.parts if ledger.part(cfg.archive_id, p.index)["status"] != "done"]
+            if cfg.cached_transfer_only:
+                todo = [p for p in todo if ledger.minted_url(cfg.archive_id, p.index)]
             if cfg.max_parts is not None:
-                todo = todo[: max(0, cfg.max_parts)]
-
-            # ---- consult the destination index BEFORE minting anything -----
-            #
-            # `index_destination` and `plan_moves` were written for exactly this and
-            # the orchestrator never called them: the index was built here, written
-            # to later, and never READ. So a part whose bytes were already in the
-            # archive could still be re-minted (Δ1 against a 5-attempt allowance) and
-            # re-transferred. `test_moving_is_idempotent_by_planning` proved the
-            # mechanism correct in isolation while nothing in the run used it —
-            # a test that gave false confidence about production behaviour.
-            #
-            # Only parts whose REAL name is already recorded can be checked here,
-            # because the scrape can only ever produce the placeholder `download`
-            # (the redirector basename). For a fresh ledger the name is not knowable
-            # until after minting, so this prevents duplicate work on re-runs and on
-            # a ledger that lost its part rows — which is exactly when it matters.
-            already_present = []
-            _name_to_idx: dict = {}
-            for _p in todo:
-                _row = ledger.part(cfg.archive_id, _p.index)
-                _name = (_row["filename"] if _row else None) or ""
-                _size = _int_size(_p.size)
-                if _name and _name != "download" and _size is not None:
-                    _name_to_idx[_name] = _p.index
-                    already_present.append(
-                        (_name, os.path.join(cfg.staging_dir, _name), _size))
-            _skipped: set = set()
-            for _item in plan_moves(already_present, dest_index):
-                if _item.action == "skip-present" and _item.filename in _name_to_idx:
-                    _idx = _name_to_idx[_item.filename]
-                    ledger.set_part_status(cfg.archive_id, _idx, "done")
-                    _skipped.add(_idx)
-            if _skipped:
-                todo = [p for p in todo if p.index not in _skipped]
-
+                todo = todo[:max(0, cfg.max_parts)]
             for part in todo:
                 idx = part.index
-                # NOTE: `part.filename` is the *redirector* basename, which is the
-                # literal string `download` for every part of every export — so it
-                # is never used to name a file. The real name comes off the minted
-                # URL below and is threaded through staging, ledger and move.
-                staged = os.path.join(cfg.staging_dir, part.filename or f"part-{idx}.zip")
-                expected = _int_size(part.size)
-
-                # ---- mint, only if the cache says so -----------------------
-                minted_url = ledger.minted_url(cfg.archive_id, idx)
-                if minted_url is None:
-                    if not part.redirector:
-                        ledger.set_part_status(cfg.archive_id, idx, "failed",
-                                               error="no redirector URL on the page")
+                row = ledger.part(cfg.archive_id, idx)
+                expected = _int_size(row["size_expected"])
+                minted_url = row["minted_url"]
+                name = row["filename"] or ""
+                staged_complete = _staged_complete(cfg, row)
+                # CRC supplies evidence for ZIP adoption; opaque files need a trusted digest.
+                if not remote and not cfg.mint_only and safe_filename(name) and carries_part_identity(name) and expected:
+                    assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
+                    if not fuse_mount_for(cfg.archive_dir, _read_mounts()):
+                        dest = _safe_path(cfg.archive_dir, name)
+                        if os.path.isfile(dest):
+                            adopted = _verify_part(dest, size_expected=expected, hash_check=True,
+                                                   sha256_expected=row["sha256"])
+                            if adopted.ok and (row["sha256"] or name.lower().endswith(".zip")):
+                                ledger.record_verified(cfg.archive_id, idx, sha256=adopted.sha256, size=expected)
+                                ledger.set_part_status(cfg.archive_id, idx, "done")
+                                continue
+                if not minted_url and not staged_complete:
+                    if cfg.cached_transfer_only:
                         continue
+                    if not part.redirector:
+                        ledger.set_part_status(cfg.archive_id, idx, "pending", error="no cached URL or redirector")
+                        continue
+                    ledger.set_job_status(cfg.archive_id, "minting")
                     try:
-                        result = await mint_part(session, part.redirector,
-                                                 settle=cfg.settle,
-                                                 restore_url=restore_url)
-                    except NeedsReauth as exc:
-                        ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
-                        return await _finish("needs_reauth", error=str(exc))
-                    except QuotaExceeded as exc:
-                        # Terminal for THIS export. Caught before the generic
-                        # handler below so it is never downgraded to a per-part
-                        # failure that a later pass would pointlessly retry.
-                        ledger.set_job_status(cfg.archive_id, "quota_exceeded",
-                                              error=str(exc))
-                        return await _finish("quota_exceeded", error=str(exc))
-                    except (MintError, AutopilotError) as exc:
-                        ledger.set_part_status(cfg.archive_id, idx, "failed",
-                                               error=f"mint failed: {exc}")
+                        result = await mint_part(await browser(), part.redirector, settle=cfg.settle, restore_url=restore_url)
+                    except NeedsReauth:
+                        return await finish("needs_reauth", "mint authentication challenge; left visible")
+                    except QuotaExceeded:
+                        return await finish("quota_exceeded", "export download allowance exhausted")
+                    except MintError as exc:
+                        ledger.set_part_status(cfg.archive_id, idx, "failed", error=_sanitized(exc))
                         continue
                     minted_url = result.url
                     ledger.record_mint(cfg.archive_id, idx, minted_url)
-
-                # ---- the real filename, from the minted URL ----------------
-                # Measured 2026-09-19: the scraped name is `download` for EVERY
-                # part, so staging and the destination index both collapsed a
-                # multi-part export onto one filename. The file host's URL path
-                # carries the true name, e.g. `takeout-20260919T163231Z-1-001.zip`.
-                real_name = (part_filename_from_url(minted_url)
-                             or (part.filename if part.filename not in ("", "download") else "")
-                             or f"part-{idx}.zip")
-                if real_name != part.filename:
-                    part.filename = real_name
-                    ledger.set_part_filename(cfg.archive_id, idx, real_name)
-                staged = os.path.join(cfg.staging_dir, real_name)
-
-                # ---- mint-only: stop after every URL is earned --------------
-                # Measured 2026-09-19: a minted URL still served `206` with real zip
-                # bytes **81 minutes after it was minted**, long past the ~45-minute
-                # ReAuth window. Minting is what the window gates; TRANSFERRING only
-                # needs the jar.
-                #
-                # That matters at real scale. This loop mints per part as it goes, so a
-                # 63-part export taking hours would run out of window part-way and
-                # stop with `needs_reauth` — unable to earn the later URLs. Minting all
-                # of them first, while the window is fresh, makes the long transfer
-                # pass independent of it. Since minted URLs are already cached in the
-                # ledger, a second ordinary run picks them up and never mints again.
+                    if not getattr(result, "download_cleanup_confirmed", True):
+                        return await finish("failed", "automation download cancellation failed; URL cached, human cleanup required")
+                if minted_url:
+                    query = parse_query(minted_url)
+                    if ((query.get("j") and query["j"] != cfg.archive_id)
+                            or (query.get("i") and query["i"] != str(idx))):
+                        raise AutopilotError("cached URL archive/part mismatch")
+                    url_name = part_filename_from_url(minted_url)
+                    if url_name:
+                        if name != url_name and carries_part_identity(name) and staged_complete:
+                            raise AutopilotError("staged filename and cached URL mismatch")
+                        name = url_name
+                staged = _safe_path(cfg.staging_dir, name)
+                ledger.set_part_filename(cfg.archive_id, idx, name)
                 if cfg.mint_only:
                     continue
-
-                # ---- transfer (Range resume is free) -----------------------
-                ledger.set_job_status(cfg.archive_id, "transferring")
-                try:
-                    transfer = await download(
-                        http_client, minted_url, staged,
-                        jar_header=jar.header,
-                        expected_size=expected,
-                        etag=ledger.part(cfg.archive_id, idx)["etag"],
-                    )
-                except NeedsReauth as exc:
-                    # A transfer that is rejected for auth means THIS URL did not
-                    # work — session-wide or URL-expiry, we cannot tell which. It
-                    # was the only failure path that neither recorded the attempt
-                    # nor dropped the cached URL, so after a human re-authed, the
-                    # next run re-used the same rejected URL, failed identically,
-                    # and set `needs_reauth` again: a status a human could never
-                    # leave. Observed by two independent reviewers; it is the exact
-                    # v2 "park forever" shape this rebuild exists to remove.
-                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
-                    ledger.clear_mint(cfg.archive_id, idx)
-                    ledger.set_job_status(cfg.archive_id, "needs_reauth", error=str(exc))
-                    return await _finish("needs_reauth", error=str(exc))
-                except RemoteChanged as exc:
-                    # the remote object is not what we planned against: the cached
-                    # URL is useless, so drop it and let a later pass re-mint
-                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
-                    ledger.clear_mint(cfg.archive_id, idx)
-                    ledger.set_part_status(cfg.archive_id, idx, "partial",
-                                           error=f"remote changed: {exc}")
+                if expected is None:
+                    ledger.set_part_status(cfg.archive_id, idx, "pending", error="known exact size required")
                     continue
-                except (TransferError, AutopilotError) as exc:
-                    # A failed GET is still a GET. It used to book nothing, so the
-                    # ledger reported `transfer 0` for runs that had made real
-                    # requests — and the counter is the only budget signal this
-                    # project has.
-                    ledger.record_failed_transfer(cfg.archive_id, idx, exc)
-                    # A cached URL that just failed is not evidence of a working
-                    # URL, but neither is a transient blip: re-minting costs Δ1 and
-                    # the export's allowance is only 5. So retry the cached URL a
-                    # bounded number of times, then drop it rather than wedge the
-                    # part on it forever (the only other invalidation was
-                    # RemoteChanged).
-                    if ledger.failed_transfer_count(cfg.archive_id, idx) >= MAX_CACHED_URL_FAILURES:
+                have = os.path.getsize(staged) if os.path.isfile(staged) else 0
+                if have != expected:
+                    remaining = max(0, expected - have) if row["etag"] else expected
+                    assert_staging_ready(cfg.staging_dir, min_headroom=remaining + cfg.staging_reserve + (cfg.min_headroom or 0))
+                    if not minted_url:
+                        ledger.set_part_status(cfg.archive_id, idx, "pending", error="no cached URL")
+                        continue
+                    if jar is None:
+                        jar = await pull_jar(await browser(read_only=True))
+                    ledger.set_job_status(cfg.archive_id, "transferring")
+                    optional_headers = {}
+                    if getattr(jar, "user_agent", None):
+                        import inspect
+                        if "user_agent" in inspect.signature(download).parameters:
+                            optional_headers["user_agent"] = jar.user_agent
+                    try:
+                        transfer = await download(http_client, minted_url, staged, jar_header=jar.header,
+                                                  expected_size=expected, etag=row["etag"], expected_filename=name,
+                                                  **optional_headers)
+                    except NeedsReauth as exc:
+                        ledger.record_failed_transfer(cfg.archive_id, idx, exc)
                         ledger.clear_mint(cfg.archive_id, idx)
-                    ledger.set_part_status(cfg.archive_id, idx, "failed", error=str(exc))
-                    continue
-
-                kind = AttemptKind.RESUME if transfer.resumed_from else AttemptKind.TRANSFER
-                # `already-complete` means `download()` short-circuited because the
-                # staged file was already the expected size — it made ZERO requests,
-                # so booking it would increment the attempt counter for work that was
-                # not attempted, and the counter is the only budget signal here.
-                if transfer.status != "already-complete":
-                    ledger.record_transfer(cfg.archive_id, idx, kind, transfer.status,
-                                           bytes_moved=transfer.bytes_written,
-                                           size_on_disk=transfer.total_bytes,
-                                           etag=transfer.etag)
-
-                if not transfer.complete:
-                    ledger.set_part_status(cfg.archive_id, idx, "partial")
-                    continue
-
-                # ---- verify on LOCAL disk (cheap reads) --------------------
+                        return await finish("needs_reauth", "cached URL rejected authentication")
+                    except RemoteChanged as exc:
+                        ledger.record_failed_transfer(cfg.archive_id, idx, exc)
+                        ledger.clear_mint(cfg.archive_id, idx)
+                        ledger.set_part_status(cfg.archive_id, idx, "partial", error="remote changed")
+                        continue
+                    except TransferError as exc:
+                        ledger.record_failed_transfer(cfg.archive_id, idx, exc)
+                        ledger.set_part_status(cfg.archive_id, idx, "partial", error=_sanitized(exc))
+                        continue
+                    if transfer.status != "already-complete":
+                        ledger.record_transfer(cfg.archive_id, idx,
+                                               AttemptKind.RESUME if transfer.resumed_from else AttemptKind.TRANSFER,
+                                               transfer.status, bytes_moved=transfer.bytes_written,
+                                               size_on_disk=transfer.total_bytes, etag=transfer.etag)
+                    if not transfer.complete or transfer.error:
+                        # A failed stream can leave exactly the expected byte count.
+                        # Preserve those bytes as evidence, but never let a later
+                        # already-complete shortcut turn the failed read into success.
+                        if transfer.error and os.path.isfile(staged) and os.path.getsize(staged) >= expected:
+                            os.rename(staged, staged + ".corrupt-" + uuid.uuid4().hex)
+                        ledger.set_part_status(cfg.archive_id, idx, "partial", error=_sanitized(transfer.error) if transfer.error else None)
+                        continue
                 ledger.set_job_status(cfg.archive_id, "verifying")
-                outcome = verify_local(staged, size_expected=expected,
-                                       hash_check=cfg.verify_hash)
+                outcome = _verify_part(staged, size_expected=expected, hash_check=True,
+                                       sha256_expected=row["sha256"])
                 if not outcome.ok:
-                    ledger.set_part_status(
-                        cfg.archive_id, idx,
-                        "partial" if outcome.resumable else "failed",
-                        error=outcome.detail)
+                    # Byte-complete corrupt ZIPs must not short-circuit forever.
+                    if os.path.isfile(staged) and os.path.getsize(staged) >= expected and not outcome.resumable:
+                        os.rename(staged, staged + ".corrupt-" + uuid.uuid4().hex)
+                    ledger.set_part_status(cfg.archive_id, idx, "partial" if outcome.resumable else "failed", error=outcome.detail)
                     continue
-
-                # ---- move (rename last; index kept in memory) --------------
+                ledger.record_verified(cfg.archive_id, idx, sha256=outcome.sha256, size=expected)
                 ledger.set_job_status(cfg.archive_id, "moving")
-                moved = move_part(
-                    staged, cfg.archive_dir, filename=real_name,
-                    expected_size=expected,
-                    **{k: v for k, v in (("timeout", cfg.move_timeout),
-                                         ("stall", cfg.move_stall)) if v is not None})
-                if moved.action == "moved":
-                    dest_index.names[real_name] = expected or 0
+                confirmed = False
+                if remote:
+                    result = await asyncio.to_thread(archive_remote_part, staged, remote, filename=name,
+                                                    expected_size=expected, sha256=outcome.sha256)
+                    confirmed = _remote_confirmed(result, remote, name, expected, outcome.sha256)
+                    if confirmed:
+                        ledger.record_verified(cfg.archive_id, idx, sha256=outcome.sha256,
+                                               size=expected, remote_path=result.remote_path)
+                else:
+                    assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
+                    native = not fuse_mount_for(cfg.archive_dir, _read_mounts())
+                    moved = await asyncio.to_thread(move_part, staged, cfg.archive_dir, filename=name,
+                                                   expected_size=expected,
+                                                   **{k:v for k,v in (("timeout", cfg.move_timeout), ("stall", cfg.move_stall)) if v is not None})
+                    assert_destination_ready(cfg.archive_dir, require_mount=cfg.require_mount)
+                    native = native and not fuse_mount_for(cfg.archive_dir, _read_mounts())
+                    if native and moved.action in ("moved", "already-present", "skipped-present"):
+                        verified = _verify_part(_safe_path(cfg.archive_dir, name), size_expected=expected,
+                                                hash_check=True, sha256_expected=outcome.sha256)
+                        confirmed = verified.ok
+                if confirmed:
                     ledger.set_part_status(cfg.archive_id, idx, "done")
-                    # Free the staged copy once the archive copy is verified.
-                    #
-                    # Staging is scratch; the archive is the copy of record. Keeping
-                    # both costs a full duplicate of the export, and on the 64-product
-                    # pull that is 131.6 GB of a 300 GB volume that must also hold
-                    # rclone's 100 GB VFS cache — i.e. it does not fit (measured
-                    # 2026-09-21: 194 GB free vs ~232 GB wanted). OPT-IN because the
-                    # staged copy is the only way to re-verify without re-downloading,
-                    # and for a small export that safety net is worth its size.
-                    # Only ever after a verified move, never before.
                     if cfg.clean_staging:
                         try:
                             os.unlink(staged)
-                        except OSError as exc:
-                            print(f"warning: part {idx}: moved and verified, but the "
-                                  f"staged copy could not be removed ({exc})",
-                                  file=sys.stderr)
+                        except OSError:
+                            pass
                 else:
-                    # Verified but not moved: the part is NOT done — it is still
-                    # only staged, and saying otherwise would overstate completeness.
-                    ledger.set_part_status(cfg.archive_id, idx, "partial",
-                                           error=f"move failed: {moved.detail}")
-
-            # ---- 6. verdict -------------------------------------------------
+                    ledger.set_part_status(cfg.archive_id, idx, "partial", error="archive not backend/hash confirmed; staged bytes retained")
             summary = ledger.summary(cfg.archive_id)
-            remaining = summary["parts"] - summary["done"]
-            status = "complete" if remaining == 0 and summary["parts"] else "incomplete"
-            ledger.set_job_status(cfg.archive_id, status)
-            return await _finish(status)
-    except BrowserUnavailable as exc:
-        # A browser that cannot be reached means this job cannot proceed, and it
-        # must not be left mid-flight with no explanation. Narrow on purpose: this
-        # type is raised only by the session factory's own connect, so catching it
-        # here does not swallow defects elsewhere in the run.
-        _why = f"cannot reach the browser at {cfg.cdp_http}: {exc}"
-        try:
-            ledger.set_job_status(cfg.archive_id, "failed", error=_why)
-        except Exception:  # noqa: BLE001 - the ledger itself may be the problem
-            pass
-        return await _finish("failed", error=_why)
-    except AutopilotError as exc:
-        # A classified failure that escaped a specific handler still becomes a REPORTED
-        # status rather than a traceback. Without this, a CDP session whose reader died
-        # mid-run (now `CdpError`, which is an `AutopilotError`) propagated straight out
-        # of `run_once`, past the CLI, and left the job parked on whatever status it held
-        # with no record of why.
-        #
-        # Deliberately scoped to the project's own error family: a `TypeError` or
-        # `KeyError` is a defect and SHOULD surface as a traceback.
-        _why = f"{type(exc).__name__}: {exc}"
-        try:
-            ledger.set_job_status(cfg.archive_id, "failed", error=_why)
-        except Exception:  # noqa: BLE001 - the ledger itself may be the problem
-            pass
-        return await _finish("failed", error=_why)
+            complete = list_evidence and summary["done"] == expected_count and summary["parts"] == expected_count and expected_count > 0
+            return await finish("complete" if complete and not cfg.mint_only else "incomplete")
+    except CookieError as exc:
+        return await finish("needs_reauth", _sanitized(exc))
+    except (AutopilotError, OSError) as exc:
+        return await finish("failed", _sanitized(exc))
     finally:
         ledger.close()
 
 
-def _needs_work(ledger: Ledger, archive_id: str, idx) -> bool:
-    row = ledger.part(archive_id, idx)
-    if row is None:
-        return True
-    return row["status"] not in ("done",)
-
-
 def run_once_sync(cfg: RunConfig, **kwargs) -> RunOutcome:
-    """Blocking wrapper for CLI and shell callers."""
     return asyncio.run(run_once(cfg, **kwargs))

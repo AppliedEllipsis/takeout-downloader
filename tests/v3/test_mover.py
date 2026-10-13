@@ -49,17 +49,18 @@ def test_refuses_a_destination_that_is_not_on_a_fuse_mount(tmp_path):
     assert "not on a FUSE mount" in str(e.value)
 
 
-def test_a_SUBDIRECTORY_of_the_mount_passes():
-    """Containment, not equality — the real destination is a subdirectory.
-
-    The production destination is `/opt/archives/google-takeout/<acct>/<export>/`.
-    An equality test against mount points would refuse that correct path, which is
-    as bad as a guard that does nothing.
-    """
-    assert_destination_ready("/opt/archives", mounts=MOUNTS, require_mount=True)
-    nested = [("/", "ext4"), ("/opt/archives", "fuse.rclone")]
-    assert fuse_mount_for("/opt/archives/google-takeout/acct/2026-06-23", nested) \
-        == "/opt/archives"
+def test_a_SUBDIRECTORY_of_the_mount_passes(tmp_path):
+    """Use a real temporary root, not an OS-global directory that may not exist."""
+    root = tmp_path / "archive"
+    nested = root / "google-takeout" / "acct" / "export"
+    nested.mkdir(parents=True)
+    mounts = [(str(root), "fuse.rclone")]
+    assert_destination_ready(str(nested), mounts=mounts, require_mount=True)
+    found = fuse_mount_for(str(nested), mounts)
+    assert found is not None
+    assert found == fuse_mount_for(str(root), mounts)
+    assert is_mount_point(str(root), mounts)
+    assert not is_mount_point(str(nested), mounts)
 
 
 def test_refuses_a_destination_that_does_not_exist():
@@ -173,3 +174,89 @@ def test_moving_is_idempotent_by_planning(tmp_path):
     idx = index_destination(str(dest))
     plan = plan_moves([("p.zip", str(src), 50)], idx)
     assert plan[0].action == "skip-present"
+
+@pytest.mark.parametrize('filename', ['../escape', '/escape', 'a\b', 'C:foo', '', '..', 'NUL'])
+def test_move_rejects_unsafe_names(tmp_path, filename):
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    assert move_part(str(src), str(dest), filename=filename).action == 'failed'
+    assert not list(dest.iterdir())
+
+
+@pytest.mark.parametrize('data', [b'x', b'xyz'])
+def test_move_preserves_existing_mismatch(tmp_path, data):
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    final = dest / 'part.zip'
+    final.write_bytes(data)
+    r = move_part(str(src), str(dest), filename='part.zip')
+    assert r.action == 'skipped-size-mismatch'
+    assert final.read_bytes() == data
+    assert src.read_bytes() == b'abc'
+
+
+def test_move_checks_same_size_corrupt_copy(tmp_path, monkeypatch):
+    import autopilot.mover as mover
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    monkeypatch.setattr(mover, '_COPY_CHILD', mover._COPY_CHILD.replace("d.write(b)", "d.write(b'x' * len(b))"))
+    r = move_part(str(src), str(dest), filename='part.zip')
+    assert r.action == 'failed' and 'digest' in r.detail
+    assert not list(dest.iterdir())
+
+
+def test_move_rechecks_mount_loss(tmp_path, monkeypatch):
+    import autopilot.mover as mover
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    tables = iter([[(str(dest), 'fuse.rclone')], [(str(dest), 'fuse.rclone')], []])
+    monkeypatch.setattr(mover, '_read_mounts', lambda: next(tables))
+    r = move_part(str(src), str(dest), filename='part.zip')
+    assert r.action == 'failed' and 'mount lost' in r.detail
+    assert not (dest / 'part.zip').exists()
+
+
+def test_move_child_timeout(tmp_path, monkeypatch):
+    import autopilot.mover as mover
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    monkeypatch.setattr(mover, '_HASH_CHILD', 'import time; time.sleep(10)')
+    r = move_part(str(src), str(dest), timeout=.05)
+    assert r.action == 'failed'
+    assert not list(dest.iterdir())
+
+
+def test_move_rejects_traversal_destination_path(tmp_path):
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    r = move_part(str(src), str(dest / '..' / 'dest'))
+    assert r.action == 'failed' and not list(dest.iterdir())
+
+
+def test_move_no_clobber_concurrent_destination(tmp_path, monkeypatch):
+    import autopilot.mover as mover
+    src = tmp_path / 'source'
+    src.write_bytes(b'abc')
+    dest = tmp_path / 'dest'
+    dest.mkdir()
+    original_link = mover.os.link
+    def racing_link(tmp, final):
+        with open(final, 'wb') as f:
+            f.write(b'other writer')
+        return original_link(tmp, final)
+    monkeypatch.setattr(mover.os, 'link', racing_link)
+    assert move_part(str(src), str(dest), filename='part.zip').action == 'failed'
+    assert (dest / 'part.zip').read_bytes() == b'other writer'
+    assert not list(dest.glob('*.moving'))

@@ -9,6 +9,22 @@ Reference: `docs/v3/01-ARCHITECTURE.md`, and the measurements in
 """
 from __future__ import annotations
 
+import re
+from urllib.parse import urlsplit
+
+
+def redact_error(value: str) -> str:
+    """Expose URL hosts only: signed paths, queries and userinfo stay internal."""
+    def safe_url(match):
+        try:
+            parsed = urlsplit(match.group(0))
+            return f"{parsed.scheme}://{parsed.hostname or '<host>'}/<redacted>"
+        except ValueError:
+            return "<redacted-url>"
+    value = re.sub(r"https?://[^\s<>\"']+", safe_url, str(value), flags=re.I)
+    return re.sub(r"\b(rapt|[\w-]*token|password|passwd|authorization|cookie|sid)\s*[:=]\s*[^\s,;]+",
+                  r"\1=<redacted>", value, flags=re.I)
+
 __all__ = [
     "AutopilotError",
     "NeedsReauth",
@@ -21,7 +37,10 @@ __all__ = [
 
 
 class AutopilotError(Exception):
-    """Base class for every autopilot failure."""
+    """Base class for every autopilot failure, with safe exposed diagnostics."""
+
+    def __init__(self, *args):
+        super().__init__(*(redact_error(arg) if isinstance(arg, str) else arg for arg in args))
 
 
 class NeedsReauth(AutopilotError):
@@ -45,7 +64,7 @@ class NeedsReauth(AutopilotError):
 
     def __init__(self, url: str, detail: str = "") -> None:
         self.url = url
-        self.detail = detail
+        self.detail = redact_error(detail)
         super().__init__(
             f"ReAuth required (hit {url or 'a sign-in page'})"
             + (f": {detail}" if detail else "")
@@ -101,7 +120,7 @@ class QuotaExceeded(MintError):
 
     def __init__(self, url: str = "", detail: str = "") -> None:
         self.url = url
-        self.detail = detail
+        self.detail = redact_error(detail)
         super().__init__(
             "the export's download allowance is exhausted"
             + (f" ({detail})" if detail else "")

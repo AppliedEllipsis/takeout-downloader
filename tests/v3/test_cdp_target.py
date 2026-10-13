@@ -41,21 +41,22 @@ def test_prefers_a_takeout_tab():
     assert "takeout.google.com" in pick_page_target(targets)["url"]
 
 
-def test_falls_back_to_any_page_when_no_takeout_tab_exists():
+def test_refuses_to_drive_unrelated_tabs_when_no_takeout_tab_exists():
     targets = [t("https://example.com/"), t("chrome://newtab")]
-    assert pick_page_target(targets)["url"] == "https://example.com/"
+    with pytest.raises(AutopilotError, match="unrelated tabs"):
+        pick_page_target(targets)
 
 
 def test_ignores_non_page_targets():
     targets = [t("chrome-extension://abc/background.js", type_="service_worker"),
-               t("https://example.com/")]
+               t("https://takeout.google.com/manage")]
     assert pick_page_target(targets)["type"] == "page"
 
 
 def test_ignores_targets_without_a_debugger_url():
     targets = [{"type": "page", "url": "https://x/", "webSocketDebuggerUrl": ""},
-               t("https://y/")]
-    assert pick_page_target(targets)["url"] == "https://y/"
+               t("https://takeout.google.com/manage")]
+    assert pick_page_target(targets)["url"] == "https://takeout.google.com/manage"
 
 
 def test_raises_clearly_when_there_is_no_page_target():
@@ -112,3 +113,21 @@ def test_the_factory_attaches_to_a_page_target_not_the_browser(monkeypatch):
         f"endpoint cannot navigate. Got {seen['url']}")
     assert "/devtools/page/" in seen["ws"], (
         f"must attach to a page target, got {seen['ws']}")
+
+
+def test_read_only_cookie_attachment_can_use_challenge_tab_without_driving_it(monkeypatch):
+    import asyncio
+    import autopilot.run as run_mod
+    from orchestration_fixtures import FakeTransport
+    import autopilot.ws_transport as ws_mod
+    transport = FakeTransport(command_results={"Storage.getCookies": {"cookies": [
+        {"name": "SID", "value": "offline", "domain": ".google.com"}]}})
+    monkeypatch.setattr(run_mod, "_get_json", lambda *a: [t("https://accounts.google.com/challenge/pwd")])
+    async def connect(url, **kwargs):
+        return transport
+    monkeypatch.setattr(ws_mod.WebSocketTransport, "connect", classmethod(lambda cls, url, **kw: connect(url, **kw)))
+    async def read():
+        async with run_mod._default_session_factory("http://offline", read_only=True)() as session:
+            return await run_mod.pull_jar(session)
+    assert asyncio.run(read()).usable
+    assert not transport.navigated(), "reading a jar must not hide an authentication challenge"

@@ -73,3 +73,26 @@ def test_pull_jar_refuses_when_the_browser_has_no_google_cookies():
             return await pull_jar(session)
     with pytest.raises(CookieError):
         run(go())
+
+
+def test_suffix_is_exact_or_subdomain_not_substring():
+    from autopilot.jar import build_header
+    jar = build_header([
+        {"name": "ok1", "value": "a", "domain": ".google.com"},
+        {"name": "ok2", "value": "b", "domain": "takeout.google.com"},
+        {"name": "bad1", "value": "secret", "domain": "evilgoogle.com"},
+        {"name": "bad2", "value": "secret", "domain": "google.com.evil.test"},
+    ])
+    assert jar.header == "ok1=a; ok2=b" and jar.n_google == 2
+
+
+def test_optional_user_agent_only_when_session_adapter_supports_it():
+    import asyncio
+    from autopilot.jar import pull_jar
+    class Adapter:
+        async def call(self, method):
+            return {"cookies": [{"name": "SID", "value": "offline", "domain": ".google.com"}]}
+        async def value(self, expression):
+            assert expression == "navigator.userAgent"
+            return "Mozilla/5.0 offline-test"
+    assert asyncio.run(pull_jar(Adapter())).user_agent == "Mozilla/5.0 offline-test"

@@ -80,7 +80,7 @@ def test_refresh_branch_no_longer_requires_j_in_source():
 
     import autopilot.mint as mint_mod
 
-    src = inspect.getsource(mint_mod.mint)
+    src = inspect.getsource(mint_mod._mint_tracked)
     assert 'params.get("rapt") and params.get("j")' not in src, (
         "the old predicate demanded `j` and discarded a valid rapt")
     assert "archive_id_from_archive_url(refresh.location)" in src, (

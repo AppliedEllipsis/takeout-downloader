@@ -58,6 +58,22 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
 
 
+def _nonnegative_int(raw):
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return value
+
+
+def _positive_float(raw):
+    import math
+
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m autopilot",
@@ -67,7 +83,19 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run one pass over an export")
     _add_common(run)
     run.add_argument("--staging", required=True, help="local staging dir, e.g. /config/jobs/<id>")
-    run.add_argument("--archive", required=True, help="final destination dir")
+    run.add_argument("--archive", required=True, help="archive view/native-local destination dir")
+    run.add_argument("--archive-remote", default=None,
+                     help="full rclone export directory; enables checked direct backend upload")
+    run.add_argument("--rclone-binary", default="rclone")
+    run.add_argument("--rclone-config", default=None,
+                     help="encrypted rclone configuration path, never a password")
+    run.add_argument("--remote-timeout", type=_positive_float, default=21600)
+    run.add_argument("--staging-reserve", type=_nonnegative_int, default=0,
+                     help="extra bytes reserved for shared caches beyond part/headroom budget")
+    run.add_argument("--cached-transfer-only", action="store_true",
+                     help="transfer already-minted unfinished parts without spending a mint")
+    run.add_argument("--work-url", default=None,
+                     help="account-selected archive URL (user identity only, no reauth token)")
     run.add_argument("--account", default=None)
     run.add_argument("--cdp-http", default="http://127.0.0.1:9222")
     run.add_argument("--max-parts", type=int, default=None,
@@ -89,9 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "NOTE: exits 1 on SUCCESS, because work remains (no bytes "
                           "moved yet) — do not chain it with &&.")
     run.add_argument("--verify-hash", action="store_true",
-                     help="hash-verify instead of the cheap header+EOCD check")
+                     help="compute SHA256 in addition to archive CRC validation; "
+                          "direct remote mode compares staged and backend bytes")
     run.add_argument("--allow-unmounted-archive", action="store_true",
                      help="skip the destination-is-a-mount assertion (DEV ONLY)")
+
+    watch = sub.add_parser("watch", help="discover and archive exports unattended")
+    watch.add_argument("--config", required=True)
+    watch.add_argument("--once", action="store_true")
+    watch.add_argument("--dry-run", action="store_true")
 
     rep = sub.add_parser("report", help="print the completeness report from the ledger")
     _add_common(rep)
@@ -149,6 +183,13 @@ def cmd_run(args) -> int:
         move_stall=_env_float("AUTOPILOT_MOVE_STALL", None),
         mint_only=getattr(args, "mint_only", False),
         clean_staging=getattr(args, "clean_staging", False),
+        archive_remote=getattr(args, "archive_remote", None),
+        rclone_binary=getattr(args, "rclone_binary", "rclone"),
+        rclone_config=getattr(args, "rclone_config", None),
+        remote_timeout=getattr(args, "remote_timeout", 21600),
+        staging_reserve=getattr(args, "staging_reserve", 0),
+        cached_transfer_only=getattr(args, "cached_transfer_only", False),
+        work_url=getattr(args, "work_url", None),
     )
     outcome = run_once_sync(cfg)
 
@@ -236,6 +277,16 @@ def main(argv: Optional[list] = None) -> int:
     _make_output_unicode_safe()
     args = build_parser().parse_args(argv)
     try:
+        if args.cmd == "watch":
+            from .watch import WatchConfig, watch
+            try:
+                state = watch(WatchConfig.load(args.config), once=args.once, dry_run=args.dry_run)
+                print(json.dumps(state, sort_keys=True))
+                return EXIT_OK
+            except Exception:
+                # Config/browser errors can include tokens. Never print raw exceptions.
+                print("watch refused or unavailable; check configuration and local service", file=sys.stderr)
+                return EXIT_OTHER
         if args.cmd == "run":
             return cmd_run(args)
         if args.cmd == "report":

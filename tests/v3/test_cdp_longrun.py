@@ -186,13 +186,48 @@ def test_a_closed_session_raises_rather_than_hanging():
 # the outer safety net
 # ==========================================================================
 def test_run_once_reports_an_escaped_autopilot_error_as_a_status(tmp_path):
-    """A `CdpError` escaping mid-run must become `failed` with the reason recorded,
-    not a traceback that leaves the job on its previous status."""
-    import inspect
+    """Execute the safety net instead of requiring a particular except spelling."""
+    from contextlib import asynccontextmanager
+    from autopilot.ledger import open_ledger
+    from autopilot.run import RunConfig, run_once
 
-    import autopilot.run as run_mod
+    stage, archive = tmp_path / "stage", tmp_path / "archive"
+    stage.mkdir()
+    archive.mkdir()
+    cfg = RunConfig("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    str(tmp_path / "ledger.sqlite"), str(stage), str(archive),
+                    require_mount=False)
 
-    src = inspect.getsource(run_mod.run_once)
-    assert "except AutopilotError as exc:" in src
-    # and it must remain scoped to the project's own family, so real bugs still surface
-    assert "except Exception" not in src.split("except AutopilotError as exc:")[1][:400]
+    @asynccontextmanager
+    async def dead_session():
+        raise CdpError("reader died")
+        yield  # pragma: no cover - the connection fails before yielding
+
+    outcome = asyncio.run(run_once(cfg, session_factory=dead_session, http_client=object()))
+    assert outcome.status == "failed"
+    assert "reader died" in outcome.error
+    ledger = open_ledger(cfg.ledger_path)
+    try:
+        assert ledger.job(cfg.archive_id)["status"] == "failed"
+    finally:
+        ledger.close()
+
+
+def test_unexpected_programming_error_is_not_hidden_as_success(tmp_path):
+    from contextlib import asynccontextmanager
+    from autopilot.run import RunConfig, run_once
+
+    stage, archive = tmp_path / "stage", tmp_path / "archive"
+    stage.mkdir()
+    archive.mkdir()
+    cfg = RunConfig("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    str(tmp_path / "ledger.sqlite"), str(stage), str(archive),
+                    require_mount=False)
+
+    @asynccontextmanager
+    async def bad_session():
+        raise RuntimeError("programming bug")
+        yield  # pragma: no cover
+
+    with pytest.raises(RuntimeError, match="programming bug"):
+        asyncio.run(run_once(cfg, session_factory=bad_session, http_client=object()))

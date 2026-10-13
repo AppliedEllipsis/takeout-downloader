@@ -27,7 +27,8 @@ import pytest
 from autopilot.cdp import CdpSession
 from autopilot.ledger import LedgerOnFuseMount, open_ledger
 from autopilot.run import RunConfig, RunOutcome, run_once, run_once_sync
-from fake_cdp import FakeTransport, redirect_event
+from orchestration_fixtures import FakeTransport
+from fake_cdp import redirect_event
 from fake_http import FakeHttpClient, FakeStream
 
 ARCHIVE_ID = "f470fe32-76d6-43a6-9321-dbc76834919e"
@@ -229,6 +230,7 @@ def scenario(tmp_path, *, n_parts: int = 1, expiry: str = FUTURE,
         led.upsert_job(ARCHIVE_ID, account=ACCOUNT)
         led.upsert_parts(ARCHIVE_ID, [(i, part_filename(i), sizes[i])
                                       for i in range(n_parts)])
+        led.record_part_list(ARCHIVE_ID, expected_count=n_parts, user_id=USER)
         for i in range(n_parts):
             led.record_mint(ARCHIVE_ID, i, file_url(i))
         led.close()
@@ -341,7 +343,7 @@ def test_rule3_needs_reauth_from_mint_becomes_a_status(tmp_path):
     outcome = go(s)                                  # must not raise
 
     assert outcome.status == "needs_reauth"
-    assert "accounts.google.com" in (outcome.error or "")
+    assert "authentication" in (outcome.error or "")
     led = open_ledger(s["ledger_path"])
     try:
         job = led.job(ARCHIVE_ID)
@@ -362,7 +364,7 @@ def test_rule3_needs_reauth_from_transfer_becomes_a_status(tmp_path):
     outcome = go(s)                                  # must not raise
 
     assert outcome.status == "needs_reauth"
-    assert "accounts.google.com" in (outcome.error or "")
+    assert "authentication" in (outcome.error or "")
     led = open_ledger(s["ledger_path"])
     try:
         assert all(p.status != "failed" for p in led.parts(ARCHIVE_ID)), (

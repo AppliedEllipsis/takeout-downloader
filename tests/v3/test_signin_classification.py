@@ -59,7 +59,7 @@ def test_the_old_predicate_is_gone_from_source():
 
     import autopilot.mint as mint_mod
 
-    src = inspect.getsource(mint_mod.mint)
+    src = inspect.getsource(mint_mod._mint_tracked)
     assert "ACCOUNTS_HOST in r.location" not in src, (
         "matching the accounts host alone misclassifies RotateCookiesPage")
     assert "is_signin_location(r.location)" in src

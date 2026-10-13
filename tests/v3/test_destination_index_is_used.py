@@ -37,7 +37,7 @@ def _seed_ledger_with_real_name(s, name=REAL_NAME):
 
 def _place_in_destination(s, name=REAL_NAME, size=None):
     """Put the bytes in the archive, as a previous successful move would have."""
-    (s["archive"] / name).write_bytes(b"x" * (size if size is not None else s["sizes"][0]))
+    (s["archive"] / name).write_bytes(s["bodies"][0] if size is None else s["bodies"][0][:size])
 
 
 def test_a_part_already_in_the_destination_is_not_minted_or_transferred(tmp_path):
@@ -100,5 +100,5 @@ def test_the_wiring_exists_in_source_as_a_backstop(tmp_path):
     import autopilot.run as run_mod
 
     src = inspect.getsource(run_mod.run_once)
-    assert "plan_moves(" in src, "run_once must consult the destination index"
-    assert 'skip-present' in src, "the skip-present decision must be acted on"
+    assert "adopted = _verify_part(" in src
+    assert "adopted.ok" in src, "existing files require integrity evidence, not a size-only plan"

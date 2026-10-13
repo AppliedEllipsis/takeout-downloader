@@ -641,3 +641,13 @@ cached file-host URL as the entry (the response-form success return), so the dow
   the free-space delta in the live proof read −137 MB while the download had provably been
   cancelled. The exact signal is the byte count of `/config/Downloads`, and that is what the
   verification asserts.
+
+## 2026-10-13 — Preserve the hybrid and define unattended durability gates
+
+**Context.** Fresh exports require manual single-export commands; the current verifier rejects legitimate loose parts, and a FUSE fsync alone cannot establish backend upload. Source accounts are short of space and new exports are pending.
+
+**Decision.** Keep browser minting plus validated HTTP resume. Add explicit-account discovery, a persistent bounded watcher and supervisor. Validate archive members and legitimate non-ZIP parts; make computed hashes distinct from trusted comparisons. Use direct remote upload and forced backend size/digest confirmation before durable completion or staging cleanup. Never automatically retry rejected passwords or delete source-account data.
+
+**Alternatives.** Rewriting the transport or adopting Drive-destination exports would discard working resume behavior or add source-account storage demands. Timestamp-based reminting may spend attempts unnecessarily and is not an expiry oracle.
+
+**Consequences.** New mechanisms need offline integration and independent refutation, then a measured server release. Pending Google exports cannot be reported as tested/complete until actually available and downloaded. The acceptance contract is `docs/v3/05-WATCH-INTERFACE.md`; evidence index is `.wiki/reliability-audit.md`.

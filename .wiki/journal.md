@@ -1653,3 +1653,24 @@ one covering the most products holds nothing.
 | `.recon/_why_18of19.py` | Names the unreachable part instead of guessing |
 
 325 tests pass, was 271 at the start of this stretch.
+
+## 2026-10-13 — Audit baseline and unattended archival contract
+
+**What changed.** Corrected README/architecture to the implemented hybrid v3, recorded source-grounded reliability blockers and primary-source comparisons, and specified watcher/integrity/durability release gates. Audit reports and the resumable multi-phase plan are in `.pi/reports/` and `.pi/workflows/`. No source-account data or production download state was changed by the audits.
+
+**Decisions.** Preserve browser minting and HTTP resume; prioritize mixed-file validation, durable direct remote confirmation and supervised discovery. No password retry/bypass promises and no size-only COMPLETE claim. DeepSeek build calls hit HTTP 402 exhausted balance; unstarted builders were replaced by scoped `codex-everywhere/gpt-6.1-sol` lanes, with their actual provider verified.
+
+**Commands run** (from the active worktree unless stated):
+
+```bash
+python -m pytest tests/v3 tests/v2 -q
+# 797 passed, 6 live-gated tests skipped, exit 0 (pre-change baseline).
+git branch --show-current
+# feat/takeout-autopilot
+git remote -v
+# origin and server-final configured; no push yet.
+python --version
+# Python 3.12.7 on the workstation.
+```
+
+The baseline test command was executed by the isolated verification lane, not merely inferred from a prior report. New Google exports remain untested while pending. Live-server measurements are recorded separately once the server inspection completes.

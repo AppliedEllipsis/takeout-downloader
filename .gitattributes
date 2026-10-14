@@ -1,0 +1,2 @@
+# Keep POSIX shell scripts executable with stable LF bytes across platforms.
+*.sh text eol=lf

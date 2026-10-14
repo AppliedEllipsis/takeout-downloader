@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
-ROOT = r"D:\_projects\takeout_downloader_script\.claude\worktrees\takeout-autopilot"
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import autopilot.__main__ as main_mod  # noqa: E402
 from autopilot.run import RunOutcome  # noqa: E402

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 import sys
 import tempfile
 
-PY_ROOT = r"D:\_projects\takeout_downloader_script\.claude\worktrees\takeout-autopilot"
-if PY_ROOT not in sys.path:
-    sys.path.insert(0, PY_ROOT)
+PY_ROOT = Path(__file__).resolve().parents[2]
+if str(PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(PY_ROOT))
 
 from autopilot.ledger import AttemptKind, open_ledger
 from autopilot.report import build_report

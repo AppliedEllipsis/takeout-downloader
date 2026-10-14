@@ -1,43 +1,60 @@
-# v3 "autopilot" — design index
+# v3 autopilot — current reliability documentation
 
-The redesign of the Takeout downloader, written **after** the architecture was settled by measurement
-rather than by argument. Read `01-ARCHITECTURE.md` first.
+**Updated 2026-10-13. Owner deferred activation, rclone unlock and Google sign-in.**
+No real Google mint/download or password attempt. No live backend canary; pending
+and ready export counts are unknown. No new port or browser/container restart.
 
-| File | Purpose |
+| Page | Purpose |
 |---|---|
-| [01-ARCHITECTURE.md](01-ARCHITECTURE.md) | The design: premise, actors, state machine, modules, decisions, invariants, what we keep from v2, open unknowns |
+| [01-ARCHITECTURE.md](01-ARCHITECTURE.md) | September design history; current execution/receipt rules below supersede stale details |
+| [02-RUN-INTERFACE.md](02-RUN-INTERFACE.md) | Current one-export API/CLI, remote options and exit codes |
+| [03-OPERATIONS.md](03-OPERATIONS.md) | Runtime paths, permissions, checks and stop/recovery |
+| [04-FULL-PULL.md](04-FULL-PULL.md) | Future owner-gated full pull; not an executed release procedure |
+| [05-WATCH-INTERFACE.md](05-WATCH-INTERFACE.md) | Watch config, identity, scheduling and status contract |
+| [Wiki automation](../../.wiki/automation.md) | Authoritative host/container execution map and activation boundaries |
+| [Reliability evidence](../../.wiki/reliability-audit.md) | Measured reports and unresolved final gates |
+| [October journal](../../.wiki/journal-2026-10.md) | Dated source move/evidence/deferred work |
 
-**Companion documents (outside this folder):**
+## Current design
 
-| Where | What |
-|---|---|
-| `.wiki/measured-facts.md` | Every value the design is built on, measured live 2026-09-19 |
-| `.wiki/decisions.md` | The ADR trail, including the superseded architectures |
-| `.wiki/failure-modes.md` | Failure modes, with 1.9 (tab flood) fully documented |
-| `.wiki/runbooks.md` | Operational procedures, including how to run the attempt-cost experiment |
-| `.recon/11-root-cause-confirmed.md` | The ReAuth diagnosis, with the redirect chain |
-| `.recon/12-ladder-results-and-architecture.md` | The full measurement ladder and what it determines |
+1. **Browser mints; HTTP transporter moves.** Browser cookies/user agent support
+   file-host transfer, not bypass of interactive Google authentication.
+2. **Cache valid URLs; do not remint by age.** Mint only with tracked automation
+   ownership; preserve human tabs/downloads. Authentication is a visible pause.
+3. **Stage/ledger/state on encrypted local disk.** ZIP members get full CRC reads;
+   loose known-size files have explicitly weaker evidence. Computing a digest is
+   not comparing to a trusted source digest.
+4. **Durable mode uploads directly through rclone.** Exact backend size and forced
+   SHA256 comparison gate receipt/done/cleanup; FUSE fsync/size is insufficient.
+5. **Watcher schedules bounded fair work.** Strict account identity, pending poll,
+   OS lock, atomic sanitized status and backoff; no export creation/source deletion.
+6. **Host supervises inside-container non-root worker.** `tools/container_watch.py`,
+   foreground docker exec, existing manager venv and container-local CDP; mandatory
+   backend unlock preflight. Unit remains disabled/inactive.
 
-## The design in six lines
+## Source and evidence boundary
 
-1. **The browser mints; the transporter moves.** Only a real browser can satisfy the password ReAuth
-   that produces the `rapt` token — and `rapt` gates minting, not transferring.
-2. **Mint by navigating the redirector plainly** — observe the redirect `Location` over CDP `Network`
-   events and never abort the request (aborting prevents the mint). The extension cancels the browser's
-   stray download. **Resolved 2026-09-19** — see `01-ARCHITECTURE.md` §4.1.
-3. **`NEEDS_REAUTH` is a first-class state**, alerted and owned — never a `needs_cookie` park that
-   spawns a tab a minute for three months.
-4. **Stage on `/config`, verify there, then move** — never write to `/`, never run a SQLite ledger on the
-   rclone FUSE mount.
-5. **`Range` resumes are free; minting is the scarce resource.** Cache minted URLs and never re-mint.
-6. **`dl_counts` is telemetry, not an invariant** — the counter is demonstrably not a precise
-   per-download oracle.
+Canonical source: `C:/Users/User/_projects/takeout-downloader-reliability`, branch
+`feat/takeout-autopilot`. D original is unchanged (disk full). `1f7f9af` is already
+pushed **docs-only**, not the implemented release. Migrated baseline was
+971 passed / 6 skipped / 2 fixture failures; parent reports repaired focused
+fixtures 38 passed. Final actual-checkout whole-suite gate is not known here.
+Do not predict totals or infer deployment from offline passes. Earlier September
+measurements/ADRs remain dated history, including attempt-cost retractions.
 
-## Why the old approach is deleted rather than repaired
+## Protected environment and release boundary
 
-All three earlier generations extracted the cookie and replayed it for **minting**. That is impossible:
-a replayed jar carries no `rapt` and cannot answer an interactive prompt. `takeout2/cookie.py`, the
-`Storage.getCookies` capture path, the capture→POST→replay pipeline, the `needs_cookie` park and the
-1-minute recapture alarm all exist to serve that false premise and go with it.
+Mandatory unit `EnvironmentFile` is host-only
+`/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env` (`root:root 0600`),
+under `root:root 0700`, outside worker-writable PRIVATE and browser `/work`,
+`/config` binds. A worker-writable parent permits replacement and root environment
+injection even when the file is root-owned. PRIVATE remains host
+`/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot` →
+`/config/autopilot`, owner `20001:20001`, mode `0700`, no group/other bits;
+ancestor traversal is separate. No key/credential file was provided or created.
 
-The cookie is still used — but only for **transferring**, where it is measured to work.
+[CORE21495 is deployed](../../.wiki/core-release.md), not activated. Current unit
+uses `Restart=on-failure`, `RestartSec=30`, five starts per 300 seconds and stays
+disabled/inactive. Config-only alias preflight allows reviewed network terminal
+types and rejects unsupported wrappers/local/memory/unknown; it proves neither
+backend connectivity, canary nor durability. Owner-deferred gates remain.

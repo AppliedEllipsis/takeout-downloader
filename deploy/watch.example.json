@@ -1,0 +1,22 @@
+{
+  "state_dir": "/config/autopilot/state",
+  "ledger": "/config/autopilot/ledger.sqlite",
+  "staging_root": "/config/autopilot/staging",
+  "archive_root": "/opt/archives/google-takeout",
+  "archive_remote": "archives:google-takeout",
+  "cdp_http": "http://127.0.0.1:9222",
+  "poll_seconds": 60,
+  "retry_max_seconds": 3600,
+  "reauth_retry_seconds": 300,
+  "min_headroom": 5368709120,
+  "staging_reserve": 107374182400,
+  "rclone_binary": "/config/autopilot/bin/rclone",
+  "rclone_config": "/config/autopilot/rclone.conf",
+  "accounts": [
+    {
+      "name": "owner",
+      "manage_url": "https://takeout.google.com/manage?user=REPLACE_WITH_NUMERIC_GOOGLE_USER_ID",
+      "user_id": "REPLACE_WITH_NUMERIC_GOOGLE_USER_ID"
+    }
+  ]
+}

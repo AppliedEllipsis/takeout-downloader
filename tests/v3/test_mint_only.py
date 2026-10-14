@@ -40,7 +40,7 @@ def test_mint_only_earns_urls_without_transferring_anything(tmp_path):
     s = scenario(tmp_path, n_parts=1)
     cfg = RunConfig(archive_id=ARCHIVE_ID, ledger_path=s["cfg"].ledger_path,
                     staging_dir=s["cfg"].staging_dir, archive_dir=s["cfg"].archive_dir,
-                    account=ACCOUNT, settle=0.01, mint_only=True)
+                    account=ACCOUNT, require_mount=False, settle=0.01, mint_only=True)
 
     outcome = asyncio.run(run_once(cfg, session_factory=s["harness"],
                                    http_client=s["client"]))
@@ -59,7 +59,7 @@ def test_the_minted_urls_are_cached_for_the_next_pass(tmp_path):
 
     cfg = RunConfig(archive_id=ARCHIVE_ID, ledger_path=ledger_path,
                     staging_dir=s["cfg"].staging_dir, archive_dir=s["cfg"].archive_dir,
-                    account=ACCOUNT, settle=0.01, mint_only=True)
+                    account=ACCOUNT, require_mount=False, settle=0.01, mint_only=True)
     asyncio.run(run_once(cfg, session_factory=s["harness"], http_client=s["client"]))
 
     led = open_ledger(ledger_path)
@@ -71,11 +71,10 @@ def test_the_minted_urls_are_cached_for_the_next_pass(tmp_path):
     s2 = scenario(tmp_path, n_parts=1)
     cfg2 = RunConfig(archive_id=ARCHIVE_ID, ledger_path=ledger_path,
                      staging_dir=s2["cfg"].staging_dir, archive_dir=s2["cfg"].archive_dir,
-                     account=ACCOUNT, settle=0.01)
+                     account=ACCOUNT, require_mount=False, settle=0.01)
     asyncio.run(run_once(cfg2, session_factory=s2["harness"], http_client=s2["client"]))
     assert s2["client"].requests, "the second pass should transfer"
-    # it may still mint if the cached URL is missing, so assert the cache existed
-    assert s2["harness"].mint_navigations() != [] or s2["client"].requests != []
+    assert s2["harness"].mint_navigations() == [], "the cached URL must not be minted again"
 
 
 def test_run_once_checks_mint_only_after_minting_and_before_transferring():
@@ -133,7 +132,7 @@ def test_a_mint_only_run_reports_minting_and_never_transferring(tmp_path, monkey
 
     cfg = RunConfig(archive_id=ARCHIVE_ID, ledger_path=ledger_path,
                     staging_dir=s["cfg"].staging_dir, archive_dir=s["cfg"].archive_dir,
-                    account=ACCOUNT, settle=0.01, mint_only=True)
+                    account=ACCOUNT, require_mount=False, settle=0.01, mint_only=True)
     outcome = asyncio.run(run_once(cfg, session_factory=s["harness"],
                                    http_client=s["client"]))
 

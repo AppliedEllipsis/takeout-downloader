@@ -29,20 +29,18 @@
 # ----------------
 # Three volumes are mounted:
 #   1. ./downloads        -> /downloads   (default output + resume state)
-#   2. /opt (host)        -> /opt         (your JuiceFS / encfs storage)
+#   2. /opt/archives      -> /opt/archives (archive storage ONLY)
 #   3. . (app folder)     -> /work        (source dir; in.json here is found)
 #
-# Inside the TUI you can set the output directory to anything under /downloads
-# or /opt. To save into e.g.
-#     /srv/storage/google-takeout/my-takeout
-# just type or Browse to that path in the TUI — it's visible because /opt is
-# mounted. A host symlink like ./downloads/opt -> /opt is also followed by the
-# TUI (paths are resolved before the allowed-dir check).
+# Output roots are /downloads and /opt/archives only. For archive storage use
+# /opt/archives/google-takeout/my-takeout. The archive bind is deliberately
+# literal: STORAGE_ROOT overrides cannot expose /opt or host credentials.
+# Exclude host secrets from ALL mounts before provisioning credentials.
 #
 # WRITING THE PAYLOAD FILE
 # ------------------------
 # The TUI searches these in.json / payload.json / curl.txt locations in order:
-#   - the output dir you set (e.g. /srv/storage/google-takeout/.../in.json)
+#   - the output dir you set (e.g. /opt/archives/google-takeout/.../in.json)
 #   - the container cwd (/app — usually unmounted, skip)
 #   - /downloads             (mounted from ./downloads on host)
 #   - /downloads/drop        (mounted from ./drop on host)
@@ -51,23 +49,15 @@
 #   - $HOME (rarely useful in a container)
 #
 # Easiest flow: write to the SAME folder you'll download into:
-#     echo '{...}' > /srv/storage/google-takeout/my-takeout/in.json
+#     echo '{...}' > /opt/archives/google-takeout/my-takeout/in.json
 # Then type '.' in the TUI.
 #
 # JUICEFS / FUSE SUBMOUNTS
 # ------------------------
-# /opt on the host has FUSE submounts under it (JuiceFS: <storage-mount>,
-# gocryptfs: /opt/docker, /opt/caches). A plain bind mount would show those as
-# EMPTY dirs in the container. `recursive: enabled` (rbind) captures the
-# submounts that exist at start; `propagation: rslave` additionally keeps them
-# in sync if the host (re)mounts them while the container runs.
-#
-# `rslave` requires the host /opt to be a shared or slave mount. On systemd
-# systems / is shared by default, so /opt inherits that and this works. If the
-# container ever FAILS TO START with a propagation error, either run once:
-#     sudo mount --make-rshared /
-# or drop the `propagation: rslave` line below (recursive bind alone still shows
-# the submounts present at start, which is the common case).
+# The archive subtree may have FUSE submounts. `recursive: enabled` captures
+# existing submounts; `propagation: rslave` also follows host remounts. The host
+# archive mount must be shared or slave for propagation. Never broaden this
+# bind to /opt: sibling host-only credentials must remain outside the container.
 #
 # There is no web server, no exposed port, and no daemon — payloads come from
 # the browser extension via your clipboard (Copy as JSON -> paste), or from
@@ -92,10 +82,8 @@ services:
         required: false
 
     environment:
-      # Leave OUTPUT_DIR EMPTY by default so the app auto-detects: it prefers
-      # /srv/storage/google-takeout when that exists, else ./downloads.
-      # Forcing /downloads here would override that detection (the old bug).
-      # Set OUTPUT_DIR in .env or the shell to pin a specific path.
+      # Leave OUTPUT_DIR empty to retain application auto-detection; set it
+      # explicitly to a path under /opt/archives or /downloads when needed.
       OUTPUT_DIR: ${OUTPUT_DIR:-}
       TERM: ${TERM:-xterm-256color}
       # Persist last-used TUI settings on the mounted volume so they survive
@@ -106,9 +94,8 @@ services:
       # can `tail -f downloads/takeout.log` from a second SSH session even if
       # the TUI itself is frozen or hidden. Override with TAKEOUT_LOG_FILE.
       TAKEOUT_LOG_FILE: /downloads/takeout.log
-      # /opt is an allowed output root by default, but list it explicitly in
-      # case you point OUTPUT_DIR at a deep JuiceFS path.
-      ALLOWED_DIRS: /opt:/downloads
+      # Only archive storage and downloads are allowed output roots.
+      ALLOWED_DIRS: /opt/archives:/downloads
 
     volumes:
       # Downloaded archives + resume state (.downloading, .takeout_sizes.json)
@@ -127,11 +114,11 @@ services:
       # the TUI because the container's /app is not the same folder.
       - .:/work
 
-      # Host /opt (with its JuiceFS + encfs FUSE submounts) visible in-container.
+      # Only host archive storage (including its FUSE submounts) is visible.
       # bind-recursive + rslave is what makes the nested FUSE mounts show up.
       - type: bind
-        source: /opt
-        target: /opt
+        source: /opt/archives
+        target: /opt/archives
         bind:
           propagation: rslave
           recursive: enabled
@@ -152,7 +139,7 @@ services:
   #     docker compose run --rm takeout-cli
   #
   # Pass flags after the service name. NOTE: use SPACE not = with --out:
-  #   docker compose run --rm takeout-cli --out /srv/storage/...
+  #   docker compose run --rm takeout-cli --out /opt/archives/...
   # If you use --out=/path the equals sign confuses Docker Compose/runc
   # into thinking --out is an executable. Space is required.
   # Alternatively, set OUTPUT_DIR in .env to avoid the flag entirely.
@@ -168,7 +155,7 @@ services:
     environment:
       OUTPUT_DIR: ${OUTPUT_DIR:-}
       TERM: ${TERM:-xterm-256color}
-      ALLOWED_DIRS: /opt:/downloads
+      ALLOWED_DIRS: /opt/archives:/downloads
       # Empty by default: the CLI picks 1 for the internal engine (Google
       # serves Takeout single-stream) and 5 for aria2c. Set PARALLEL_DOWNLOADS
       # in .env/shell only to force a specific value.
@@ -180,8 +167,8 @@ services:
       - ./drop:/downloads/drop
       - .:/work
       - type: bind
-        source: /opt
-        target: /opt
+        source: /opt/archives
+        target: /opt/archives
         bind:
           propagation: rslave
           recursive: enabled

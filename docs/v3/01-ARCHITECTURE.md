@@ -1,8 +1,16 @@
 # v3 "autopilot" — architecture
 
-**Status:** design, grounded in measurement. Supersedes the v3 sketch the prior session left in a chat
-log, and supersedes the cookie-replay architecture of all three earlier generations.
-**Evidence:** every design choice below cites a measurement. The measurements live in
+**Status:** historical September 2026 design and measurements, not the current release contract.
+The October release supersedes the verifier, mover, cancellation and supervision sketches below.
+Current source/runtime map: [project architecture](../../.wiki/architecture.md).
+Verified CORE21495 deployment: [release evidence](../../.wiki/core-release.md).
+Current run/watch interface and operating gates: [02](02-RUN-INTERFACE.md),
+[03](03-OPERATIONS.md), [05](05-WATCH-INTERFACE.md). The host unit uses bounded
+`Restart=on-failure`; it remains disabled/inactive while owner-deferred storage
+unlock and Google authentication are unavailable. No live backend/export claim
+follows from these historical measurements.
+
+**Evidence:** each historical design choice below cites a measurement. The measurements live in
 `.wiki/measured-facts.md` (worktree) and `.recon/11-root-cause-confirmed.md`,
 `.recon/12-ladder-results-and-architecture.md` (main checkout).
 
@@ -132,7 +140,7 @@ recommendation; recorded so the trade-off is explicit if it is ever revisited.
 | `autopilot/report.py` | Completeness report + alerts | Telegram notifier already exists (`manager/notify.py`) |
 | `autopilot/errors.py` | The v3 failure-type family (`NeedsReauth`, `QuotaExceeded`, …) | One import; the distinctions the system depends on are named, not string-matched |
 | `autopilot/__main__.py` | CLI: `run` / `report`; maps statuses to exit codes 0/1/2/3/4 | The shell/cron surface — see `02-RUN-INTERFACE.md` |
-| `helpers/` | MV3 extension: cancels the browser's stray native downloads (auto-cancel stays ON) | Scrape/mint moved to Python over CDP (`scrape.py`/`mint.py`); the extension no longer drives them |
+| `helpers/` | MV3 extension; standing global auto-cancel is **OFF** | Python minting cancels only automation-owned GUID/frame downloads after URL capture; human downloads remain untouched |
 
 **Still to be deleted — a plan, not done** (migration step 4; see `03-OPERATIONS.md` §5): the CDP cookie
 *capture* pipeline (`takeout2/cookie.py`, still present at 146 lines), the capture→POST→replay path, the
@@ -234,8 +242,10 @@ Because the counter is untrustworthy and the true per-part cost is unresolved, t
 
 ## 5. Invariants (testable)
 
-1. **The browser never downloads Takeout bytes.** Auto-cancel stays ON; minting navigates the
-   redirector and observes over CDP `Network`, and never aborts the request (§4.1).
+1. **Human browser downloads are never globally cancelled.** Global auto-cancel is
+   OFF. Automated minting observes the redirector without Fetch interception, then
+   cancels only its tracked GUID/frame downloads after capture. It refuses to mint
+   without ownership tracking; cleanup failure is reported, never hidden.
 2. **A replayed cookie is used only for *transferring*, never for *minting*.**
 3. **The ledger file is never on a FUSE mount.**
 4. **Every scraped attribute is keyed by `i=`, and `distinct(i) == N` is asserted before planning.**

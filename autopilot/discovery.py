@@ -33,24 +33,55 @@ def archive_id(value):
     return canonical
 
 
-def safe_url(url, user_id, *, archive=False):
+def safe_url(url, user_id, *, archive=False, runtime=False, verified_user=False):
+    """Validate identity separately from short-lived runtime routing/proof keys.
+
+    Config calls use the default strict mode. A missing URL user can only be
+    filled by discovery after independent DOM identity verification, never by
+    authuser (an account slot) or rapt (a proof token). Runtime return values are
+    navigation-only: use stored_url before returning/persisting a reference.
+    """
     if not isinstance(user_id, str) or not re.fullmatch(r"[0-9]{1,32}", user_id):
         raise DiscoveryBlocked("missing or invalid user_id")
-    if not isinstance(url, str) or len(url) > 2048:
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(c) <= 32 or ord(c) == 127 for c in url):
         raise DiscoveryBlocked("invalid Takeout URL")
-    p = urlsplit(url)
+    try:
+        p = urlsplit(url)
+        q = parse_qs(p.query, keep_blank_values=True, strict_parsing=True,
+                     max_num_fields=10, errors="strict")
+    except (ValueError, UnicodeError):
+        raise DiscoveryBlocked("invalid Takeout URL") from None
     if p.scheme != "https" or p.netloc != "takeout.google.com" or p.fragment:
         raise DiscoveryBlocked("unsafe Takeout URL")
-    q = parse_qs(p.query, keep_blank_values=True)
-    if q.get("user") != [user_id] or set(q) - {"user", "page", "pageToken"}:
+    allowed = {"user"} | ({"page", "pageToken", "rapt", "authuser"} if runtime else set())
+    if set(q) - allowed or any(len(values) != 1 for values in q.values()):
+        raise DiscoveryBlocked("unsupported Takeout URL query")
+    if "user" not in q and runtime and verified_user:
+        q["user"] = [user_id]
+    if q.get("user") != [user_id]:
         raise DiscoveryBlocked("Takeout URL identity mismatch")
+    if "authuser" in q and not re.fullmatch(r"0|[1-9][0-9]{0,2}", q["authuser"][0]):
+        raise DiscoveryBlocked("invalid account routing key")
+    if "page" in q and not re.fullmatch(r"[0-9]{1,10}", q["page"][0]):
+        raise DiscoveryBlocked("invalid pagination key")
+    for key in ("rapt", "pageToken"):
+        if key in q and (not q[key][0] or len(q[key][0]) > 1024 or
+                         any(ord(c) <= 32 or ord(c) >= 127 for c in q[key][0])):
+            raise DiscoveryBlocked("invalid runtime token key")
     if archive:
         if not p.path.startswith("/manage/archive/"):
             raise DiscoveryBlocked("invalid archive path")
         archive_id(p.path[len("/manage/archive/"):])
     elif p.path != "/manage":
         raise DiscoveryBlocked("invalid manage path")
-    return url
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q, doseq=True), ""))
+
+
+def stored_url(url, user_id, *, archive=False):
+    """Token-free canonical reference; never persist runtime proof/routing keys."""
+    clean = safe_url(url, user_id, archive=archive, runtime=True)
+    p = urlsplit(clean)
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode({"user": user_id}), ""))
 
 
 @dataclass(frozen=True)
@@ -104,16 +135,13 @@ async def discover_pages(session, account, *, max_pages=10, max_exports=100, set
         data = json.loads(await session.value(SNAPSHOT_JS))
         if data.get("challenged"):
             raise DiscoveryBlocked("needs_reauth")
-        safe_url(data.get("url"), user)
         if data.get("users") != [user]:
             raise DiscoveryBlocked("account identity unverified")
+        safe_url(data.get("url"), user, runtime=True, verified_user=True)
         for link in data.get("archives", []):
-            # Links sometimes omit user; explicitly select the verified account.
-            p = urlsplit(link)
-            q = parse_qs(p.query)
-            if "user" not in q and not p.query:
-                link = urlunsplit((p.scheme, p.netloc, p.path, urlencode({"user": user}), ""))
-            safe_url(link, user, archive=True)
+            # Only independently verified manage DOM can fill an absent user.
+            # Keep proofs in memory for this navigation, never in stored refs.
+            link = safe_url(link, user, archive=True, runtime=True, verified_user=True)
             ident = archive_id(urlsplit(link).path.split("/")[-1])
             archives[ident] = link
             if len(archives) > max_exports:
@@ -123,7 +151,7 @@ async def discover_pages(session, account, *, max_pages=10, max_exports=100, set
             break
         if len(following) != 1:
             raise DiscoveryBlocked("ambiguous pagination")
-        url = safe_url(following[0], user)
+        url = safe_url(following[0], user, runtime=True, verified_user=True)
     else:
         raise DiscoveryBlocked("pagination limit exceeded")
     result = []
@@ -133,7 +161,7 @@ async def discover_pages(session, account, *, max_pages=10, max_exports=100, set
         data = json.loads(await session.value(SNAPSHOT_JS))
         if data.get("challenged"):
             raise DiscoveryBlocked("needs_reauth")
-        safe_url(data.get("url"), user, archive=True)
+        safe_url(data.get("url"), user, archive=True, runtime=True, verified_user=True)
         if urlsplit(data["url"]).path.split("/")[-1].lower() != ident:
             raise DiscoveryBlocked("archive identity mismatch")
         # A pending page can contain no account metadata at all. It remains
@@ -152,7 +180,7 @@ async def discover_pages(session, account, *, max_pages=10, max_exports=100, set
             indices.add(int(index))
         status = ("expired_unrecoverable" if data.get("expired") else
                   "google_failed" if data.get("failed") else "ready" if parts else "pending")
-        result.append(DiscoveredExport(ident, user, link, status, len(parts)))
+        result.append(DiscoveredExport(ident, user, stored_url(link, user, archive=True), status, len(parts)))
     return result
 
 

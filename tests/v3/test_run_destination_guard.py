@@ -20,12 +20,13 @@ verified. Injecting the table is what makes the refusal observable here at all.
 """
 from __future__ import annotations
 
-import sys
 from dataclasses import replace
+from pathlib import Path
+import sys
 
-ROOT = r"D:\_projects\takeout_downloader_script\.claude\worktrees\takeout-autopilot"
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import autopilot.ledger as ledger_mod  # noqa: E402
 from autopilot.run import run_once  # noqa: E402

@@ -18,14 +18,15 @@ nothing. `pick_page_target` is pure so this is testable without a browser.
 """
 from __future__ import annotations
 
-import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
+import sys
 
 import pytest
 
-ROOT = r"D:\_projects\takeout_downloader_script\.claude\worktrees\takeout-autopilot"
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from autopilot.errors import AutopilotError  # noqa: E402
 from autopilot.run import pick_page_target  # noqa: E402

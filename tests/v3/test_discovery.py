@@ -125,3 +125,94 @@ async def test_dedicated_target_closed_on_success_and_failure(monkeypatch):
     assert sum(method == "Target.closeTarget" for method, p in calls) == 2
     assert all(p["targetId"] == "our-target" for method, p in calls if method == "Target.closeTarget")
     assert all("our-target" in url for url in sockets if "/page/" in url)
+
+
+@pytest.mark.parametrize("query", ["&rapt=opaque-proof", "&authuser=0", "&rapt=opaque-proof&authuser=2",
+                                  "&page=2&pageToken=pagination-token"])
+def test_runtime_query_keys_validated_but_config_remains_token_free(query):
+    assert safe_url(ARCHIVE + query, USER, archive=True, runtime=True)
+    with pytest.raises(DiscoveryBlocked):
+        safe_url(MANAGE + query, USER)
+
+
+@pytest.mark.parametrize("query", ["&user=999", "&user=" + USER, "&rapt=", "&rapt=one&rapt=two",
+                                    "&rapt=%0Asecret", "&authuser=-1", "&authuser=email",
+                                    "&authuser=0&authuser=1", "&unknown=secret", "&badquery"])
+def test_runtime_queries_fail_closed_without_echoing_tokens(query):
+    with pytest.raises(DiscoveryBlocked) as exc:
+        safe_url(ARCHIVE + query, USER, archive=True, runtime=True)
+    assert "secret" not in str(exc.value)
+
+
+@offline_async
+@pytest.mark.parametrize("missing_user", [False, True])
+async def test_runtime_archive_proof_used_for_navigation_not_stored_refs(missing_user):
+    base = ARCHIVE.split("?", 1)[0]
+    runtime = base + ("?" if missing_user else "?user=" + USER + "&") + "rapt=opaque-proof&authuser=0"
+    first = page(MANAGE + "&rapt=manage-proof&authuser=0")
+    first["archives"] = [runtime]
+    final = page(runtime)
+    final["parts"] = [{"user": USER, "archive_id": ID, "index": "0"}]
+    session = Session([first, final])
+    found = await discover_pages(session, SimpleNamespace(user_id=USER, manage_url=MANAGE))
+    assert found[0].archive_url == ARCHIVE
+    assert found[0].status == "ready"
+    assert "opaque-proof" in session.navigated[1]
+    assert "user=" + USER in session.navigated[1]
+    assert "proof" not in repr(found) and "authuser" not in repr(found)
+
+
+@offline_async
+async def test_queryless_observed_locations_require_independent_identity():
+    first = page(MANAGE.split("?", 1)[0])
+    first["archives"] = [ARCHIVE.split("?", 1)[0]]
+    final = page(ARCHIVE.split("?", 1)[0])
+    final["parts"] = [{"user": USER, "archive_id": ID, "index": "0"}]
+    found = await discover_pages(Session([first, final]), SimpleNamespace(user_id=USER, manage_url=MANAGE))
+    assert found[0].archive_url == ARCHIVE and found[0].status == "ready"
+    first["users"] = []
+    with pytest.raises(DiscoveryBlocked, match="identity"):
+        await discover_pages(Session([first]), SimpleNamespace(user_id=USER, manage_url=MANAGE))
+
+
+@offline_async
+@pytest.mark.parametrize("where", ["link", "location", "part-user", "part-uuid", "location-uuid"])
+async def test_runtime_proofs_do_not_override_independent_user_or_archive_identity(where):
+    first = page(MANAGE)
+    first["archives"] = [ARCHIVE + "&rapt=proof&authuser=0"]
+    final = page(ARCHIVE + "&rapt=proof&authuser=0")
+    final["parts"] = [{"user": USER, "archive_id": ID, "index": "0"}]
+    if where == "link":
+        first["archives"] = [ARCHIVE.replace("user=" + USER, "user=999") + "&rapt=proof&authuser=0"]
+    elif where == "location":
+        final["url"] = final["url"].replace("user=" + USER, "user=999")
+    elif where == "part-user":
+        final["parts"][0]["user"] = "999"
+    elif where == "part-uuid":
+        final["parts"][0]["archive_id"] = "00000000-0000-0000-0000-000000000000"
+    else:
+        final["url"] = final["url"].replace(ID, "00000000-0000-0000-0000-000000000000")
+    with pytest.raises(DiscoveryBlocked):
+        await discover_pages(Session([first, final]), SimpleNamespace(user_id=USER, manage_url=MANAGE))
+
+
+@offline_async
+async def test_runtime_pagination_proof_not_export_reference():
+    first = page(MANAGE)
+    following = MANAGE + "&page=2&rapt=next-proof&authuser=0"
+    first["next"] = [following]
+    second = page(following)
+    second["archives"] = [ARCHIVE + "&rapt=archive-proof"]
+    final = page(ARCHIVE + "&rapt=archive-proof")
+    session = Session([first, second, final])
+    found = await discover_pages(session, SimpleNamespace(user_id=USER, manage_url=MANAGE))
+    assert session.navigated[1] == following
+    assert found[0].archive_url == ARCHIVE
+
+
+def test_config_rejects_runtime_keys_before_any_discovery():
+    from autopilot.watch import WatchConfig
+    for key in ("rapt=proof", "authuser=0", "pageToken=pagination-token", "page=2"):
+        with pytest.raises(DiscoveryBlocked):
+            WatchConfig.from_dict({"accounts": [{"name": "owner", "user_id": USER,
+                                                "manage_url": MANAGE + "&" + key}]})

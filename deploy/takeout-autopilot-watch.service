@@ -1,0 +1,44 @@
+# Install/update only after owner approval. KEEP DISABLED/INACTIVE until both
+# unlock and authenticated identity gates are separately approved.
+[Unit]
+Description=Takeout foreground container watcher bridge (activation deferred)
+After=network-online.target docker.service
+Wants=network-online.target
+RequiresMountsFor=/opt/local_cache_crypt
+ConditionPathIsMountPoint=/opt/local_cache_crypt
+ConditionPathExists=/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot/bin/rclone
+ConditionPathExists=/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot/watch.json
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Host bridge needs Docker authority, not the worker. Never add the worker to
+# docker group. Reserve/provision dedicated container UID:GID 20001:20001 and
+# chown PRIVATE directories/config to it (0700/0600).
+# Keep root credentials outside worker-writable and container-mounted paths:
+# /opt/local_cache_crypt/takeout-autopilot-secrets root:root 0700,
+# credentials.env root:root 0600. Worker must not replace the root EnvFile.
+User=root
+Group=root
+WorkingDirectory=/opt/local_cache_crypt/_projects/takeout-downloader/.v3
+EnvironmentFile=/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -I -B /opt/local_cache_crypt/_projects/takeout-downloader/.v3/tools/container_watch.py --container takeout-webgui --identity 20001:20001 --config /config/autopilot/watch.json
+# A crash is restartable, but bounded; activation remains separately deferred.
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=25
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot
+# Container child is outside the host unit cgroup: stdin EOF/8s lease and its
+# Linux subreaper are mandatory. Do not replace exec -i with detached execution.
+
+[Install]
+WantedBy=multi-user.target

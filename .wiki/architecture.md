@@ -1,66 +1,116 @@
 # Architecture and source map
 
-**Updated 2026-10-13.** Supersedes the preliminary September map. Live health and new-export end-to-end readiness are being audited; do not infer them from this source map.
+**Updated 2026-10-13.** Release source is the C checkout; activation is deferred.
+[Execution contract](automation.md) supersedes older host-worker and
+browser-native descriptions.
 
-## Current design: v3 hybrid autopilot
-
-Browser authentication and URL minting are separate from byte transfer. The real Chromium session navigates the Takeout redirector and captures the file-host URL. The Python HTTP transport uses a fresh browser cookie jar and HTTP Range to resume. Parts are staged locally, verified, and copied to archive storage. Cached URLs and progress persist in a local SQLite ledger.
+## Hybrid data flow
 
 ```text
-Takeout archive page
-  -> CDP scrape (part indices and expected sizes)
-  -> browser mint (interactive reauth may be required)
-  -> persistent ledger (local encrypted disk)
-  -> HTTP transfer (cookie jar, validator and resume)
-  -> local staging -> validation -> archive mover -> completeness report
+verified account manage page -> discovered export UUID / complete part list
+  -> pending: poll only; ready: bounded watcher pass
+  -> browser mint (human reauth boundary; cached URLs first)
+  -> HTTP transfer (cookie jar, validated Range/strong validator)
+  -> encrypted staging -> format/size/CRC validation + computed SHA256
+  -> direct rclone upload -> exact size + forced backend SHA256 + size
+  -> ledger receipt -> done -> optional staging cleanup
 ```
 
-The legacy code remains for compatibility and reference. Do not launch a legacy downloader alongside v3 against the same browser/ledger/staging directory.
+The browser authenticates/mints, not bulk-transfers. Cookie replay is used for
+file-host **transfer**, not to replace interactive Google authentication. No
+Fetch interception, password retry loop or human-download sweep is authorized.
+Mint cancellation is scoped to the automation-owned frame/download GUID;
+cancellation refusal is an explicit blocker, not permission to cancel human work.
 
-## File map
+## Execution boundaries
 
-| Path | Purpose |
+```text
+host systemd unit (disabled now)
+  -> tools/container_watch.py, bounded foreground docker-exec supervisor
+     -> existing takeout-webgui, explicit non-root UID
+        /opt/manager-venv/bin/python, code /work/.v3
+        PRIVATE mapped as /config/autopilot
+        CDP http://127.0.0.1:9222 inside container
+```
+
+[CORE21495 is deployed](core-release.md); executor/unit installation is separate.
+Host-only root credentials must be outside worker-owned PRIVATE and **all
+effective container mounts before provisioning**, not merely `/work` and
+`/config`; see [protected layout](credentials.md). Alias/crypt/chunker preflight permits only
+reviewed network terminals, refusing unsupported wrappers/local/memory/unknown.
+It is config-only, not connectivity/canary/durability evidence.
+
+Backend-config unlock preflight must succeed **before watcher launch**. Supervisor stdin
+heartbeat/EOF and scoped process-tree cleanup cover lost host supervision;
+killing only the docker client is insufficient. No new port, host-CDP repair,
+browser restart or container recreation is authorized for this release.
+
+## Integrity and receipt semantics
+
+| Evidence | Means | Does not mean |
+|---|---|---|
+| Exact expected size | Complete-length loose part (`SIZE_OK`) | Authenticity/content checksum |
+| ZIP directory + every member CRC | Archive members read/decompressed and validated | Trusted source SHA256/product coverage |
+| TAR full reads, gzip CRC/ISIZE | Declared stream validated; invalid tails rejected | Source authenticity |
+| Computed SHA256 | Digest of observed bytes; detail states whether compared | Trusted equality merely because state is `HASH_OK` |
+| SHA256 matched trusted expectation | Equality to supplied expected digest | Correctness of an untrusted expectation |
+| Confirmed backend receipt | Exact path, size, staged/backend SHA256 and confirmation time | Permanent immutability/replication/retention |
+
+ZIP CRCs cannot be disabled with compatibility `crc_check=False`. Declared formats
+must match bytes; obvious login/error HTML is rejected, but legitimate known-size
+HTML/mail/media can be accepted. Unknown-size loose data needs a trusted digest.
+Hash-read failure is UNVERIFIED, never retained success.
+
+Remote mode does not treat FUSE fsync or size equality as durability. It uses
+`copyto --ignore-existing`, forced `hashsum SHA256 --download` and exact size
+checks. Existing different objects fail closed, even same-size/different-content.
+Matching persistent done receipts avoid re-reading multi-GB objects on every
+one-part pass; they are historical confirmation, **not a fresh backend audit**.
+Changed destination/missing receipt requires verification. Use a single writer:
+rclone has no generic transactional create against arbitrary other writers.
+
+## Source map
+
+| Path | Responsibility |
 |---|---|
-| `autopilot/__main__.py` | CLI dispatch, exit-status contract and production RunConfig defaults. |
-| `autopilot/run.py` | Injectable one-export orchestration (`RunConfig`, `RunOutcome`, `run_once`, `run_once_sync`). |
-| `autopilot/scrape.py` | Archive-page metadata, index/completeness checks and reauth-navigation helpers. |
-| `autopilot/mint.py` | Capture file-host URLs through browser navigation; clean up automation-owned stray downloads. |
-| `autopilot/cdp.py` | CDP session/event protocol abstraction. |
-| `autopilot/ws_transport.py` | Real websocket adapter and advertised CDP endpoint discovery. |
-| `autopilot/jar.py` | Pull browser cookies/user agent for authenticated HTTP transfer. |
-| `autopilot/transport.py` | Resumable file-host byte transfer and remote-change detection. |
-| `autopilot/ledger.py` | SQLite jobs, parts, attempts, naming aliases and local-filesystem checks. |
-| `autopilot/verify.py` | Staged-file validation helpers. |
-| `autopilot/mover.py` | Staging/destination preflight, one-pass archive indexing and bounded copy. |
-| `autopilot/report.py` | Completeness, expiry and archive-presence reports. |
-| `autopilot/errors.py` | Named operational errors including reauth and quota. |
-| `tools/satisfy_login.py` | Single-attempt password challenge helper; secret file pointer, never a 2FA bypass. |
-| `tools/extension_switch.py` | Inspect/change explicit extension switches. |
-| `tools/sweep_downloads.py` | Browser-download cleanup tool; not part of source-account deletion. |
-| `tools/repair_part_filenames.py` | Recover real part filenames using matching archive evidence. |
-| `tools/xwd_to_png.py` | Convert virtual-desktop captures without ImageMagick. |
-| `helpers/` | Chromium extension and content scripts; human-initiated downloads must remain untouched. |
-| `webgui/` | Chromium/webtop launch and container bootstrap configuration. |
-| `docker-compose.webgui.yml` | Browser desktop deployment and bind mounts. |
-| `tests/v3/` | Network-free protocol, transfer, integrity, orchestration and CLI regression tests. |
-| `docs/v3/` | Architecture, frozen run interface and operational/full-pull guides. |
-| `.wiki/` | Maintained project map, decisions and measured operating evidence. |
-| `.pi/workflows/unattended-archival.md` | Reliability audit/build/verification/deployment plan and resume boundaries. |
-| `takeout2/`, `tests/v2/`, `docs/v2/` | Older burst-engine generation and its tests/design. |
-| `manager/`, `helpers/`, `webgui/` | Historical manager/browser integration; some infrastructure is still shared. |
-| `takeout_dl.py`, `takeout_cli.py`, `takeout.py`, `google_takeout_tui.py` | Legacy interactive download entry points. |
-| `.recon/` in main checkout | Historical, untracked recon scripts/evidence. Not production orchestration. |
+| `autopilot/__main__.py` | run/report/watch CLI and run exit codes |
+| `autopilot/watch.py`, `discovery.py` | Identity, disposable targets, pending polling, atomic status/OS lock, fairness/backoff |
+| `autopilot/run.py` | Cached-only passes, part/disk limits and completion gates |
+| `autopilot/mint.py`, `scrape.py` | Metadata and browser-owned URL earning/cancellation |
+| `autopilot/cdp.py`, `ws_transport.py`, `jar.py` | CDP and cookies/user agent |
+| `autopilot/transport.py`, `verify.py` | Validated resume, classified partial failures, full format checks |
+| `autopilot/remote.py`, `mover.py` | Bounded backend subprocesses; legacy verified native-local copy |
+| `autopilot/ledger.py`, `report.py` | Local SQLite progress/receipts; evidence-limited reports |
+| `tools/container_watch.py` | Approved lifecycle supervisor; execution-lane release artifact |
+| `deploy/` | Unit/example templates, not installation/activation evidence |
+| `requirements-autopilot.txt`, `takeout2/` | Runtime dependency list and required legacy contracts package |
+| `tests/v3/`, `tests/v2/` | Offline tests; opt-in public-network tests remain skipped |
+| `.pi/workflows/finish-release.md`, `.pi/reports/` | Frozen ownership and measured evidence |
 
-## Deployment and storage boundaries
+Legacy manager/browser infrastructure remains shared. Do not run legacy and v3
+workers against the same browser/ledger/staging concurrently. Preserve the dirty
+server main checkout; release updates target only its clean `.v3` worktree.
 
-- Workstation authoritative branch: `feat/takeout-autopilot` in `.claude/worktrees/takeout-autopilot`.
-- Server host repo: `/opt/local_cache_crypt/_projects/takeout-downloader`; v3 checkout: `.v3`.
-- Browser container: `takeout-webgui`; code appears at `/work/.v3`, persistent configuration at `/config`.
-- Local staging and ledger live on the encrypted cache volume, **not** `/opt/archives` and not the small root disk.
-- `/opt/archives` was observed as an rclone FUSE mount. A successful FUSE copy/readback can still be cache-local; remote durability needs separate evidence.
-- Staging, browser downloads and rclone VFS cache share the same physical disk budget.
-- Existing browser session and human downloads must be preserved during deploy. Verify running extension code, not just repository timestamps.
+## Mount admission and archive compatibility
 
-## Current audit gates
+Future Compose archive sources/targets for webGUI, TUI and CLI are fixed literal
+`/opt/archives`; no broad `/opt` bind or inherited `STORAGE_ROOT` override. webGUI
+manager `STORAGE_ROOT` is fixed `/opt/archives`; CLI allowed roots are
+`/opt/archives:/downloads`. Other mounts still require effective-layout review.
 
-Fresh export discovery, supervision/restart, multi-account identity, retry/backoff, strict archive integrity, shared-disk headroom and remote-upload confirmation are audit subjects. The existing one-export `run` CLI is not by itself an unattended service. See the workflow plan and current journal for verified changes.
+Before Docker exec, the host supervisor inspects every effective mount with a
+10-second deadline and 1 MiB stdout cap, suppressed stderr and bounded owned-client
+cleanup. Bind/volume sources are checked lexically and after real-path resolution
+against `/opt/local_cache_crypt/takeout-autopilot-secrets`; ancestor, exact and
+descendant overlap is rejected even read-only or through symlinks. Missing/empty/
+malformed metadata, unsupported types, failed inspection, resolution error, timeout
+and flood fail closed. Environment values are not printed or put in exec argv.
+
+This is point-in-time admission, not prevention when an administrator later
+creates/reconfigures an unsafe container or changes symlinks. Effective mount
+exclusion is REQUIRED BEFORE provisioning secrets. Existing containers were not
+recreated; synthetic layout evidence is not live inspection. Legacy `outputDir`
+outside the new roots needs an explicitly reviewed safe bind outside all secret
+ancestors, not restoration of `/opt`. See the
+[security ADR](decisions.md#2026-10-13--effective-mount-exclusion-before-secrets-future-compose-only)
+and [repair evidence](../.pi/reports/mount-boundary-repair.md).

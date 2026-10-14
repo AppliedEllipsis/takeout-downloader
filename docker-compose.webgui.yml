@@ -47,7 +47,7 @@ services:
       # below pins it to 127.0.0.1 on the server too.
       MANAGER_HOST: "127.0.0.1"
       MANAGER_PORT: "8080"
-      STORAGE_ROOT: ${STORAGE_ROOT:-/opt}
+      STORAGE_ROOT: /opt/archives
       TAKEOUT_SUBDIR: ${TAKEOUT_SUBDIR:-google-takeout}
       MANAGER_API_TOKEN: ${MANAGER_API_TOKEN:-}
       MANAGER_CAPTURE_TOKEN: ${MANAGER_CAPTURE_TOKEN:-}
@@ -77,9 +77,11 @@ services:
     volumes:
       - ./config:/config            # PERSISTENT: browser profile + KasmVNC creds
       - .:/work                     # live source (engine + manager + extension)
+      # Fixed archive subtree: never inherit a broad host STORAGE_ROOT.
+      # Exclude host secrets from ALL mounts before provisioning credentials.
       - type: bind
-        source: ${STORAGE_ROOT:-/opt}
-        target: ${STORAGE_ROOT:-/opt}
+        source: /opt/archives
+        target: /opt/archives
         bind:
           propagation: rslave
           recursive: enabled        # JuiceFS/encfs submounts visible in-container

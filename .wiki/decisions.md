@@ -651,3 +651,104 @@ cached file-host URL as the entry (the response-form success return), so the dow
 **Alternatives.** Rewriting the transport or adopting Drive-destination exports would discard working resume behavior or add source-account storage demands. Timestamp-based reminting may spend attempts unnecessarily and is not an expiry oracle.
 
 **Consequences.** New mechanisms need offline integration and independent refutation, then a measured server release. Pending Google exports cannot be reported as tested/complete until actually available and downloaded. The acceptance contract is `docs/v3/05-WATCH-INTERFACE.md`; evidence index is `.wiki/reliability-audit.md`.
+
+
+## 2026-10-13 — Container-local worker with host lifecycle supervision; activation HOLD
+
+**Context.** October preflight found host CDP docker-proxy resets while existing
+container-local CDP worked. Fresh Takeout views required reauthentication and
+noninteractive encrypted rclone unlock failed. The owner explicitly deferred
+unlock and Google sign-in. D filled up; canonical release source moved to
+`C:/Users/User/_projects/takeout-downloader-reliability`, D original unchanged.
+`1f7f9af` is already-pushed docs-only history, not the implementation deployment.
+
+**Decision.** Host systemd supervises `tools/container_watch.py`, a bounded
+foreground docker-exec supervisor. Run watcher as an explicit non-root UID in the
+existing `takeout-webgui`, code `/work/.v3`, existing `/opt/manager-venv/bin/python`.
+Encrypted host PRIVATE (`config/autopilot`) maps to `/config/autopilot`; use its
+trusted copied `bin/rclone`, encrypted config, private local ledger/state/staging/
+cache and container-path watch JSON. Forward env by variable name only, never
+secret values in argv. Require bounded noninteractive backend unlock/access
+preflight before watcher launch. Stdin heartbeat/EOF and scoped owned-tree cleanup
+prevent orphan downloads when host supervision disappears.
+
+**Alternatives rejected.** Repairing/exposing host CDP or adding a TCP management
+port, restarting/recreating the stateful browser/container, detached docker exec,
+and a new production host venv. The old host-worker/host-path examples are
+superseded. Do not touch the dirty server main repo to release `.v3` code.
+
+**Consequences and gates.** Unit remains disabled/inactive. No service launch,
+Google mint/download, password attempt, unlock or live backend canary while owner
+holds activation. Ready/pending counts unknown, not zero. Final source suite and
+supervisor/identity/UID/permission/unit/import evidence are separate release gates;
+no expected total or deployment claim. Matching size or FUSE fsync is not durable
+completion: direct backend size/forced SHA256 confirmation creates exact path/
+size/digest/time receipts; stable matching receipts are historical evidence reused
+for throughput, not a fresh backend audit or retention guarantee. Computed digest
+is not trusted source comparison. Preserve human downloads and all cached/staged
+progress. Source deletion is never a downloader operation.
+
+**Authority/evidence.** `.pi/workflows/finish-release.md`,
+`.pi/reports/server-preflight.md`, `.pi/reports/release-migration.md`,
+`.wiki/automation.md` and `.wiki/reliability-audit.md`. Earlier entries remain
+append-only dated history; this decision supersedes conflicting runtime details.
+
+## 2026-10-13 — Mandatory host-only root environment; security supersession
+
+**Decision.** Unit EnvironmentFile must be
+`/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env`, root:root 0600
+under root:root 0700. Keep this host-only directory outside worker-writable
+PRIVATE and browser `/work` and `/config` binds. PRIVATE remains
+`/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot` →
+`/config/autopilot`, owner 20001:20001, mode 0700, no group/other bits. Ancestor
+traversal is separate, never an exception for PRIVATE itself.
+
+**Rationale.** Root ownership of credentials.env inside a worker-writable parent
+cannot prevent replacement by that worker and injection of root environment.
+This supersedes any earlier root-env-inside-PRIVATE instruction; dated history
+is retained. No key/credential file was provided or created; activation remains
+owner-deferred. Restart=on-failure with 30 seconds/five starts per 300 seconds is
+bounded recovery, not launch approval. CORE21495 deployment is complete, not
+executor/unit installation or worker activation.
+
+**Preflight boundary.** Alias/crypt/chunker resolution allows explicitly reviewed
+network terminals and rejects unsupported wrappers/local/memory/unknown. It is
+config-only, not backend connectivity, canary or durability evidence.
+
+
+## 2026-10-13 — Effective mount exclusion before secrets; future Compose only
+
+**Supersedes:** incomplete mount-exclusion claims in the 2026-10-13 mandatory
+host-only environment ADR; that secret location/permission decision is retained.
+The frozen gate found a real containment bug: broad `/opt` archive binds exposed
+`/opt/local_cache_crypt/takeout-autopilot-secrets`. Root 0700/0600 does not make a
+mounted path host-only. This is not waived by documentation SHA reconciliation.
+
+**Decision.** All three future archive binds (webGUI/TUI/CLI) are literal
+`/opt/archives:/opt/archives`, no inherited `STORAGE_ROOT` override to broad `/opt`.
+CLI allowed roots are `/opt/archives:/downloads`. **All effective container mounts
+must exclude the secret directory BEFORE provisioning secrets.** Bounded host-side
+Docker inspect admission before exec checks lexical and real source paths and
+refuses ancestor/exact/descendant overlap for binds and volumes, even read-only
+or symlink aliases. Missing/empty/malformed metadata, unsupported types, resolution
+errors, failed inspection, timeout and flood fail closed. Probe deadline 10 seconds,
+stdout cap 1 MiB, stderr suppressed; only owned inspect client is killed/waited.
+
+**Compatibility/runbook.** Legacy `outputDir` outside the new roots needs an
+explicit reviewed safe bind outside all secret ancestors, and reviewed output-root
+configuration where applicable; never broaden `/opt`. Other mounts/overrides,
+especially VFS host cache sources, still require effective-layout review.
+Admission is point-in-time, not prevention when an administrator independently
+creates/reconfigures an unsafe container, changes symlinks or bypasses supervision.
+Repeat review after changes; the pre-provision exclusion requirement is independent.
+
+**Evidence/limits.** [Mount repair](../.pi/reports/mount-boundary-repair.md): Windows
+1352 passed / 66 skipped; nonroot WSL focused 251 passed. Broad native Linux
+validation pending; broader dependency/test/raw-CRLF blockers are retained.
+[Frozen gate](../.pi/reports/final-frozen-gate.md) README/automation SHA drift is
+commander-documented banner edits only; no mismatch in its 173 source/config/test
+files. History remains unchanged; reconciliation is not containment-bug waiver,
+rebaseline or final approval. Future configuration only: no existing containers
+recreated, no secret file, no live inspection or activation. CORE21495 unchanged,
+not recertified. Owner unlock/sign-in and executor/unit installation remain deferred.
+See [operations](automation.md#mount-boundary-admission-and-compatibility-runbook--future-only).

@@ -1,7 +1,47 @@
 # Infrastructure
 
+**Release contract updated 2026-10-13; activation deferred.** Current source is
+`C:/Users/User/_projects/takeout-downloader-reliability`; original D source is
+unchanged because D filled up. `1f7f9af` is already-pushed docs-only history, not
+an implementation deployment revision.
+
+**CORE21495 deployed:** [release evidence](core-release.md), 2026-10-13T22:00:42Z; clean `.v3`, 36 module fingerprints/0 mismatches, dirty main six entries preserved. Executor/unit installation remains deferred; worker inactive, unit disabled.
+
+## Current execution/path authority
+
+Read [automation.md](automation.md) for the complete map and stop/recovery paths.
+
+| Item | Approved target / dated evidence |
+|---|---|
+| Host repo / code | `/opt/local_cache_crypt/_projects/takeout-downloader` / `.v3`; preserve dirty main checkout |
+| Container code | `/work/.v3` inside existing `takeout-webgui` |
+| Supervisor | Host systemd → `tools/container_watch.py` → foreground docker exec, explicit non-root container UID |
+| Interpreter | Existing container `/opt/manager-venv/bin/python` |
+| Encrypted PRIVATE | Host repo `config/autopilot` → `/config/autopilot`; local ledger/state/staging/cache |
+| rclone | Trusted copy `PRIVATE/bin/rclone` → `/config/autopilot/bin/rclone`; encrypted config mapped similarly |
+| CDP | Container-local `127.0.0.1:9222`; October host docker-proxy probes reset, so host-loopback readiness is not assumed |
+| Archive | Direct `archives:google-takeout`; `/opt/archives/google-takeout` is only the historical FUSE view |
+| Host-only env | `/opt/local_cache_crypt/takeout-autopilot-secrets` root:root `0700`; `credentials.env` root:root `0600`, mandatory EnvironmentFile, excluded from every effective container mount before provisioning |
+| Service | Must remain disabled/inactive; unlock/sign-in/activation owner-deferred |
+
+[October preflight](../.pi/reports/server-preflight.md) found the old clean server
+`.v3` at `1b70ce2`, running container and encrypted XFS volume. Noninteractive
+rclone unlock failed (exit 1); fresh Google views required reauth. Pending/ready
+counts **unknown**; backend canary not attempted. No new port, browser/container
+restart, worker activation or deployment was performed by this documentation lane.
+The earlier host-worker venv/dedicated host-user plan in preflight is superseded
+by the container execution ADR; its historical observations remain evidence.
+
+## Historical inventory — 2026-09-19, NOT current health
+
+The remainder is retained dated investigation context. Words such as “live”,
+“currently”, “right now” and status icons below refer **only to that September
+probe**, not this release. In particular, September sign-in/tunnel/extension
+observations do not override October reauth or current disabled-worker gates.
+Never restart Chromium or manipulate the desktop based on these historical notes.
+
 **Verified live 2026-09-19** by read-only SSH probes (`.recon/probe2.sh` in the main checkout).
-Everything here is measured, not assumed. Commands used are in [runbooks.md](runbooks.md).
+Everything below is a historical measurement. Commands used are in [runbooks.md](runbooks.md).
 
 ## Host
 
@@ -195,3 +235,38 @@ design currently assumes, and is worth weighing before implementing the re-auth 
   re-create the historical ~6-minute per-part `stat()` livelock?
 - Does a Chromium restart preserve Google auth? **Unverified assumption.**
 - Why is port 8080 (manager API) not serving? Is the manager down, or on another port?
+
+## Mandatory protected environment layout
+
+Host-only `/opt/local_cache_crypt/takeout-autopilot-secrets` must be `root:root
+0700`; its `credentials.env` must be `root:root 0600` and is the mandatory unit
+`EnvironmentFile`. Keep it outside worker-writable PRIVATE and **all effective
+container mounts BEFORE provisioning secrets**, including ancestor sources,
+read-only mounts, volumes and symlink aliases; `/work` and `/config` alone are
+not a sufficient exclusion check. Root ownership of a file inside a worker-writable directory
+is insufficient: the worker could replace it and inject root environment.
+
+PRIVATE remains `/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot`
+→ `/config/autopilot`, owner `20001:20001`, mode `0700`, no group/other bits.
+Ancestor traversal is a separate check, not a PRIVATE permission exception.
+No key/credential file was provided or created; activation remains owner-deferred.
+
+## Future mount correction; not live exclusion evidence
+
+All three future archive binds (webGUI, TUI, CLI) are literal
+`/opt/archives:/opt/archives`, not a broad `/opt` or an inherited `STORAGE_ROOT`
+override. CLI allowed roots are `/opt/archives:/downloads`. Review every other
+effective source too, especially configurable read-only VFS cache sources.
+
+Bounded host-side Docker inspect admission before exec rejects source ancestor,
+exact or descendant overlap with `/opt/local_cache_crypt/takeout-autopilot-secrets`,
+including read-only bind/volume sources and lexical/resolved symlink aliases.
+Malformed/missing metadata and failed/timed-out/oversized inspection fail closed.
+This point-in-time guard does not prevent later unsafe administrator container/
+mount/symlink changes. **Effective exclusion is REQUIRED BEFORE provisioning
+secrets**; permissions alone are not containment. No secret file was created, no
+existing containers recreated, and no current live-layout certification is claimed.
+
+Legacy `outputDir` needs an explicit safe bind outside all secret ancestors when
+outside the new roots. See [future runbook](automation.md#mount-boundary-admission-and-compatibility-runbook--future-only)
+and [repair evidence](../.pi/reports/mount-boundary-repair.md).

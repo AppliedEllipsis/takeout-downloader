@@ -1,223 +1,159 @@
-# Full pull — the repeatable procedure
+# Full pull — FUTURE owner-gated procedure
 
-Run this end to end or step by step. Every command is copy-pasteable. Written 2026-09-21,
-on the second attempt at a real pull, so it records what actually happened rather than
-what was expected.
+**Updated 2026-10-13. NOT executed for this release.** Owner deferred rclone unlock,
+Google sign-in and worker activation. No real mint/download/password attempt or
+live backend canary. Pending/ready export counts unknown. Do not copy these
+commands into a live session until separately authorized.
 
-Companion: `03-OPERATIONS.md` (live state, exit codes, container requirements),
-`02-RUN-INTERFACE.md` (the frozen contract).
+## 1. Establish the gates, not assumptions
 
----
+Follow [operations](03-OPERATIONS.md) and [automation](../../.wiki/automation.md):
+final code gates, safe `.v3` revision/imports, encrypted storage/permissions,
+non-root UID, container venv, private config, authorized unlock preflight and
+verified authenticated account identity. No new port/browser restart. Do not run
+manual `run` alongside the watcher/legacy downloader; single archival writer.
 
-## Why the order is what it is — measured, not assumed
+Discover actual available exports after owner sign-in. Compare **all** expected
+parts against existing receipt/integrity evidence before spending attempts.
+Decode safe filenames/aliases; matching size alone is not content/backend proof.
+An empty/login/pending page is never completion and never a count of zero exports.
+Quotas/counter behavior are dated telemetry, not a promise of free transfers.
+Do not guess expiry from cached URL age or remint a valid URL merely to test it.
 
-**A minted URL outlives the ReAuth window.** Measured 2026-09-19:
+## 2. Separate URL earning from cached-only transfer
 
-```
-minted at 18:04:18Z   ·   tested ~19:25   ·   HTTP 206   ·   first bytes PK\x03\x04
-```
+Minting needs an authenticated browser window; byte transfer uses cached file-host
+URLs/cookies and may outlast that window. September's observed window/resume costs
+are historical, not guaranteed current lifetimes. Refuse untokened/auth-challenged
+mint work rather than doing an untracked redirector probe. Only automation-owned
+browser downloads may be cancelled; human downloads/tabs remain untouched.
 
-81 minutes later it still served real zip bytes. The ReAuth window is ~45 minutes. So:
-
-- **Minting is what the window gates.** Each part needs a mint, and a mint needs a live window.
-- **Transferring needs only the jar.** It does not expire with the window.
-
-A 63-part export takes hours. If you mint per part as you go, you run out of window
-part-way and the run stops with `needs_reauth`, unable to earn the later URLs — **the pull
-cannot finish in one pass**. Hence: mint everything first, then transfer.
-
----
-
-## Step 0 — check what is ALREADY on disk before you pull anything
-
-**Do this first, every time.** On 2026-09-21 the whole 141.28 GB export had already been
-pulled by v2 while a v3 pull was being planned. The v3 transfer was cancelled. Running it
-would have re-downloaded bytes already present and spent an allowance that was already
-partly gone.
-
-**The allowance is 5 attempts per PART, not per export** — page text: *"You can try to
-download a file only 5 times"*, with per-zip counters. Two downloaders racing the same
-export share that allowance, so a race can leave two partial copies and nothing left to
-finish either with.
-
-List what Google says exists, then compare against the directory:
+The watcher handles separate mint batches and bounded cached passes automatically.
+Production launches only via the approved supervisor/unit described in
+[automation](../../.wiki/automation.md); do not bypass its preflight/heartbeat
+with a manual or detached exec. For understanding the underlying one-export CLI,
+the following is an **argument reference, not a production launch recipe**.
+Paths are container paths and variables are placeholders, never real identities:
 
 ```bash
-docker exec takeout-webgui python3 /tmp/_diff_full64.py     # see .recon/_verify_full64_fast.py
+# REFERENCE ONLY, NOT EXECUTED. Future use needs approved lifecycle supervision.
+# Never put cookies, passwords or reauth tokens in argv.
+/opt/manager-venv/bin/python -B -m autopilot run \
+  --archive-id "$ID" --account "$LABEL" --work-url "$WORK_URL" \
+  --ledger /config/autopilot/ledger.sqlite \
+  --staging "/config/autopilot/staging/$LABEL/$ID" \
+  --archive "/opt/archives/google-takeout/$LABEL/$ID" \
+  --archive-remote "archives:google-takeout/$LABEL/$ID" \
+  --rclone-binary /config/autopilot/bin/rclone \
+  --rclone-config /config/autopilot/rclone.conf \
+  --remote-timeout 21600 --staging-reserve 107374182400 \
+  --mint-only --json
 ```
 
-The comparison has one trap, paid for once already: **decode filenames before matching.**
-v3's ledger held `All%20mail%20Including%20Spam%20and%20Trash-002.mbox` while v2 had
-written the decoded `All mail Including Spam and Trash-002.mbox`. The file was present and
-exact, and the first comparison called it missing. A completeness comparison is only as
-good as its name matching.
+Authorized env is supplied privately through the supervisor by **name only**;
+`RCLONE_CACHE_DIR` is sanitized to `/config/autopilot/cache`. The released
+supervisor currently launches `watch`, not arbitrary `run` commands. No manual
+run bypass is approved here; long work requires the foreground guardian with
+heartbeat/scoped tree cleanup, not an unguarded docker client.
 
-Decide an export is complete only on all of:
+Mint-only normally returns `incomplete`, exit **1**, when URLs are earned but parts
+are not archived. Inspect status/error: do not use `&& transfer` or mask every
+failure with `|| true`.
 
-| check | how | why |
-|---|---|---|
-| exact byte count, **every** part | against Google's per-part sizes in the ledger | a size-up from a directory listing misses non-zip parts — the `.mbox` is 13.58 GB of a 141.28 GB total |
-| nothing still being written | `stat` twice, ~20 s apart | a large file can match its final size only at the end |
-| each `.zip` still whole | EOCD present in the last 64 KB | a truncated zip loses it |
-| a non-zip part | head and tail are sane | an mbox needs a `From ` line and a MIME terminator |
+## 3. Bounded transfer-pass argument reference (FUTURE)
 
-Byte counts, EOCD and structure are **not** a CRC check of the members. That requires
-reading every byte — do it deliberately as a separate pass (`.recon/_crc_full64.py`),
-because this account has produced truncated archives before.
+At the engine level the same arguments above replace `--mint-only` with:
 
-If the export is already complete: **stop.** Do not transfer. v3's minted URLs can be left
-cached; minting cost Δ1 each and is harmless on its own.
-
----
-
-## Step 1 — reach the browser and sign in
-
-The browser lives inside the container. Its desktop is exposed as a **KasmVNC portal on
-port 3000**, published to the server's loopback only:
-
-```bash
-# on the workstation
-ssh -N -L 3000:127.0.0.1:3000 takeout-server
-# then open
-http://localhost:3000
+```text
+--cached-transfer-only --max-parts 1 --verify-hash --json
 ```
 
-`3000 -> 3000/tcp` and `8080 -> 8080/tcp` are bound to `127.0.0.1` on the server, so the
-forward is the only way in. Verified: the forwarded portal answers **HTTP 200** and serves
-the KasmVNC viewer (PWA manifest, no `WWW-Authenticate` on `/`).
+The explicit `--cached-transfer-only` matters: an ordinary run may scrape/mint;
+it is **not** inherently transfer-only. Cached-only reconstructs the full known
+ledger list and cannot call a cached subset complete. It may still need browser
+cookies, but verified staged bytes can upload without browser/remint.
 
-In the portal, sign in to Google. **Two different states look similar and mean different
-things:**
+Repeat only after inspecting the classified result and backoff/storage budget.
+Cleanup is an optional additional `--clean-staging`; never add it before accepting
+receipt semantics. Failed confirmation retains staging. Validated partial streams
+resume with saved strong validator; corrupt complete bytes are quarantined.
 
-| What you see | What it means |
+| Run exit | Action |
 |---|---|
-| `accounts.google.com/v3/signin/accountchooser` | pick an account — **not usable yet** |
-| `accounts.google.com/v3/signin/challenge/pwd` | the ReAuth challenge — satisfy it |
-| `takeout.google.com/manage?rapt=…` | signed in **and** holding a token; minting will work |
+| 0 complete | Expected part list passed archival gates; verify evidence scope below |
+| 1 incomplete/failed | Read sanitized status/error; bounded retry only if appropriate |
+| 2 needs_reauth | Owner acts later; preserve cached/staged work, no password loop |
+| 3 expired / 4 quota | Terminal; owner requests new export |
 
-> Only the last one is ready. A signed-in session that has never satisfied a challenge
-> still serves **untokened** download links — the run will earn a token itself
-> (`provoke_rapt`), but if that comes back with a challenge, the window has lapsed and
-> you must satisfy it before minting.
+## 4. Completion evidence, not a directory listing
 
----
+Require exact expected part count/indices and sizes, full applicable archive
+checks, staged SHA256 and confirmed exact backend path/size/SHA/time. ZIP validation
+reads every member CRC; TAR/gzip streams are fully read. Known-size loose mail/media
+has size-level validation unless a trusted expected digest is supplied. A computed
+SHA256 is not source-authenticity comparison.
 
-## Step 2 — readiness, before spending anything
+Backend SHA is forced with rclone `hashsum SHA256 --download`, bracketed by exact
+size checks; FUSE fsync/readback or `ls` cannot substitute. Same-name mismatched
+objects fail closed, never overwrite. Stable ledger receipts are historical
+confirmation reused for throughput, **not a fresh backend audit** and not a
+provider retention guarantee.
 
-```bash
-ssh takeout-server 'docker exec -i -w /work/.v3 \
-  -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui python3 -B -' < .recon/_readiness.py
-```
+A future `python -m autopilot report --archive-id ID --ledger PATH` reports local
+accounting only; optional `--archive-dir` may count size-matching prior-tool files,
+not CRC/backend evidence. No source-account deletion is authorized. Record exact
+executed commands, loaded revision, sanitized outcomes and failed/unknown evidence
+before any claim of a new export complete. This release has no such live claim.
 
-Confirms: signed in?, which archives are downloadable, remaining allowance, and that the
-destination mount is up.
+## Protected environment and release boundary
 
-**Check Google's counter, not the ledger's.** They are different quantities and only
-Google's runs out — an export allows **5 downloads**, and it refuses the 6th with
-`quotaExceeded=true`. The archive page shows `Number of times already downloaded: N`.
+Mandatory unit `EnvironmentFile` is host-only
+`/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env` (`root:root 0600`),
+under `root:root 0700`, outside worker-writable PRIVATE and **all effective
+container mounts BEFORE provisioning secrets**. Check source ancestors, read-only
+mounts, volumes and resolved symlinks, not just `/work` and `/config`. A worker-writable parent permits replacement and root environment
+injection even when the file is root-owned. PRIVATE remains host
+`/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot` →
+`/config/autopilot`, owner `20001:20001`, mode `0700`, no group/other bits;
+ancestor traversal is separate. No key/credential file was provided or created.
 
-```bash
-# disk headroom (staging shares its volume with rclone's 100 GB VFS cache)
-ssh takeout-server 'df -h /opt/local_cache_crypt | tail -1; mount | grep opt/archives'
-```
+[CORE21495 is deployed](../../.wiki/core-release.md), not activated. Current unit
+uses `Restart=on-failure`, `RestartSec=30`, five starts per 300 seconds and stays
+disabled/inactive. Config-only alias preflight allows reviewed network terminal
+types and rejects unsupported wrappers/local/memory/unknown; it proves neither
+backend connectivity, canary nor durability. Owner-deferred gates remain.
 
-Required: the archive is a **`fuse.rclone` mount**. If it is not, `run_once` refuses —
-correctly, because a detached mount turns `/opt/archives` into an ordinary directory on a
-14 GB root filesystem and a mover would write terabytes into it (failure mode 1.7).
+## Mount admission and legacy output compatibility — FUTURE ONLY
 
----
+Future webGUI, TUI and CLI archive binds are literal
+`/opt/archives:/opt/archives`. No `STORAGE_ROOT` override can broaden them to
+`/opt`; webGUI manager root is fixed `/opt/archives` and CLI allowed roots are
+`/opt/archives:/downloads`. Legacy `outputDir` outside those roots requires an
+**explicit safe bind outside all secret ancestors** plus reviewed output-root
+configuration where applicable. Do not restore broad `/opt` for compatibility.
 
-## Step 3 — mint every URL while the window is fresh
+Every effective mount must exclude
+`/opt/local_cache_crypt/takeout-autopilot-secrets` BEFORE provisioning secrets.
+Review other binds/volumes too, including the configurable read-only VFS cache
+source. Root ownership/modes are necessary access controls, not proof of exclusion.
+Before exec, host supervisor admission uses Docker inspect with a 10-second
+bound, 1 MiB stdout cap, suppressed stderr and bounded owned-client cleanup.
+Lexical/resolved source ancestor, exact or descendant overlap refuses even for
+read-only bind/volume mounts and symlink aliases. Empty/missing/malformed metadata,
+unsupported types, resolution errors, failed inspection, timeout and flood fail
+closed. Refusal is not permission to bypass supervision.
 
-```bash
-ID=<archive id>;  ACCT=<account>
-ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
-  python3 -B -m autopilot run \
-    --archive-id $ID --mint-only \
-    --ledger  /config/v3-selftest/full.db \
-    --staging /config/v3-selftest/full \
-    --archive /opt/archives/google-takeout/$ACCT/$ID \
-    --account $ACCT"
-```
-
-Expected: a report with `Verdict: INCOMPLETE`, and **exit code 1**.
-
-> **Exit 1 here is success, not failure** — and this matters when scripting. `incomplete`
-> means "work remains", which is true: URLs are earned, bytes are not moved. Only
-> `complete` exits 0. So a chained `--mint-only && transfer` would never run the
-> transfer; use `;` or `||true`, or check the report rather than the code.
-> (Observed 2026-09-21 on the 5-part test export.)
-
-`incomplete` is the CORRECT verdict at this step. Nothing may claim the pull is done.
-
-Do this immediately after signing in. It is fast (Δ1 per part) and it is the only step
-that needs the window.
-
----
-
-## Step 4 — the transfer pass
-
-```bash
-ssh takeout-server "docker exec -w /work/.v3 -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
-  python3 -B -m autopilot run \
-    --archive-id $ID \
-    --ledger  /config/v3-selftest/full.db \
-    --staging /config/v3-selftest/full \
-    --archive /opt/archives/google-takeout/$ACCT/$ID \
-    --account $ACCT"
-```
-
-Hours, for a large export. Window-independent: it uses the cached URLs from step 2 and
-**never mints**. Re-run until **exit 0**.
-
-**Resuming is the normal case, not the exceptional one.** Every re-run continues:
-completed parts are skipped, partial files are `Range`-resumed (Δ0), and the destination
-index prevents re-fetching what is already archived. Ctrl-C and re-run freely.
-
-Exit codes: `0` complete · `2` re-auth needed (re-do step 0, then re-run) · `3` export
-expired · `4` allowance spent (new export required) · `1` other, read the `error:` line.
-
----
-
-## Step 5 — confirm the result
-
-```bash
-ssh takeout-server "docker exec takeout-webgui sh -c \
-  'ls -la /opt/archives/google-takeout/$ACCT/$ID | head -20'"
-```
-
-A part is done only when it is **on the archive**, named from the minted URL's basename
-(`takeout-YYYYMMDDTHHMMSSZ-N-NNN.zip`) — never `download`.
-
----
-
-## Gotchas, each of which has cost time here
-
-- **The window is ~45 min and it lapses silently.** Work done hours earlier still reports
-  `needs_reauth` correctly, with 0 attempts spent. Just sign in again.
-- **`--mint-only` before any long transfer.** Without it a multi-hour pull is
-  architecturally unable to finish (see the top of this file).
-- **Never budget against the ledger's attempt count.** A run reported `mint 0 | transfer 0`
-  while Google's counter went 3 → 5. Read `dl_counts`.
-- **A 5-attempt export is exhausted by about five probes.** Read the counter *before* an
-  experiment, not after.
-- **Extension changes need a Chromium restart.** `chrome.runtime.reload()` reports success
-  and does not take effect here (measured twice). `pkill -f chromium` inside the container
-  and the s6 loop relaunches it within ~4 s; clear `SingletonLock`/`Cookie`/`Socket` if it
-  does not.
-- **`chrome.alarms` persist across browser restarts.** An alarm's presence does NOT mean old
-  code is loaded — and it misled a reload check here until a behavioural test settled it.
-- **`.recon/` does not exist on the server**; pipe probes in over stdin (`docker exec -i … -`).
-- **CDP lives inside the container**, at `127.0.0.1:9222` there. It is published to the
-  server's loopback too, but not to the workstation.
-- **Only the repo root is bind-mounted** (`/work`), so the `.v3` worktree must live inside it.
-- **Editing two copies is a trap.** The live extension is the **main checkout's** copy
-  (`--load-extension=/work/helpers`); the test suite reads the **worktree's**.
-
-## Known untidiness
-
-- Two localhost-only listeners on the workstation (`13099`, `13100`) were started while
-  testing the portal forward and could not be attributed to a process from the shell
-  (`wmic`/`tasklist`/PowerShell cannot resolve the owning PID). They forward to the
-  server's loopback portal and are not externally reachable. They die with the session; a
-  reboot clears them. Do not blanket-kill `ssh.exe` — that takes out your Bitvise sessions.
+This is point-in-time admission, NOT prevention when an administrator later
+creates/reconfigures an unsafe container or changes mounts/symlinks. Repeat
+layout review after changes; pre-provision exclusion is a separate mandatory gate.
+No existing containers were recreated and no secret file was created.
+[Repair evidence](../../.pi/reports/mount-boundary-repair.md): Windows **1352 passed /
+66 skipped**, nonroot WSL focused **251 passed**; broad native Linux validation
+pending with dependency/test/raw-CRLF blockers retained. These are measured offline
+results, not live safety/full-pull proof. The
+[frozen gate](../../.pi/reports/final-frozen-gate.md) wiki SHA drift is reconciled
+as commander banner edits only, with no mismatch in its 173 source/config/test
+files; this does not waive the true containment bug or rewrite historical HOLD.
+See [runbook](../../.wiki/automation.md#mount-boundary-admission-and-compatibility-runbook--future-only)
+and [audit](../../.wiki/reliability-audit.md). No final approval, executor activation
+or recertification of deployed CORE21495 is inferred.

@@ -144,7 +144,7 @@ def test_owned_spawned_descendant_terminated(tmp_path, monkeypatch, mode):
     script.write_text('''import subprocess, sys, time
 from pathlib import Path
 root = Path(__file__).parent
-child = "import time,os; from pathlib import Path; p=Path(%r); p.with_name('ready').write_text(str(os.getpid())); time.sleep(1); p.write_text('alive'); time.sleep(30)" % str(root / 'descendant-survived')
+child = "import time,os; from pathlib import Path; p=Path(%r); p.with_name('ready').write_text(str(os.getpid())); time.sleep(4); p.write_text('alive'); time.sleep(30)" % str(root / 'descendant-survived')
 subprocess.Popen([sys.executable, '-c', child])
 while not (root / 'ready').exists(): time.sleep(.005)
 mode = sys.argv[1]
@@ -157,15 +157,20 @@ time.sleep(30)
     def spawn(argv, **kwargs):
         return real_popen([sys.executable, str(script), mode], **kwargs)
     monkeypatch.setattr(remote.subprocess, 'Popen', spawn)
-    cfg = RemoteConfig('archive:export', binary=sys.executable, timeout=.5)
+    cfg = RemoteConfig('archive:export', binary=sys.executable, timeout=3)
     if mode == 'parent-exit':
         code, _ = remote._command(cfg, ['lsjson', 'archive:export/part.zip'])
         assert code == 9
     else:
         with pytest.raises(ValueError):
             remote._command(cfg, ['lsjson', 'archive:export/part.zip'])
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(.01)
     assert ready.exists(), 'regression must actually spawn and run the owned child'
-    time.sleep(1.2)
+    # The child writes its survival marker after four seconds.  Give that bounded
+    # interval to elapse before asserting cleanup, without relying on scheduling.
+    time.sleep(4.2)
     assert not marker.exists(), 'owned descendant survived command cleanup'
     pid = int(ready.read_text())
     import os

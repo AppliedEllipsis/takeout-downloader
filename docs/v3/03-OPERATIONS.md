@@ -1,164 +1,157 @@
-# v3 autopilot — operations
+# v3 operations — release HOLD and future runbook
 
-How to run it, where it lives, what it needs, and the order in which the v2 cookie machinery gets
-removed. Everything here was measured on the live server on **2026-09-19**; anything not measured is
-marked **UNVERIFIED**.
+**2026-10-13.** Owner deferred unlock, Google sign-in and worker activation.
+Unit must stay disabled/inactive. No real mint/download/password attempt/backend
+canary; ready/pending counts unknown. Commands marked FUTURE have **not** been
+executed by this documentation lane.
 
-Companion docs: `docs/v3/01-ARCHITECTURE.md` (why it works this way), `docs/v3/02-RUN-INTERFACE.md`
-(the frozen contract), `.wiki/failure-modes*.md` (what goes wrong and what to do).
+## Runtime authority
 
----
+[Wiki automation](../../.wiki/automation.md) is the complete path/permission and
+stop/recovery contract. [Credentials](../../.wiki/credentials.md) records names
+and pointers only. [Server preflight](../../.pi/reports/server-preflight.md)
+records dated actual probes, not current deployment success.
 
-## 1. Verified state of the live system
-
-Read directly from the running container and the live extension on 2026-09-19.
-
-| Thing | Value | Note |
-|---|---|---|
-| Container | `takeout-webgui`, Up 6 weeks | `takeout-tunnel` also up |
-| Chromium | `149.0.7827.155`, CDP on `127.0.0.1:9222` | **inside** the container, not on the host |
-| Page targets | **2** | was **314** at the flood peak |
-| Memory | 3.1 GiB / 7.6 GiB | was **0 → 4.7 GiB** while the flood ran |
-| `local.autoRecapture` | **`false`** | the tab-flood fix; now also the code default |
-| `local.autoCancelDownloads` | **`false`** | flipped 2026-09-22 by owner directive — the workflow depends on real browser downloads. A mint therefore leaves a real part-sized download in `/config/Downloads` (on `cache_crypt`, 300 GB; not the 14 GB root disk). Reverse with `.recon/_cancel_off.py` + one edit. |
-| `chrome.storage.managed` | **empty `[]`** | proves the managed-policy `autoRecapture` was inert — nothing ever wrote it |
-| v2 manager `:8080` | HTTP 200 | alive; **all jobs `complete`**, none parked in `needs_cookie` |
-| webgui `:3000` | HTTP 200 | |
-| Archive mount | `/opt/archives` (rclone) | writable; VFS cache empty |
-| Python in container | 3.13.5, `websockets` 16.0, `aiohttp` | **no `websocket-client`**, **no `pytest`** |
-
-The extension is loaded with `--load-extension=/work/helpers`, and `/work` is the **main checkout**
-(`/opt/local_cache_crypt/_projects/takeout-downloader`). **So the live extension is the main checkout's
-copy, not the worktree's.** Two files can exist with the same name and only one is live — see §6.
-
----
-
-## 2. Running v3
-
-```bash
-ARCHIVE=<the archive id from the manage page>
-
-ssh takeout-server "docker exec -w /work/.v3 \
-    -e PYTHONDONTWRITEBYTECODE=1 takeout-webgui \
-    python3 -B -m autopilot run \
-      --archive-id $ARCHIVE \
-      --ledger   /config/v3-selftest/state.db \
-      --staging  /config/v3-selftest/staging \
-      --archive  /opt/archives/<account>/<archive-id> \
-      --account  <account>"
-```
-
-**Exit codes** — branch on these, do not parse the report:
-
-| Code | Status | Meaning | Resumable? |
-|---|---|---|---|
-| 0 | `complete` | every part verified on disk and moved | — |
-| 2 | `needs_reauth` | a navigation landed on a sign-in page | yes, after a human authorises |
-| 3 | `expired_unrecoverable` | the export's window closed; bytes are gone server-side | **no** — a new export is the only remedy |
-| 4 | `quota_exceeded` | Google's per-export download allowance is spent | **no** — a new export is the only remedy |
-| 1 | other | see the report's `error:` line | varies |
-
-Codes 3 and 4 are deliberately distinct from 1: **both are terminal**, and a caller that files them as
-generic will retry forever against something that can never succeed. Runbooks §1.14 and §1.19.
-
-The report is printed to stdout as markdown; `--json` emits the same as JSON.
-
-**Cost model.** A mint is **Δ1**, a `Range` resume is **Δ0**, and a bounced request is **Δ0**. A fresh
-full transfer was **never measured** — the report says so in its own attempts table, and that is
-intentional rather than an oversight. See `measured-facts.md`.
-
-⚠️ **Budget against `dl_counts`, never against the ledger's attempt count.** They are different
-quantities and only Google's runs out. A run was observed printing `mint 0 | transfer 0` while Google's
-counter went 3 → 5. Read the *"Number of times already downloaded: N"* text **before** an experiment.
-
----
-
-## 3. Where it lives, and why
-
-The live checkout `/work` is on `feat/internal-downloader` and must not be disturbed. v3 is deployed to
-a **git worktree inside the repo root**:
-
-```bash
-ssh takeout-server "cd /opt/local_cache_crypt/_projects/takeout-downloader && \
-  git fetch origin && \
-  git worktree add --detach .v3 origin/feat/takeout-autopilot"
-```
-
-`.v3` is *inside* the repo, so it appears in the container as `/work/.v3` — **only the repo root is
-bind-mounted**, so a worktree anywhere else is invisible to the container. To update:
-
-```bash
-ssh takeout-server "cd <repo> && git fetch origin && \
-  git -C .v3 checkout --detach origin/feat/takeout-autopilot && git -C .v3 log --oneline -1"
-```
-
----
-
-## 4. Container-side requirements
-
-- **`python3 -B` / `PYTHONDONTWRITEBYTECODE=1`, always.** The container runs as **root**, so any
-  `__pycache__` it writes lands root-owned inside the bind mount and the host user cannot delete it.
-- **cwd matters.** `autopilot.verify` resolves `takeout2` from the current working directory, so run
-  with `-w /work/.v3`. A `PYTHONPATH`-only deploy would silently bind to the live `/work/takeout2` —
-  identical today, not guaranteed later.
-- **`pytest` is absent in the container.** The suite is a workstation suite:
-  `/c/Users/User/anaconda3/python.exe -m pytest tests/v3 -q -p no:cacheprovider`.
-- WebSocket support comes from `websockets` 16.0. `websocket-client` is **not** installed and is not
-  needed; do not add a dependency for it.
-
----
-
-## 5. The migration, in order
-
-v3 does **not** need the cookie-capture machinery at all — it mints over CDP. So the v2 path is to be
-deleted rather than repaired. Do it in this order; each step is independently safe.
-
-**Step 1 — the spawner (DONE).** `autoRecapture` now defaults to `false` and all four read sites fail
-closed. The alarm is created only on explicit opt-in. `tests/v3/test_extension_defaults.py` pins this.
-This is a **latent** fix: the live storage was already `false`, so nothing visibly changes — it closes
-the hole that a **profile reset** would otherwise reopen.
-
-**Step 2 — run v3 alongside v2 (NEXT).** Point v3 at a real archive, confirm a `COMPLETE`, and confirm
-the report's file lands under its real `takeout-*.zip` name — not `download`. Nothing is removed yet.
-
-**Step 3 — stop the manager driving jobs.** The manager's spawner is
-`manager/app.py:246` (`pending = [j for j in orch.list_jobs() if j["status"] == J.NEEDS_COOKIE]`) feeding
-`:222` / `:444-456`. Until it is removed, any job that reaches `NEEDS_COOKIE` re-arms the tab flood
-whenever `autoRecapture` is turned back on. **Disable before deleting.**
-
-**Step 4 — delete the cookie-replay path.** Scope measured 2026-09-19:
-
-| Area | What |
+| Component | Approved target |
 |---|---|
-| `takeout2/cookie.py` | whole module (146 lines): `LiveCookieJar`, `CookieError`, `CookieState` |
-| `takeout2/engine.py` | `:39` import, `:179` `cookie_source` parameter |
-| `takeout2/cli.py` | `:228-229`, `:804-807`, `:1178-1179` — three `LiveCookieJar` constructions |
-| `manager/v2integration.py` | `:70`, `:99` — builds a fresh jar per burst |
-| `manager/engine_bridge.py` | `:84-87` — flips a job to `NEEDS_COOKIE` and waits |
-| `manager/app.py`, `manager/diagnose.py` | `:222`, `:246`, `:51`, `:61` — the park and its diagnostics |
-| `helpers/background.js` | the capture listener, the POST-to-manager path, `triggerRecapture` |
-| `helpers/content.js` | `:999` the `recaptureDownload` handler |
-| `helpers/overlay.js`, `popup.js`, `options.js` | `needs_cookie` UI states and the checkbox |
-| `tests/v2/test_cookie.py` | the tests for the thing being deleted |
+| Canonical workstation source | `C:/Users/User/_projects/takeout-downloader-reliability`; D original unchanged (full disk) |
+| Server code | `/opt/local_cache_crypt/_projects/takeout-downloader/.v3` → `/work/.v3`; preserve dirty main repo |
+| PRIVATE | Host repo `config/autopilot` → `/config/autopilot` inside existing `takeout-webgui` |
+| Worker | Existing `/opt/manager-venv/bin/python`, explicit non-root container UID |
+| Supervision | Host systemd → `tools/container_watch.py` → bounded foreground docker exec |
+| rclone | Trusted `PRIVATE/bin/rclone` + encrypted `PRIVATE/rclone.conf`, container-mapped paths |
+| CDP | Existing container-local `http://127.0.0.1:9222`; no new listener/forward |
+| Archive authority | Direct `archives:google-takeout`; FUSE `/opt/archives` is only a view |
 
-**Step 5 — retire rather than rewrite the runbooks.** Every `needs_cookie` runbook step becomes obsolete;
-mark them superseded instead of silently deleting, so anyone following an old copy learns why.
+Earlier host-worker/PRIVATE-venv and host-path JSON templates are superseded.
+Host `/config` does not exist. Existing venv must import both `autopilot` and
+`takeout2` and the websocket runtime dependency. Templates are not installation
+proof. Browser/extension reload or restart is **not** a release step.
 
----
+## Gates before any future activation
 
-## 6. Gotchas that have already cost time
+1. Final actual-checkout tests/compile/import/CLI and independent supervisor/identity
+   evidence, secret review and immutable approved source. Repair evidence is
+   Windows 1352 passed / 66 skipped and focused nonroot WSL 251 passed; broad
+   native Linux validation remains pending (see the repair report below).
+2. [CORE21495 deployed](../../.wiki/core-release.md) at 22:00:42 UTC: clean
+   `.v3`, 36 fingerprints/0 mismatches, dirty main six entries preserved.
+   Executor/unit installation remains deferred, not inferred from CORE deployment.
+3. Verify encrypted mount, explicit numeric container UID, all ancestor traversal,
+   private config readability and state/ledger/staging/cache/tmp writability. Keep env
+   root-0600, private files/dirs and umask 0077; never broaden secrets to fix access.
+4. Check unit syntax and stopped/disabled state. Unit must supervise a foreground
+   exec; heartbeat/EOF and scoped tree cleanup must prevent orphan downloads.
+5. Current supervisor preflight is bounded noninteractive encrypted `config dump`
+   and alias-chain validation, **not network/backend access**; no canary or remote
+   credential-validity proof follows from it. **Later owner authorization:** unlock credentials and Google interactive sign-in;
+   verified account DOM/URLs/readiness. Mandatory bounded noninteractive backend-config
+   unlock preflight must succeed before watcher launch. No password guessing.
+6. Separate launch approval. Optional tiny retained canary needs its own permission;
+   none has run. It proves storage mechanics, not Google export completion.
 
-- **`.recon/` does not exist on the server.** It is untracked scratch on the workstation; the server has
-  its own clone. Pipe probes in:
-  `ssh takeout-server 'docker exec -i -w /work/.v3 takeout-webgui python3 -B -' < probe.py`
-- **CDP is inside the container.** `127.0.0.1:9222` from the workstation is nothing at all — the failure
-  is silent-empty rather than an error. Always wrap in the ssh + `docker exec`.
-- **Two copies of every tracked file exist.** The main checkout and the `.v3` worktree have separate
-  working trees, and the branches have diverged. Editing the wrong copy produces a change that is
-  invisible to both the test suite and production. **The live extension is the main checkout's copy**
-  (`--load-extension=/work/helpers`); the test suite reads the worktree's.
-- **`/manage` truncates its export list.** A 4,000-character read showed 4 requests where 6 existed.
-  Never conclude "only N exist" from a page dump.
-- **The Takeout UI is an SPA that changes no URL per step**, so verify each step by reading the DOM, not
-  the address bar. A synthetic click can also fire with no visible effect — always re-read state after.
-- **A 5-attempt export is exhausted by roughly five probes.** Read `dl_counts` before, not after.
+Production budget: remaining/restart bytes + 100 GiB reserve (`107374182400`) +
+5 GiB floor (`5368709120`) on the shared encrypted disk. Browser downloads and
+VFS cache growth count too. Recheck per part; no root-disk fallback.
+
+## FUTURE inspection examples — no activation
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 takeout-server \
+  'systemctl is-enabled takeout-autopilot-watch.service; systemctl is-active takeout-autopilot-watch.service'
+ssh -o BatchMode=yes -o ConnectTimeout=10 takeout-server \
+  'df -h /opt/local_cache_crypt; findmnt -T /opt/local_cache_crypt'
+```
+
+For local CLI syntax, `python -B -m autopilot run --help` and
+`python -B -m autopilot watch --help` do not contact Google/backend. Exact executed
+local commands/results: [release-docs.md](../../.pi/reports/release-docs.md).
+`watch --once` is **not** read-only: it can discover, mint, transfer and upload.
+`--once --dry-run` validates config only and does not prove backend/Google readiness.
+Do not run a live tick during this hold.
+
+## FUTURE stop and recovery
+
+```bash
+# Host: scoped worker stop, NOT a browser/container stop.
+sudo systemctl stop takeout-autopilot-watch.service
+sudo systemctl disable takeout-autopilot-watch.service
+systemctl is-active takeout-autopilot-watch.service
+systemctl is-enabled takeout-autopilot-watch.service
+```
+
+Prove this worker tree/owned transfers are gone; killing the docker client alone
+is insufficient. No `pkill -f python`, Chromium restart, broad download sweep,
+mount unmount or deletion of state/ledger/partial/quarantine evidence. Never remove
+a lock file to evade an active OS lock. Retain sanitized status and progress.
+
+- **Backend/preflight failure:** keep stopped, retain staging; owner supplies unlock
+  later. No FUSE fallback or decrypted/public config.
+- **Reauth/identity blocked:** owner signs in/verifies account later; no automatic
+  password helper or guessed label/user ID. Cached valid work remains useful.
+- **Storage/mount blocked:** restore encrypted mount/headroom before retry; preserve
+  partials/receipts. Direct backend failure never authorizes staging cleanup.
+- **Network interruption:** resume with saved strong validator; changed remote/auth
+  failure is explicit, no arbitrary-age remint.
+- **Corrupt archive:** quarantine and inspect; size-only adoption cannot repair CRC.
+- **Expired/quota/Google failed:** terminal; new owner-created export required.
+- **Restart:** reuse local ledger/state/receipts and single OS lock; no concurrent
+  legacy/v3 writers or arbitrary remote writers. Start/restart is not approved now.
+
+A ledger-only report needs no browser; optional `--archive-dir` size accounting
+is not a fresh integrity/backend audit. Do not delete source data based on it.
+See [run contract](02-RUN-INTERFACE.md) for exit codes and
+[future full pull](04-FULL-PULL.md) for per-export command templates.
+
+## Protected environment and release boundary
+
+Mandatory unit `EnvironmentFile` is host-only
+`/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env` (`root:root 0600`),
+under `root:root 0700`, outside worker-writable PRIVATE and **all effective
+container mounts BEFORE provisioning secrets**. Check source ancestors, read-only
+mounts, volumes and resolved symlinks, not just `/work` and `/config`. A worker-writable parent permits replacement and root environment
+injection even when the file is root-owned. PRIVATE remains host
+`/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot` →
+`/config/autopilot`, owner `20001:20001`, mode `0700`, no group/other bits;
+ancestor traversal is separate. No key/credential file was provided or created.
+
+[CORE21495 is deployed](../../.wiki/core-release.md), not activated. Current unit
+uses `Restart=on-failure`, `RestartSec=30`, five starts per 300 seconds and stays
+disabled/inactive. Config-only alias preflight allows reviewed network terminal
+types and rejects unsupported wrappers/local/memory/unknown; it proves neither
+backend connectivity, canary nor durability. Owner-deferred gates remain.
+
+## Mount admission and legacy output compatibility — FUTURE ONLY
+
+Future webGUI, TUI and CLI archive binds are literal
+`/opt/archives:/opt/archives`. No `STORAGE_ROOT` override can broaden them to
+`/opt`; webGUI manager root is fixed `/opt/archives` and CLI allowed roots are
+`/opt/archives:/downloads`. Legacy `outputDir` outside those roots requires an
+**explicit safe bind outside all secret ancestors** plus reviewed output-root
+configuration where applicable. Do not restore broad `/opt` for compatibility.
+
+Every effective mount must exclude
+`/opt/local_cache_crypt/takeout-autopilot-secrets` BEFORE provisioning secrets.
+Review other binds/volumes too, including the configurable read-only VFS cache
+source. Root ownership/modes are necessary access controls, not proof of exclusion.
+Before exec, host supervisor admission uses Docker inspect with a 10-second
+bound, 1 MiB stdout cap, suppressed stderr and bounded owned-client cleanup.
+Lexical/resolved source ancestor, exact or descendant overlap refuses even for
+read-only bind/volume mounts and symlink aliases. Empty/missing/malformed metadata,
+unsupported types, resolution errors, failed inspection, timeout and flood fail
+closed. Refusal is not permission to bypass supervision.
+
+This is point-in-time admission, NOT prevention when an administrator later
+creates/reconfigures an unsafe container or changes mounts/symlinks. Repeat
+layout review after changes; pre-provision exclusion is a separate mandatory gate.
+No existing containers were recreated and no secret file was created.
+[Repair evidence](../../.pi/reports/mount-boundary-repair.md): Windows **1352 passed /
+66 skipped**, nonroot WSL focused **251 passed**; broad native Linux validation
+pending with dependency/test/raw-CRLF blockers retained. These are measured offline
+results, not live safety/full-pull proof. The
+[frozen gate](../../.pi/reports/final-frozen-gate.md) wiki SHA drift is reconciled
+as commander banner edits only, with no mismatch in its 173 source/config/test
+files; this does not waive the true containment bug or rewrite historical HOLD.
+See [runbook](../../.wiki/automation.md#mount-boundary-admission-and-compatibility-runbook--future-only)
+and [audit](../../.wiki/reliability-audit.md). No final approval, executor activation
+or recertification of deployed CORE21495 is inferred.

@@ -106,7 +106,7 @@ cat > "$POLICY_DIR/takeout-manager.json" <<EOF
         "managerUrl": "$MANAGER_URL",
         "captureToken": "$CAPTURE_TOKEN",
         "autoPost": true,
-        "autoRecapture": true
+        "autoRecapture": false
       }
     }
   }

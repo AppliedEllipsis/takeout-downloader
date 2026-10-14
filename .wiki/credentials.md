@@ -1,63 +1,108 @@
 # Credentials — pointers only
 
-**Never put actual secrets in this file.** Pointers, variable names, and locations only.
+**Updated 2026-10-13. Never record values, cookies, signed URLs or tokens here.**
+Owner deferred rclone unlock and Google sign-in. This page grants no authorization
+to try a password, unlock a backend, mint a URL or start a worker.
 
-## Remote server
+## Locations and permissions
 
-| What | Where |
+Let `R=/opt/local_cache_crypt/_projects/takeout-downloader` and
+`PRIVATE=$R/config/autopilot` on the host.
+
+| Material | Location / rule |
 |---|---|
-| SSH access | alias `takeout-server` in the workstation's `~/.ssh/config` (key-based) |
-| Host | `ubuntu-8gb-fsn1-1` |
-| Container venv (manager) | `/opt/manager-venv` inside `takeout-webgui` |
-| Container venv (browser) | `/opt/browser-venv` inside `takeout-webgui` |
+| SSH | Alias `takeout-server`; use `-o BatchMode=yes -o ConnectTimeout=10` |
+| Google session | Existing container profile `/config/.chrome-profile`; preserve browser state |
+| CDP/cookies | Container-local `http://127.0.0.1:9222`; cookies/UA captured for transfer, not password replay |
+| Worker interpreter | Existing container `/opt/manager-venv/bin/python`; no new production host venv |
+| Encrypted rclone config | Authorized byte-identical encrypted copy: host `PRIVATE/rclone.conf`, container `/config/autopilot/rclone.conf` |
+| Trusted rclone binary | Host `PRIVATE/bin/rclone`, container `/config/autopilot/bin/rclone`; copied trusted server binary |
+| Service env | Host-only `/opt/local_cache_crypt/takeout-autopilot-secrets/credentials.env`, root:root `0600`; mandatory unit EnvironmentFile, parent root:root `0700`, outside PRIVATE and every effective container mount before provisioning |
+| Watch config | Host `PRIVATE/watch.json`, container `/config/autopilot/watch.json`; verified identity, no auth tokens |
+| Sensitive ledger | Host `PRIVATE/ledger.sqlite`, container `/config/autopilot/ledger.sqlite`; cached signed URLs require private local storage |
+| State/staging/cache/tmp | Under PRIVATE; owner `20001:20001`, directories `0700` with no group/other bits; files `0600`, umask `0077` |
 
-Always connect with `-o BatchMode=yes` so a missing key fails fast rather than
-hanging on an interactive prompt.
+Check **every parent** for traversal and container UID readability/writability.
+Host service identity and container worker UID are separate checks. Do not fix
+access by making secrets world-readable. Numeric UID mapping and actual unit
+access must be proven by the execution/deployment lane.
 
-## Google / Takeout
+## Environment names (never values)
 
-| What | Where |
-|---|---|
-| Google account auth | Browser session inside `takeout-webgui`'s Chromium, profile at `/config/.chrome-profile` |
-| Cookie source | CDP over `127.0.0.1:9222` **inside** the container (`Storage.getCookies`) — Linux only, never exposed to the host |
-| Accounts in use | Multiple; the Manage-exports page exposes them via the account switcher |
+- Authorized unlock may use `RCLONE_CONFIG_PASS` or a separately approved secure
+  credential mechanism. None has been provisioned by this documentation lane.
+  No password in argv, remote names, logs or committed JSON.
+- `RCLONE_CACHE_DIR=/config/autopilot/cache` is the **container** worker mapping.
+- Optional notifier: `TELEGRAM_ENABLED`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`.
+  Notification failure must not discard queue state.
+- `PYTHONDONTWRITEBYTECODE=1`, `PYTHONUNBUFFERED=1`: non-secret runtime settings.
+- CLI tuning: `AUTOPILOT_MIN_HEADROOM`, `AUTOPILOT_MOVE_TIMEOUT`,
+  `AUTOPILOT_MOVE_STALL`; not credentials.
 
-> **Design note (v3):** the cookie is *not* extracted or replayed any more. The browser
-> performs downloads itself. Any remaining credential handling must stay inside the
-> container.
+Supervisor forwards env **by name only** (`docker exec -e NAME`), never
+`NAME=secret` in argv. Do not print environments, raw rclone output, profile
+contents, private identity values or ledger signed URLs in reports.
 
-## Application-level (env)
+## Unlock gate and current evidence
 
-Check `.env` / `.env.example` in the repo for the authoritative list of variable
-**names** (do not copy values here). Known categories: Telegram notifier bot token &
-chat id, manager API auth, archive paths.
+[Server preflight](../.pi/reports/server-preflight.md) found encrypted config at
+`/opt/storage.local_1/projects/_rclone/rclone-u455805-sub1.conf`; its original root
+ext4 location/mode was not changed. Noninteractive `listremotes --ask-password=false`
+failed with exit 1. No authorized unlock pointer was established; no env/config
+was provisioned and no backend canary ran. An active FUSE mount does not prove
+that a new worker can unlock its configuration.
 
-## Ports / dashboards
+Before **future separately authorized** activation, the supervisor must perform a
+bounded noninteractive backend-config unlock preflight under the effective
+container UID with mapped config/binary/env. Current preflight is config-only
+`config dump --ask-password=false`, output suppressed, alias/crypt/chunker chains validated to reviewed network terminal types;
+unsupported wrappers and local/memory/unknown terminals are refused. It
+does **not** contact a backend or prove backend access. Failure prevents launch.
+Keep stdin noninteractive and rclone `--ask-password=false`; suppress raw output.
+Do not weaken encryption, mine process memory, reuse unrelated secrets or retry
+passwords. A backend canary is a separate future authorization, not a release fact.
 
-| What | Where |
-|---|---|
-| Webgui UI | `http://<host>:8080/` (and the container-local `127.0.0.1:8080`) |
-| Chromium DevTools | `127.0.0.1:9222` inside `takeout-webgui` only |
-| External reachability | via the `takeout-tunnel` container |
+## Google reauthentication — deferred
 
-## Browser extension
+Fresh views required `needs_reauth`; ready/pending counts remain unknown. Owner
+must later satisfy sign-in/second factor interactively. `tools/satisfy_login.py`,
+`TAKEOUT_GPASS` and gitignored `config/gPass.txt` are historical helper pointers,
+**not the watcher's auth path and not approved now**. The watcher does not import
+password helpers. Do not run password-helper probes for this release. Verified
+staged work can archive without reminting; expired/quota-exhausted exports need a
+new export, not auth retries.
 
-| What | Value |
-|---|---|
-| Extension id | `dgbbpdjpfeeaiheekoclkkkbipkikejl` |
-| Key file | `webgui/extension-key` (in repo — check whether it is a private key before publishing) |
+## Mandatory protected environment layout
 
-## Temporary credential (ReAuth)
+Host-only `/opt/local_cache_crypt/takeout-autopilot-secrets` must be `root:root
+0700`; its `credentials.env` must be `root:root 0600` and is the mandatory unit
+`EnvironmentFile`. Keep it outside worker-writable PRIVATE and **all effective
+container mounts BEFORE provisioning secrets**, including ancestor sources,
+read-only mounts, volumes and symlink aliases; `/work` and `/config` alone are
+not a sufficient exclusion check. Root ownership of a file inside a worker-writable directory
+is insufficient: the worker could replace it and inject root environment.
 
-| What | Where |
-|---|---|
-| Temp password for the Google ReAuth "Password challenge" | `<repo>/config/gPass.txt` — **gitignored** (`.gitignore:126`), so it never reaches the public repo. Read at run time; never in argv, never in env, never echoed |
-| Override path | env `TAKEOUT_GPASS` |
-| Handler | `tools/satisfy_login.py` — `--dry-run` reports form geometry and types nothing |
-| Extension switches | `autoCancelDownloads=false`, `autoRecapture=false`; flip with `tools/extension_switch.py` |
+PRIVATE remains `/opt/local_cache_crypt/_projects/takeout-downloader/config/autopilot`
+→ `/config/autopilot`, owner `20001:20001`, mode `0700`, no group/other bits.
+Ancestor traversal is a separate check, not a PRIVATE permission exception.
+No key/credential file was provided or created; activation remains owner-deferred.
 
-> **The file is the secret. Never echo it.** The handler prints only the source path and the
-> character count. Use `--dry-run` to confirm the form is findable before typing anything.
-> If Google demands a second factor, `gPass.txt` cannot satisfy it — a human is required.
-> Set the file mode to `0600` (`chmod 600 config/gPass.txt`; the host dir is owned by the
-> container's uid 1000, so chmod it **inside** the container).
+## Future mount correction; not live exclusion evidence
+
+All three future archive binds (webGUI, TUI, CLI) are literal
+`/opt/archives:/opt/archives`, not a broad `/opt` or an inherited `STORAGE_ROOT`
+override. CLI allowed roots are `/opt/archives:/downloads`. Review every other
+effective source too, especially configurable read-only VFS cache sources.
+
+Bounded host-side Docker inspect admission before exec rejects source ancestor,
+exact or descendant overlap with `/opt/local_cache_crypt/takeout-autopilot-secrets`,
+including read-only bind/volume sources and lexical/resolved symlink aliases.
+Malformed/missing metadata and failed/timed-out/oversized inspection fail closed.
+This point-in-time guard does not prevent later unsafe administrator container/
+mount/symlink changes. **Effective exclusion is REQUIRED BEFORE provisioning
+secrets**; permissions alone are not containment. No secret file was created, no
+existing containers recreated, and no current live-layout certification is claimed.
+
+Legacy `outputDir` needs an explicit safe bind outside all secret ancestors when
+outside the new roots. See [future runbook](automation.md#mount-boundary-admission-and-compatibility-runbook--future-only)
+and [repair evidence](../.pi/reports/mount-boundary-repair.md).

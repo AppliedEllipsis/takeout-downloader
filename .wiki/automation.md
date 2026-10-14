@@ -4,7 +4,7 @@
 approved target contract; CORE deployment is complete, not executor/unit
 installation or final merged-test evidence. Frozen ownership: [finish-release.md](../.pi/workflows/finish-release.md).
 
-**CORE21495 deployed:** [release evidence](core-release.md), 2026-10-13T22:00:42Z; clean `.v3`, 36 module fingerprints/0 mismatches, dirty main six entries preserved. Executor/unit installation remains deferred; worker inactive, unit disabled.
+**CORE21495 deployed:** [release evidence](core-release.md), 2026-10-13T22:00:42Z; clean `.v3`, 36 module fingerprints/0 mismatches, dirty main six entries preserved. **Supervisor source 7fc3ac9 deployed:** [server evidence](../.pi/reports/server-supervisor-deploy.md), 2026-10-14T03:05:31Z. Executor/unit installation remains deferred; worker inactive, unit disabled.
 
 ## What is known / what is not
 
@@ -17,9 +17,9 @@ installation or final merged-test evidence. Frozen ownership: [finish-release.md
   new TCP port or browser/container restart is authorized.
 - Initial migrated suite: 971 passed / 6 skipped / 2 fixture failures; parent
   reports repaired fixture gate 38 passed. Later mount-repair full Windows gate:
-  **1352 passed / 66 skipped**; nonroot WSL focused gate **251 passed**. Broad
-  native Linux validation remains pending. See [evidence index](reliability-audit.md);
-  do not combine totals.
+  **1352 passed / 66 skipped**; native isolated Linux v3/v2 **1211 passed / 6 skipped**;
+  native full project **1410 passed / 8 skipped**; nonroot WSL focused gate **251 passed**.
+  See [evidence index](reliability-audit.md); do not combine totals.
 
 ## Execution contract
 

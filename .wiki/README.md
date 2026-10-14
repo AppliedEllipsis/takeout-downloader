@@ -1,8 +1,8 @@
 # Takeout downloader project wiki
 
-**Updated 2026-10-13 — reliability release, activation deferred.**
+**Updated 2026-10-14 — reliability release, activation deferred.**
 
-**CORE21495 deployed:** [release evidence](core-release.md), 2026-10-13T22:00:42Z; clean `.v3`, 36 module fingerprints/0 mismatches, dirty main six entries preserved. Executor/unit installation remains deferred; worker inactive, unit disabled.
+**CORE21495 deployed:** [release evidence](core-release.md), 2026-10-13T22:00:42Z; clean `.v3`, 36 module fingerprints/0 mismatches, dirty main six entries preserved. **Supervisor source 7fc3ac9 deployed:** [server evidence](../.pi/reports/server-supervisor-deploy.md), 2026-10-14T03:05:31Z. Executor/unit installation remains deferred; worker inactive, unit disabled.
 
 ## Start here
 

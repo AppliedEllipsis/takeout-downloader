@@ -40,7 +40,7 @@ reports for source version, scope, failed runs and platform limitations.
 | Owner integration update (historical) | Parent repaired those fixtures; focused **38 passed** reported to this lane. Not a whole-suite result; later frozen/mount-repair evidence is recorded below. |
 | [server-preflight.md](../.pi/reports/server-preflight.md) | No deployment; old clean `.v3` at `1b70ce2`; unlock exit 1; host CDP reset, container CDP works; fresh view needs reauth; no ready/pending count or canary. |
 | [final-core-verifier.md](../.pi/reports/final-core-verifier.md) | Immutable core snapshot `20261013T212824394139`: **974 passed, 6 skipped**, exit 0, plus adversarial/compile/import gates. This snapshot predates the separate supervisor/runtime-token additions; it is not the final actual-checkout gate. |
-| [server-core-deploy.md](../.pi/reports/server-core-deploy.md) / [core-release.md](core-release.md) | CORE21495 deployed 22:00:42 UTC; clean `.v3`, 36 fingerprints/0 mismatches; dirty main six entries preserved; no activation. |
+| [server-core-deploy.md](../.pi/reports/server-core-deploy.md) / [core-release.md](core-release.md) | CORE21495 deployed 22:00:42 UTC; clean `.v3`, 36 fingerprints/0 mismatches; dirty main six entries preserved; no activation. |\n| [server-supervisor-deploy.md](../.pi/reports/server-supervisor-deploy.md) | Supervisor `7fc3ac9` deployed 03:05:31 UTC; clean detached `.v3`, 37 file/blob fingerprints, imports/help/mount checks passed; unit absent/inactive and no worker. No unlock/auth/canary/transfer. |
 | [release-docs.md](../.pi/reports/release-docs.md) | Exact documentation-lane commands, checks and boundaries. |
 
 Do not sum passing subtotals: reports cover different/concurrent source states
@@ -51,10 +51,8 @@ establish authenticated DOM compatibility, backend access or a new export pull.
 
 ## Outstanding gates
 
-- Frozen source plus actual-checkout suite, compile/import/CLI checks and secret
-  review; independent refutation and supervisor/identity tests.
-- Supervisor unit/example consistency, non-root UID, private path permissions,
-  mapped existing manager venv/trusted rclone and stop/orphan behavior.
+- Secure unlock preflight and authenticated identity/export readiness remain owner-deferred; no backend canary or real export pull has been performed.
+- Supervisor source, example, non-root UID, private path permissions, mapped manager venv, mount admission and stop/orphan behavior are verified offline; installing the unit and provisioning the protected secret path remain deferred.
 - CORE-only update/import/help/fingerprints are complete per server-core-deploy.md.
   Executor/unit installation, unit syntax/UID/permissions/stopped-state and scoped
   stop behavior are separate gates. This docs lane performs no deployment.

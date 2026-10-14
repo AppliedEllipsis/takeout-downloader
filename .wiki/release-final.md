@@ -23,6 +23,6 @@ Evidence: [native Linux](../.pi/reports/linux-release-gate.md), [mount repair](.
 
 ### Operational boundary
 
-CORE21495 is deployed and verified; final supervisor deployment is a separate recorded step. Owner explicitly deferred the rclone configuration unlock and Google reauthentication. Keep the worker disabled/inactive. No credential file, backend canary, fresh authenticated export discovery or real Google download has been performed. No source-account data was deleted; browser/container/rclone services and dirty main checkout are preserved.
+CORE21495 and supervisor source `7fc3ac97ef5db6f335cd70a05d2d6b77b3c43229` are deployed and verified; see [server deployment evidence](../.pi/reports/server-supervisor-deploy.md). The systemd unit is still absent/inactive and no worker is running. Owner explicitly deferred the rclone configuration unlock and Google reauthentication. Keep the worker disabled/inactive. No credential file, backend canary, fresh authenticated export discovery or real Google download has been performed. No source-account data was deleted; browser/container/rclone services and dirty main checkout are preserved.
 
 The release checkout is `C:/Users/User/_projects/takeout-downloader-reliability`; the original D worktree was preserved when D filled. `.gitattributes` pins shell scripts to LF; existing raw CRLF on the Windows filesystem is not a Linux deployment artifact. Git blobs and future checkouts must honor the LF policy.
